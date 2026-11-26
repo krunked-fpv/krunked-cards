@@ -6,6 +6,8 @@ import {
   type BlindDef,
   type BlindSlot,
   type BlindSlotState,
+  type BoosterKind,
+  type BoosterSize,
   type CardInstance,
   type EditionId,
   type JokerEvalResult,
@@ -13,6 +15,7 @@ import {
   type PokerHandId,
   type Rank,
   type ScoreBeat,
+  type SealId,
   type SimAction,
   type SimEvent,
   type SimState,
@@ -40,10 +43,13 @@ import {
   notifyJokersCardAdded,
   notifyJokersCardsDestroyed,
 } from './consumables.ts';
-import { isCardFace, isCardSuit } from './poker.ts';
+import { evaluatePokerHand, isCardFace, isCardSuit } from './poker.ts';
 import { createRngState, nextRandom, nextRandomInt, pickRandom, shuffleDeterministic } from './prng.ts';
 import { scorePlayedHand } from './scoring.ts';
 import {
+  PLANET_HAND_FALLBACK,
+  addSimFlag,
+  addUnusedDiscards,
   buildDefaultHandLevels,
   computeCashoutBreakdown,
   countActiveJoker,
@@ -51,6 +57,7 @@ import {
   createConsumableInstance,
   createJokerInstance,
   drawCardsToHand,
+  generateAdditionalShopOffer,
   generateShop,
   generateShopOffers,
   getActiveBlind,
@@ -59,12 +66,22 @@ import {
   getEffectiveHandSize,
   getEffectiveJokerSlots,
   getProbabilityMultiplier,
+  getSimMetaNum,
+  getSimMetaStr,
+  getUnusedDiscardsTotal,
+  hasChallengeRule,
+  hasSimFlag,
+  normalizeEdition,
+  normalizeSeal,
   openBoosterPack,
   pickConsumableDefFromPool,
   pickJokerDefFromPool,
   recalcJokerSellValue,
+  repriceCurrentShop,
   resolveCopiedJoker,
   safeNum,
+  setSimMetaNum,
+  setSimMetaStr,
   sortHandIds,
 } from './shop.ts';
 
@@ -87,30 +104,39 @@ function syncBankruptAt(state: SimState): void {
 
 function pickSkipTag(state: SimState, streamKey: string): string | null {
   const banned = new Set(state.tracking.bannedTags);
-  const eligible = TAGS.filter((t) => t.minAnte <= state.ante && !banned.has(t.key));
+  const effectiveAnte = Math.max(1, state.ante);
+  const eligible = TAGS.filter((t) => t.minAnte <= effectiveAnte && !banned.has(t.key));
   if (eligible.length === 0) return null;
   return pickRandom(eligible, state.rng, streamKey)?.key ?? eligible[0].key;
 }
 
-function pickBossBlind(state: SimState, forcedBossKey?: string): BlindDef {
+function pickBossBlind(state: SimState, forcedBossKey?: string, excludeKey?: string): BlindDef {
   if (forcedBossKey && BLIND_MAP[forcedBossKey]) {
     return BLIND_MAP[forcedBossKey];
   }
 
+  const bannedBlinds = new Set([...state.tracking.bannedOthers, ...state.tracking.bannedKeys]);
+  const effectiveAnte = Math.max(1, state.ante);
   const isShowdownAnte = state.ante >= 8 && state.ante % 8 === 0;
-  const allBosses = BLINDS.filter((b) => b.slot === 'Boss');
+  const allBosses = BLINDS.filter((b) => b.slot === 'Boss' && !bannedBlinds.has(b.key));
   const poolBase = isShowdownAnte
     ? allBosses.filter((b) => b.showdown)
-    : allBosses.filter((b) => !b.showdown && b.minAnte <= state.ante);
-  const fallbackPool = poolBase.length > 0 ? poolBase : allBosses;
+    : allBosses.filter((b) => !b.showdown && b.minAnte <= effectiveAnte);
+  const fallbackPool =
+    poolBase.length > 0
+      ? poolBase
+      : allBosses.length > 0
+        ? allBosses
+        : BLINDS.filter((b) => b.slot === 'Boss');
 
   const historySet = new Set(state.bossHistory);
-  let unused = fallbackPool.filter((b) => !historySet.has(b.key));
+  let unused = fallbackPool.filter((b) => !historySet.has(b.key) && b.key !== excludeKey);
   if (unused.length === 0) {
     // Cycle completed — reset history for this category
     const categoryKeys = new Set(fallbackPool.map((b) => b.key));
     state.bossHistory = state.bossHistory.filter((k) => !categoryKeys.has(k));
-    unused = fallbackPool;
+    const withoutExcluded = fallbackPool.filter((b) => b.key !== excludeKey);
+    unused = withoutExcluded.length > 0 ? withoutExcluded : fallbackPool;
   }
 
   const picked = pickRandom(unused, state.rng, `boss_ante_${state.ante}`);
@@ -148,6 +174,19 @@ function generateAnteBlinds(state: SimState, forcedBossKey?: string): Record<Bli
   const smallMult = smallDef?.mult ?? 1;
   const bigMult = bigDef?.mult ?? 1.5;
 
+  const smallDollars =
+    state.stake >= 2 || state.tracking.noReward || hasSimFlag(state, 'rule:no_reward_Small')
+      ? 0
+      : (smallDef?.dollars ?? 3);
+  const bigDollars =
+    state.tracking.noReward || hasSimFlag(state, 'rule:no_reward_Big')
+      ? 0
+      : (bigDef?.dollars ?? 4);
+  const bossDollars =
+    state.tracking.noReward || hasSimFlag(state, 'rule:no_reward_Boss')
+      ? 0
+      : bossDef.dollars;
+
   return {
     Small: {
       slot: 'Small',
@@ -156,7 +195,7 @@ function generateAnteBlinds(state: SimState, forcedBossKey?: string): Record<Bli
       status: 'Select',
       mult: smallMult,
       targetChips: computeTargetChips(state, smallMult),
-      dollars: state.stake >= 2 ? 0 : (smallDef?.dollars ?? 3),
+      dollars: smallDollars,
       tagKey: pickSkipTag(state, `tag_small_${state.ante}`),
       bossColor: smallDef?.bossColor ?? '#3a55ab',
       triggered: false,
@@ -169,7 +208,7 @@ function generateAnteBlinds(state: SimState, forcedBossKey?: string): Record<Bli
       status: 'Upcoming',
       mult: bigMult,
       targetChips: computeTargetChips(state, bigMult),
-      dollars: bigDef?.dollars ?? 4,
+      dollars: bigDollars,
       tagKey: pickSkipTag(state, `tag_big_${state.ante}`),
       bossColor: bigDef?.bossColor ?? '#e0a23a',
       triggered: false,
@@ -182,7 +221,7 @@ function generateAnteBlinds(state: SimState, forcedBossKey?: string): Record<Bli
       status: 'Upcoming',
       mult: bossDef.mult,
       targetChips: computeTargetChips(state, bossDef.mult),
-      dollars: bossDef.dollars,
+      dollars: bossDollars,
       tagKey: null,
       bossColor: bossDef.bossColor,
       triggered: false,
@@ -198,11 +237,14 @@ function refreshCardDebuffs(state: SimState): void {
     blind.slot === 'Boss' &&
     !blind.disabled;
   const blindDef = BLIND_MAP[blind.key];
+  const debuffPlayedCards = hasChallengeRule(state, 'debuff_played_cards');
 
   for (let i = 0; i < state.fullDeck.length; i++) {
     const card = state.fullDeck[i];
-    let debuffed = false;
-    if (isBossActive) {
+    // Reset debuffed before evaluating isCardSuit so Wild cards never oscillate
+    card.debuffed = false;
+    let debuffed = debuffPlayedCards && card.playedThisAnte;
+    if (!debuffed && isBossActive) {
       if (blind.key === 'bl_plant' || blindDef?.debuffFace) {
         debuffed = isCardFace(card, state.jokers);
       } else if (blind.key === 'bl_club' || blindDef?.debuffSuit === 'Clubs') {
@@ -242,6 +284,64 @@ function applyCrimsonHeartDebuff(state: SimState): void {
       blind.triggered = true;
     }
   }
+  syncBankruptAt(state);
+  refreshCardDebuffs(state);
+}
+
+function disableActiveBossBlind(state: SimState): void {
+  const blind = getActiveBlind(state);
+  if (blind.slot !== 'Boss') return;
+  const wasDisabled = blind.disabled;
+  blind.disabled = true;
+
+  // Restore any Crimson Heart disabled joker (unless perished)
+  if (state.tracking.crimsonHeartDisabledJokerId) {
+    const prev = state.jokers.find((j) => j.id === state.tracking.crimsonHeartDisabledJokerId);
+    if (prev && !(prev.perishable && prev.perishableTally <= 0)) {
+      prev.debuffed = false;
+    }
+    state.tracking.crimsonHeartDisabledJokerId = null;
+  }
+
+  // Flip all jokers & cards face-up (Amber Acorn, House, Fish, Mark, Wheel)
+  for (let i = 0; i < state.jokers.length; i++) {
+    state.jokers[i].faceDown = false;
+  }
+  for (let i = 0; i < state.fullDeck.length; i++) {
+    state.fullDeck[i].faceDown = false;
+  }
+
+  // Clear Cerulean Bell forced card
+  state.tracking.ceruleanBellForcedCardId = null;
+
+  // Reduce oversized boss target chips (The Wall 4x -> 2x, Violet Vessel 6x -> 2x)
+  if (!wasDisabled && (blind.key === 'bl_wall' || blind.key === 'bl_final_vessel')) {
+    blind.targetChips = computeTargetChips(state, 2);
+    state.targetChips = blind.targetChips;
+  }
+
+  // Mid-round restorations when disabling live Boss Blinds (e.g. selling Luchador)
+  if (!wasDisabled && state.phase === 'PLAYING') {
+    if (blind.key === 'bl_manacle') {
+      drawCardsToHand(state, 1);
+      sortHandIds(state, state.sortMode);
+    } else if (blind.key === 'bl_water') {
+      const lostDiscards = getSimMetaNum(state, 'water_lost_discards') ?? 0;
+      if (lostDiscards > 0 && countActiveJoker(state, 'j_burglar') === 0) {
+        state.discardsLeft += lostDiscards;
+      }
+      setSimMetaNum(state, 'water_lost_discards', 0);
+    } else if (blind.key === 'bl_needle') {
+      const lostHands = getSimMetaNum(state, 'needle_lost_hands') ?? 0;
+      if (lostHands > 0) {
+        state.handsLeft += lostHands;
+      }
+      setSimMetaNum(state, 'needle_lost_hands', 0);
+    }
+  }
+
+  syncBankruptAt(state);
+  refreshCardDebuffs(state);
 }
 
 function enforceCeruleanBellSelection(state: SimState): void {
@@ -282,11 +382,33 @@ function rotateRoundJokerTargets(state: SimState): void {
     if (mailCard) {
       state.tracking.mailRank = mailCard.rank;
     }
+    const castleCard = pickRandom(pool, state.rng, `castle_${state.round}`);
+    if (castleCard) {
+      state.tracking.castleSuit = castleCard.suit;
+    } else {
+      state.tracking.castleSuit = pickRandom(SUITS, state.rng, `castle_${state.round}`) ?? 'Spades';
+    }
+  } else {
+    state.tracking.castleSuit = pickRandom(SUITS, state.rng, `castle_${state.round}`) ?? 'Spades';
   }
   const ancientChoices = SUITS.filter((s) => s !== state.tracking.ancientSuit);
   state.tracking.ancientSuit =
     pickRandom(ancientChoices, state.rng, `ancient_${state.round}`) ?? 'Hearts';
-  state.tracking.castleSuit = pickRandom(SUITS, state.rng, `castle_${state.round}`) ?? 'Spades';
+}
+
+function recomputePendingBlindTargets(state: SimState): void {
+  const slots: BlindSlot[] = ['Small', 'Big', 'Boss'];
+  for (let i = 0; i < slots.length; i++) {
+    const b = state.blinds[slots[i]];
+    if (!b) continue;
+    if (b.status === 'Select' || b.status === 'Upcoming') {
+      b.targetChips = computeTargetChips(state, b.mult);
+    }
+  }
+  const active = getActiveBlind(state);
+  if (active && (active.status === 'Select' || active.status === 'Upcoming')) {
+    state.targetChips = active.targetChips;
+  }
 }
 
 function applyVoucherEffect(state: SimState, key: string): void {
@@ -294,12 +416,17 @@ function applyVoucherEffect(state: SimState, key: string): void {
     case 'v_overstock_norm':
     case 'v_overstock_plus':
       state.shopSlots += 1;
+      if (state.shop) {
+        state.shop.offers.push(generateAdditionalShopOffer(state));
+      }
       break;
     case 'v_clearance_sale':
       state.discountPercent = Math.max(state.discountPercent, 25);
+      if (state.shop) repriceCurrentShop(state);
       break;
     case 'v_liquidation':
       state.discountPercent = Math.max(state.discountPercent, 50);
+      if (state.shop) repriceCurrentShop(state);
       break;
     case 'v_hone':
       state.editionRate = Math.max(state.editionRate, 2);
@@ -309,19 +436,29 @@ function applyVoucherEffect(state: SimState, key: string): void {
       break;
     case 'v_reroll_surplus':
     case 'v_reroll_glut':
-      state.baseRerollCost = Math.max(0, state.baseRerollCost - 2);
-      state.rerollCost = Math.max(0, state.rerollCost - 2);
+      state.baseRerollCost = Math.max(1, state.baseRerollCost - 2);
+      state.rerollCost = state.rerollCost === 0 ? 0 : Math.max(1, state.rerollCost - 2);
       break;
     case 'v_crystal_ball':
       state.consumableSlots += 1;
       break;
+    case 'v_omen_globe':
+    case 'v_telescope':
+    case 'v_observatory':
+    case 'v_blank':
+    case 'v_directors_cut':
+    case 'v_retcon':
+      // Passive / queried at pack open, scoring, or boss reroll time
+      break;
     case 'v_grabber':
     case 'v_nacho_tong':
       state.handsPerRound += 1;
+      if (state.phase === 'PLAYING') state.handsLeft += 1;
       break;
     case 'v_wasteful':
     case 'v_recyclomancy':
       state.discardsPerRound += 1;
+      if (state.phase === 'PLAYING') state.discardsLeft += 1;
       break;
     case 'v_tarot_merchant':
       state.tarotRate = Math.max(state.tarotRate, 9.6);
@@ -345,15 +482,18 @@ function applyVoucherEffect(state: SimState, key: string): void {
       state.jokerSlots += 1;
       break;
     case 'v_magic_trick':
+    case 'v_illusion':
       state.playingCardRate = Math.max(state.playingCardRate, 4);
       break;
     case 'v_hieroglyph':
-      state.ante = Math.max(1, state.ante - 1);
+      state.ante = Math.max(0, state.ante - 1);
       state.handsPerRound = Math.max(1, state.handsPerRound - 1);
+      recomputePendingBlindTargets(state);
       break;
     case 'v_petroglyph':
-      state.ante = Math.max(1, state.ante - 1);
+      state.ante = Math.max(0, state.ante - 1);
       state.discardsPerRound = Math.max(0, state.discardsPerRound - 1);
+      recomputePendingBlindTargets(state);
       break;
     case 'v_paint_brush':
     case 'v_palette':
@@ -362,6 +502,35 @@ function applyVoucherEffect(state: SimState, key: string): void {
     default:
       break;
   }
+}
+
+const PACK_TAG_SPECS: Record<
+  string,
+  { boosterKey: string; kind: BoosterKind; size: BoosterSize; extra: number; choose: number }
+> = {
+  tag_charm: { boosterKey: 'p_arcana_mega_1', kind: 'Arcana', size: 'Mega', extra: 5, choose: 2 },
+  tag_meteor: { boosterKey: 'p_celestial_mega_1', kind: 'Celestial', size: 'Mega', extra: 5, choose: 2 },
+  tag_standard: { boosterKey: 'p_standard_mega_1', kind: 'Standard', size: 'Mega', extra: 5, choose: 2 },
+  tag_buffoon: { boosterKey: 'p_buffoon_mega_1', kind: 'Buffoon', size: 'Mega', extra: 4, choose: 2 },
+  tag_ethereal: { boosterKey: 'p_spectral_normal_1', kind: 'Spectral', size: 'Normal', extra: 2, choose: 1 },
+};
+
+function openPackForTag(state: SimState, tagKey: string, events: SimEvent[]): void {
+  const spec = PACK_TAG_SPECS[tagKey];
+  if (!spec) return;
+  if (state.pack !== null) {
+    // Queue additional free packs (e.g. from Double Tag) cleanly until the active pack closes
+    state.tags.push(tagKey);
+    return;
+  }
+  openBoosterPack(state, spec.boosterKey, spec.kind, spec.size, spec.extra, spec.choose);
+  runNonScoringHooks(state, 'open_booster', events, { itemKey: spec.boosterKey, itemKind: 'booster' });
+  events.push({
+    type: 'PACK_OPENED',
+    message: `Opened free ${spec.size} ${spec.kind} Pack`,
+    sound: 'magic_crumple',
+    payload: { boosterKey: spec.boosterKey, tagKey },
+  });
 }
 
 function applySingleTag(state: SimState, tagKey: string, events: SimEvent[]): void {
@@ -409,7 +578,7 @@ function applySingleTag(state: SimState, tagKey: string, events: SimEvent[]): vo
       break;
     }
     case 'tag_garbage': {
-      state.dollars = safeNum(state.dollars + state.tracking.discardsUsedTotal, state.dollars);
+      state.dollars = safeNum(state.dollars + getUnusedDiscardsTotal(state), state.dollars);
       break;
     }
     case 'tag_orbital': {
@@ -427,13 +596,23 @@ function applySingleTag(state: SimState, tagKey: string, events: SimEvent[]): vo
       for (let i = 0; i < 2; i++) {
         if (state.jokers.length >= getEffectiveJokerSlots(state)) break;
         const def = pickJokerDefFromPool(state, `topup_${i}`, { forcedRarity: 1 });
-        if (def) state.jokers.push(createJokerInstance(state, def.key));
+        if (def) {
+          state.jokers.push(
+            createJokerInstance(state, def.key, {
+              eternal: state.tracking.allEternal && def.eternalCompat,
+            })
+          );
+        }
       }
       syncBankruptAt(state);
       break;
     }
     case 'tag_boss': {
-      const newBoss = pickBossBlind(state);
+      const newBoss = pickBossBlind(state, undefined, state.blinds.Boss?.key);
+      const bossDollars =
+        state.tracking.noReward || hasSimFlag(state, 'rule:no_reward_Boss')
+          ? 0
+          : newBoss.dollars;
       state.blinds.Boss = {
         slot: 'Boss',
         key: newBoss.key,
@@ -441,7 +620,7 @@ function applySingleTag(state: SimState, tagKey: string, events: SimEvent[]): vo
         status: state.blinds.Boss.status,
         mult: newBoss.mult,
         targetChips: computeTargetChips(state, newBoss.mult),
-        dollars: newBoss.dollars,
+        dollars: bossDollars,
         tagKey: null,
         bossColor: newBoss.bossColor,
         triggered: false,
@@ -453,19 +632,11 @@ function applySingleTag(state: SimState, tagKey: string, events: SimEvent[]): vo
       break;
     }
     case 'tag_charm':
-      openBoosterPack(state, 'p_arcana_mega_1', 'Arcana', 'Mega', 5, 2);
-      break;
     case 'tag_meteor':
-      openBoosterPack(state, 'p_celestial_mega_1', 'Celestial', 'Mega', 5, 2);
-      break;
     case 'tag_standard':
-      openBoosterPack(state, 'p_standard_mega_1', 'Standard', 'Mega', 5, 2);
-      break;
     case 'tag_buffoon':
-      openBoosterPack(state, 'p_buffoon_mega_1', 'Buffoon', 'Mega', 4, 2);
-      break;
     case 'tag_ethereal':
-      openBoosterPack(state, 'p_spectral_normal_1', 'Spectral', 'Normal', 2, 1);
+      openPackForTag(state, tagKey, events);
       break;
     default:
       state.tags.push(tagKey);
@@ -520,14 +691,12 @@ function applyLifecycleHookResult(
     }
   }
   if (res.disableBoss) {
-    const blind = getActiveBlind(state);
-    if (blind.slot === 'Boss') {
-      blind.disabled = true;
-      refreshCardDebuffs(state);
-    }
+    disableActiveBossBlind(state);
   }
   if (res.addStoneCard) {
-    const stone = createCardInstance(state, 'Spades', '2', { enhancement: 'm_stone' });
+    const suit = pickRandom(SUITS, state.rng, `stone_s_${state.round}`) ?? 'Spades';
+    const rank = pickRandom(RANKS, state.rng, `stone_r_${state.round}`) ?? '2';
+    const stone = createCardInstance(state, suit, rank, { enhancement: 'm_stone' });
     state.fullDeck.push(stone);
     state.drawPile.push(stone.id);
     notifyJokersCardAdded(state, stone, events);
@@ -546,13 +715,19 @@ function applyLifecycleHookResult(
   if (res.createJoker) {
     const ed = res.createJoker.edition ?? 'none';
     if (ed === 'e_negative' || state.jokers.length < getEffectiveJokerSlots(state)) {
-      const key =
-        res.createJoker.key ??
-        pickJokerDefFromPool(state, `hook_joker_${joker.key}`, {
-          forcedRarity: res.createJoker.rarity,
-        })?.key;
+      const picked = res.createJoker.key
+        ? JOKER_MAP[res.createJoker.key]
+        : pickJokerDefFromPool(state, `hook_joker_${joker.key}`, {
+            forcedRarity: res.createJoker.rarity,
+          });
+      const key = res.createJoker.key ?? picked?.key;
       if (key) {
-        state.jokers.push(createJokerInstance(state, key, { edition: ed }));
+        state.jokers.push(
+          createJokerInstance(state, key, {
+            edition: ed,
+            eternal: state.tracking.allEternal && (picked?.eternalCompat ?? true),
+          })
+        );
       }
     }
   }
@@ -564,8 +739,13 @@ function applyLifecycleHookResult(
   }
   if (res.destroySelf && !joker.eternal) {
     destroyedJokerIds.add(joker.id);
-    if (joker.key === 'j_gros_michel' && !state.tracking.bannedKeys.includes('j_gros_michel')) {
-      state.tracking.bannedKeys.push('j_gros_michel');
+    if (joker.key === 'j_gros_michel') {
+      if (!state.tracking.bannedKeys.includes('j_gros_michel')) {
+        state.tracking.bannedKeys.push('j_gros_michel');
+      }
+      if (!state.tracking.bannedOthers.includes('__extinct_gros_michel')) {
+        state.tracking.bannedOthers.push('__extinct_gros_michel');
+      }
     }
   }
   if (res.destroyCardId) {
@@ -612,6 +792,13 @@ function runNonScoringHooks(
       targetJoker = resolved.target;
       targetIndex = resolved.targetIndex;
       isBlueprint = targetIndex !== i;
+    }
+
+    if (
+      (stage === 'first_hand_drawn' && targetJoker.key === 'j_certificate') ||
+      (stage === 'end_of_round' && targetJoker.key === 'j_gift')
+    ) {
+      continue;
     }
 
     const res = evaluateJokerHook(targetJoker.key, {
@@ -662,26 +849,93 @@ function runNonScoringHooks(
 }
 
 function handleRoundVictoryTransition(state: SimState, events: SimEvent[]): void {
-  // 1. Blue Seal: held cards with Blue Seal create the Planet for the final played hand
+  const blind = getActiveBlind(state);
+  blind.status = 'Defeated';
+
+  // 1. Blue Seal: held cards with Blue Seal create the Planet for the final played hand (Mime retriggers)
   const lastHand = state.tracking.lastPlayedHandId;
   if (lastHand) {
     const planetDef = PLANETS.find((p) => p.handType === lastHand);
-    const planetKey = planetDef?.key ?? null;
+    const planetKey =
+      planetDef?.key ??
+      Object.entries(PLANET_HAND_FALLBACK).find(([, h]) => h === lastHand)?.[0] ??
+      null;
     if (planetKey) {
-      for (let i = 0; i < state.hand.length; i++) {
-        const card = getCardById(state, state.hand[i]);
-        if (!card || card.debuffed || card.seal !== 'Blue') continue;
-        if (state.consumables.length < getEffectiveConsumableSlots(state)) {
-          state.consumables.push(createConsumableInstance(state, planetKey));
+      const probMultiplier = getProbabilityMultiplier(state.jokers);
+      const rand = (k: string) => nextRandom(state.rng, k);
+      const randInt = (k: string, max: number) => nextRandomInt(state.rng, k, max);
+      const isFace = (c: CardInstance) => isCardFace(c, state.jokers);
+      const isSuit = (c: CardInstance, s: Suit) => isCardSuit(c, s, state.jokers);
+      const heldCards = state.hand
+        .map((id) => getCardById(state, id))
+        .filter((c): c is CardInstance => Boolean(c));
+
+      for (let i = 0; i < heldCards.length; i++) {
+        const card = heldCards[i];
+        if (card.debuffed || card.seal !== 'Blue') continue;
+        let triggers = 1;
+        for (let j = 0; j < state.jokers.length; j++) {
+          const resolved = resolveCopiedJoker(state.jokers, j);
+          if (!resolved) continue;
+          const rep = evaluateJokerHook(resolved.target.key, {
+            stage: 'repetition_hand',
+            state,
+            joker: resolved.target,
+            jokerIndex: resolved.targetIndex,
+            isBlueprint: resolved.targetIndex !== j,
+            blueprintSource: resolved.targetIndex !== j ? state.jokers[j] : undefined,
+            card,
+            heldCards,
+            probMultiplier,
+            rand,
+            randInt,
+            isFace,
+            isSuit,
+          });
+          if (rep?.repetitions && rep.repetitions > 0) {
+            triggers += Math.floor(rep.repetitions);
+          }
+        }
+        for (let t = 0; t < triggers; t++) {
+          if (state.consumables.length < getEffectiveConsumableSlots(state)) {
+            state.consumables.push(createConsumableInstance(state, planetKey));
+          }
         }
       }
     }
   }
 
-  // 2. End-of-round Joker hooks (Egg sell value, Gros Michel / Cavendish extinction, etc.)
+  // 2. Engine-owned j_gift (+1 sell value to ALL Jokers and Consumables at end of round)
+  let totalGiftBonus = 0;
+  for (let i = 0; i < state.jokers.length; i++) {
+    const j = state.jokers[i];
+    if (!j.debuffed && j.key === 'j_gift') {
+      totalGiftBonus += Math.max(1, safeNum(Number(j.state.extra ?? 1), 1));
+    }
+  }
+  if (totalGiftBonus > 0) {
+    for (let i = 0; i < state.jokers.length; i++) {
+      state.jokers[i].extraSellValue += totalGiftBonus;
+      recalcJokerSellValue(state.jokers[i]);
+    }
+    for (let i = 0; i < state.consumables.length; i++) {
+      state.consumables[i].sellValue = Math.max(
+        1,
+        safeNum(state.consumables[i].sellValue, 1) + totalGiftBonus
+      );
+    }
+  }
+
+  // 3. End-of-round Joker hooks (Egg, Gros Michel, Cavendish, Invisible invis_rounds++, Rocket boss scale, Turtle Bean, Popcorn, Campfire, etc.)
   runNonScoringHooks(state, 'end_of_round', events);
 
-  // 3. Perishable Joker tally decrement (5 rounds -> debuffed permanently)
+  // 4. Record unused discards for Garbage Tag (+$1 per unused discard this run)
+  addUnusedDiscards(state, state.discardsLeft);
+
+  // 5. Compute Cashout Breakdown BEFORE Perishable final-round expiry & BEFORE clearing round debuffs
+  state.cashout = computeCashoutBreakdown(state);
+
+  // 6. Perishable Joker tally decrement (5 rounds -> debuffed permanently)
   for (let i = 0; i < state.jokers.length; i++) {
     const j = state.jokers[i];
     if (j.perishable && !j.debuffed) {
@@ -691,8 +945,9 @@ function handleRoundVictoryTransition(state: SimState, events: SimEvent[]): void
       }
     }
   }
+  syncBankruptAt(state);
 
-  // 4. Clear temporary boss states (faceDown, Crimson Heart, Cerulean Bell, temp handSize)
+  // 7. Clear temporary boss states (faceDown, Crimson Heart, Cerulean Bell, temp handSize)
   if (state.tracking.crimsonHeartDisabledJokerId) {
     const j = state.jokers.find((x) => x.id === state.tracking.crimsonHeartDisabledJokerId);
     if (j && !(j.perishable && j.perishableTally <= 0)) j.debuffed = false;
@@ -703,25 +958,52 @@ function handleRoundVictoryTransition(state: SimState, events: SimEvent[]): void
     state.fullDeck[i].faceDown = false;
     state.fullDeck[i].debuffed = false;
   }
+  // Keep permanent debuffs for Double or Nothing challenge
+  refreshCardDebuffs(state);
   state.tracking.ceruleanBellForcedCardId = null;
   state.tracking.handSizeDeltaThisRound = 0;
+  setSimMetaNum(state, 'water_lost_discards', 0);
+  setSimMetaNum(state, 'needle_lost_hands', 0);
   // Consume visual Juggle tag if present
   state.tags = state.tags.filter((t) => t !== 'tag_juggle');
 
-  // 5. Mark active blind Defeated & handle Anaglyph Deck Boss bonus
-  const blind = getActiveBlind(state);
-  blind.status = 'Defeated';
+  // 8. Rotate round targets at end of round (Idol, Ancient, Castle, Mail-In Rebate)
+  rotateRoundJokerTargets(state);
+
+  // 9. Anaglyph Deck Boss bonus (gain Double Tag after defeating each Boss Blind)
   if (
     blind.slot === 'Boss' &&
+    !state.challengeId &&
     (state.deckId === 'b_anaglyph' || Boolean(DECK_MAP[state.deckId]?.config.anaglyph))
   ) {
     grantTag(state, 'tag_double', events);
   }
 
-  // 6. Compute Cashout Breakdown
-  state.cashout = computeCashoutBreakdown(state);
+  // 10. Typecast challenge Ante-4 Boss trigger (all Jokers become Eternal; Joker slots set to 0)
+  if (blind.slot === 'Boss') {
+    const setEternalAnte = getSimMetaNum(state, 'rule:set_eternal_ante');
+    if (
+      setEternalAnte !== null &&
+      state.ante >= setEternalAnte &&
+      !hasSimFlag(state, 'rule:typecast_eternal_done')
+    ) {
+      for (let i = 0; i < state.jokers.length; i++) {
+        state.jokers[i].eternal = true;
+      }
+      addSimFlag(state, 'rule:typecast_eternal_done');
+    }
+    const setSlotsAnte = getSimMetaNum(state, 'rule:set_joker_slots_ante');
+    if (
+      setSlotsAnte !== null &&
+      state.ante >= setSlotsAnte &&
+      !hasSimFlag(state, 'rule:typecast_slots_done')
+    ) {
+      state.jokerSlots = 0;
+      addSimFlag(state, 'rule:typecast_slots_done');
+    }
+  }
 
-  // 7. Ante 8 Boss Victory vs Standard Cashout
+  // 11. Ante 8 Boss Victory vs Standard Cashout
   if (blind.slot === 'Boss' && state.ante === state.winAnte && !state.endless) {
     state.phase = 'VICTORY';
     events.push({
@@ -741,7 +1023,7 @@ function handleRoundVictoryTransition(state: SimState, events: SimEvent[]): void
   }
 }
 
-function closeOpenPack(state: SimState): void {
+function closeOpenPack(state: SimState, events: SimEvent[]): void {
   if (state.pack?.needsHand) {
     // Return dealt hand cards cleanly to draw pile
     state.drawPile = state.fullDeck.map((c) => c.id);
@@ -751,6 +1033,15 @@ function closeOpenPack(state: SimState): void {
     state.selectedCardIds = [];
   }
   state.pack = null;
+
+  // Auto-open any queued free pack tags (e.g. from Double Tag + Charm/Meteor/Standard/Buffoon/Ethereal)
+  const queuedIdx = state.tags.findIndex((t) => Boolean(PACK_TAG_SPECS[t]));
+  if (queuedIdx >= 0) {
+    const nextPackTag = state.tags.splice(queuedIdx, 1)[0];
+    openPackForTag(state, nextPackTag, events);
+    return;
+  }
+
   state.phase = state.shop !== null ? 'SHOP' : 'BLIND_SELECT';
 }
 
@@ -954,51 +1245,93 @@ export function startRun(
   state.challengeId = challengeId ?? null;
   state.phase = 'BLIND_SELECT';
 
-  // Stake 5 (Blue Stake): -1 Discard
-  if (state.stake >= 5) {
+  const challenge = challengeId ? CHALLENGE_MAP[challengeId] : undefined;
+
+  // Stake 5 (Blue Stake): -1 Discard (challenges always play on neutral Challenge Deck / White Stake)
+  if (!challenge && state.stake >= 5) {
     state.discardsPerRound = Math.max(0, state.discardsPerRound - 1);
   }
 
-  // Apply Deck Config (with built-in fallbacks for core Wave 1 decks if catalog empty)
+  // Apply Deck Config (all 15 decks supported both via catalog config and clean fallback)
   const deckDef = DECK_MAP[state.deckId];
-  const cfg = deckDef?.config;
-  if (cfg) {
-    if (cfg.hands) state.handsPerRound = Math.max(1, state.handsPerRound + cfg.hands);
-    if (cfg.discards) state.discardsPerRound = Math.max(0, state.discardsPerRound + cfg.discards);
-    if (cfg.dollars) state.dollars += cfg.dollars;
-    if (cfg.jokerSlots) state.jokerSlots = Math.max(0, state.jokerSlots + cfg.jokerSlots);
-    if (cfg.consumableSlots) state.consumableSlots = Math.max(0, state.consumableSlots + cfg.consumableSlots);
-    if (cfg.handSize) state.handSize = Math.max(1, state.handSize + cfg.handSize);
-    if (cfg.anteScaling) state.anteScaling *= cfg.anteScaling;
-    if (cfg.spectralRate !== undefined) state.spectralRate = cfg.spectralRate;
-    if (cfg.noInterest) state.tracking.noInterest = true;
-    if (cfg.vouchers) {
-      for (let i = 0; i < cfg.vouchers.length; i++) {
-        const vk = cfg.vouchers[i];
-        if (!state.vouchers.includes(vk)) {
-          state.vouchers.push(vk);
-          applyVoucherEffect(state, vk);
+  const cfg = challenge ? undefined : deckDef?.config;
+  const grantStartingVoucher = (vk: string): void => {
+    if (!state.vouchers.includes(vk)) {
+      state.vouchers.push(vk);
+      applyVoucherEffect(state, vk);
+    }
+  };
+  if (!challenge) {
+    if (cfg) {
+      if (cfg.hands) state.handsPerRound = Math.max(1, state.handsPerRound + cfg.hands);
+      if (cfg.discards) state.discardsPerRound = Math.max(0, state.discardsPerRound + cfg.discards);
+      if (cfg.dollars) state.dollars += cfg.dollars;
+      if (cfg.jokerSlots) state.jokerSlots = Math.max(0, state.jokerSlots + cfg.jokerSlots);
+      if (cfg.consumableSlots) state.consumableSlots = Math.max(0, state.consumableSlots + cfg.consumableSlots);
+      if (cfg.handSize) state.handSize = Math.max(1, state.handSize + cfg.handSize);
+      if (cfg.anteScaling) state.anteScaling *= cfg.anteScaling;
+      if (cfg.spectralRate !== undefined) state.spectralRate = cfg.spectralRate;
+      if (cfg.noInterest) state.tracking.noInterest = true;
+      if (cfg.vouchers) {
+        for (let i = 0; i < cfg.vouchers.length; i++) {
+          grantStartingVoucher(cfg.vouchers[i]);
         }
       }
-    }
-    if (cfg.consumables) {
-      for (let i = 0; i < cfg.consumables.length; i++) {
-        state.consumables.push(createConsumableInstance(state, cfg.consumables[i]));
+      if (cfg.consumables) {
+        for (let i = 0; i < cfg.consumables.length; i++) {
+          state.consumables.push(createConsumableInstance(state, cfg.consumables[i]));
+        }
       }
-    }
-  } else {
-    if (state.deckId === 'b_red') state.discardsPerRound += 1;
-    else if (state.deckId === 'b_blue') state.handsPerRound += 1;
-    else if (state.deckId === 'b_plasma') state.anteScaling *= 2;
-    else if (state.deckId === 'b_yellow') state.dollars += 10;
-    else if (state.deckId === 'b_black') {
-      state.jokerSlots += 1;
-      state.handsPerRound = Math.max(1, state.handsPerRound - 1);
+    } else {
+      switch (state.deckId) {
+        case 'b_red':
+          state.discardsPerRound += 1;
+          break;
+        case 'b_blue':
+          state.handsPerRound += 1;
+          break;
+        case 'b_yellow':
+          state.dollars += 10;
+          break;
+        case 'b_green':
+          state.tracking.noInterest = true;
+          break;
+        case 'b_black':
+          state.jokerSlots += 1;
+          state.handsPerRound = Math.max(1, state.handsPerRound - 1);
+          break;
+        case 'b_magic':
+          grantStartingVoucher('v_crystal_ball');
+          state.consumables.push(createConsumableInstance(state, 'c_fool'));
+          state.consumables.push(createConsumableInstance(state, 'c_fool'));
+          break;
+        case 'b_nebula':
+          grantStartingVoucher('v_telescope');
+          state.consumableSlots = Math.max(0, state.consumableSlots - 1);
+          break;
+        case 'b_ghost':
+          state.spectralRate = 2;
+          state.consumables.push(createConsumableInstance(state, 'c_hex'));
+          break;
+        case 'b_zodiac':
+          grantStartingVoucher('v_tarot_merchant');
+          grantStartingVoucher('v_planet_merchant');
+          grantStartingVoucher('v_overstock_norm');
+          break;
+        case 'b_painted':
+          state.handSize += 2;
+          state.jokerSlots = Math.max(0, state.jokerSlots - 1);
+          break;
+        case 'b_plasma':
+          state.anteScaling *= 2;
+          break;
+        default:
+          break;
+      }
     }
   }
 
   // Build Playing Card Deck
-  const challenge = challengeId ? CHALLENGE_MAP[challengeId] : undefined;
   if (challenge?.deck?.cards && challenge.deck.cards.length > 0) {
     for (let i = 0; i < challenge.deck.cards.length; i++) {
       const spec = challenge.deck.cards[i];
@@ -1007,19 +1340,19 @@ export function startRun(
       state.fullDeck.push(
         createCardInstance(state, suit, rank, {
           enhancement: spec.e ?? challenge.deck.enhancement ?? 'none',
-          edition: spec.d ?? 'none',
-          seal: spec.g ?? 'none',
+          edition: normalizeEdition(spec.d),
+          seal: normalizeSeal(spec.g),
         })
       );
     }
-  } else if (cfg?.checkered) {
+  } else if (!challenge && (cfg?.checkered || state.deckId === 'b_checkered')) {
     const checkeredSuits: Suit[] = ['Spades', 'Spades', 'Hearts', 'Hearts'];
     for (let s = 0; s < checkeredSuits.length; s++) {
       for (let r = 0; r < RANKS.length; r++) {
         state.fullDeck.push(createCardInstance(state, checkeredSuits[s], RANKS[r]));
       }
     }
-  } else if (cfg?.randomizeRankSuit) {
+  } else if (!challenge && (cfg?.randomizeRankSuit || state.deckId === 'b_erratic')) {
     for (let i = 0; i < 52; i++) {
       const suit = pickRandom(SUITS, state.rng, `erratic_s_${i}`) ?? 'Spades';
       const rank = pickRandom(RANKS, state.rng, `erratic_r_${i}`) ?? 'Ace';
@@ -1027,7 +1360,7 @@ export function startRun(
     }
   } else {
     const noRanks = new Set<Rank>(challenge?.deck?.noRanks ?? []);
-    if (cfg?.removeFaces) {
+    if (!challenge && (cfg?.removeFaces || state.deckId === 'b_abandoned')) {
       noRanks.add('Jack');
       noRanks.add('Queen');
       noRanks.add('King');
@@ -1052,25 +1385,45 @@ export function startRun(
       for (let i = 0; i < challenge.rules.modifiers.length; i++) {
         const m = challenge.rules.modifiers[i];
         if (m.id === 'dollars') state.dollars = m.value;
-        else if (m.id === 'discards') state.discardsPerRound = m.value;
-        else if (m.id === 'hands') state.handsPerRound = m.value;
+        else if (m.id === 'discards') state.discardsPerRound = Math.max(0, m.value);
+        else if (m.id === 'hands') state.handsPerRound = Math.max(1, m.value);
         else if (m.id === 'reroll_cost') {
-          state.baseRerollCost = m.value;
-          state.rerollCost = m.value;
-        } else if (m.id === 'joker_slots') state.jokerSlots = m.value;
-        else if (m.id === 'consumable_slots') state.consumableSlots = m.value;
-        else if (m.id === 'hand_size') state.handSize = m.value;
+          state.baseRerollCost = Math.max(0, m.value);
+          state.rerollCost = Math.max(0, m.value);
+        } else if (m.id === 'joker_slots') state.jokerSlots = Math.max(0, m.value);
+        else if (m.id === 'consumable_slots') state.consumableSlots = Math.max(0, m.value);
+        else if (m.id === 'hand_size') state.handSize = Math.max(1, m.value);
       }
     }
     if (challenge.rules.custom) {
       for (let i = 0; i < challenge.rules.custom.length; i++) {
         const rule = challenge.rules.custom[i];
         if (rule.id === 'no_reward') state.tracking.noReward = true;
-        else if (rule.id === 'no_extra_hand_money') state.tracking.noExtraHandMoney = true;
+        else if (rule.id === 'no_reward_specific' && rule.value) {
+          addSimFlag(state, `rule:no_reward_${String(rule.value)}`);
+        } else if (rule.id === 'no_extra_hand_money') state.tracking.noExtraHandMoney = true;
         else if (rule.id === 'no_interest') state.tracking.noInterest = true;
         else if (rule.id === 'all_eternal') state.tracking.allEternal = true;
-        else if (rule.id === 'flipped_cards') state.tracking.flippedCardsChance = Number(rule.value ?? 4);
-        else if (rule.id === 'inflation') state.tracking.inflationCostBump = 1;
+        else if (rule.id === 'flipped_cards') {
+          state.tracking.flippedCardsChance = Math.max(1, Number(rule.value ?? 4));
+        } else if (rule.id === 'inflation') {
+          addSimFlag(state, 'rule:inflation');
+        } else if (rule.id === 'no_shop_jokers') {
+          addSimFlag(state, 'rule:no_shop_jokers');
+          state.jokerRate = 0;
+        } else if (rule.id === 'chips_dollar_cap') {
+          addSimFlag(state, 'rule:chips_dollar_cap');
+        } else if (rule.id === 'minus_hand_size_per_X_dollar') {
+          setSimMetaNum(state, 'rule:minus_hand_size_per_X_dollar', Math.max(1, Number(rule.value ?? 5)));
+        } else if (rule.id === 'discard_cost') {
+          setSimMetaNum(state, 'rule:discard_cost', Math.max(1, Number(rule.value ?? 1)));
+        } else if (rule.id === 'debuff_played_cards') {
+          addSimFlag(state, 'rule:debuff_played_cards');
+        } else if (rule.id === 'set_eternal_ante') {
+          setSimMetaNum(state, 'rule:set_eternal_ante', Number(rule.value ?? 4));
+        } else if (rule.id === 'set_joker_slots_ante') {
+          setSimMetaNum(state, 'rule:set_joker_slots_ante', Number(rule.value ?? 4));
+        }
       }
     }
     if (challenge.restrictions.bannedCards) {
@@ -1083,20 +1436,18 @@ export function startRun(
       state.tracking.bannedOthers.push(...challenge.restrictions.bannedOther);
     }
     for (let i = 0; i < challenge.vouchers.length; i++) {
-      const vk = challenge.vouchers[i].id;
-      if (!state.vouchers.includes(vk)) {
-        state.vouchers.push(vk);
-        applyVoucherEffect(state, vk);
-      }
+      grantStartingVoucher(challenge.vouchers[i].id);
     }
     for (let i = 0; i < challenge.jokers.length; i++) {
       const js = challenge.jokers[i];
-      state.jokers.push(
-        createJokerInstance(state, js.id, {
-          eternal: Boolean(js.eternal),
-          edition: js.edition ?? 'none',
-        })
-      );
+      const inst = createJokerInstance(state, js.id, {
+        eternal: Boolean(js.eternal),
+        edition: normalizeEdition(js.edition),
+      });
+      state.jokers.push(inst);
+      if (js.pinned) {
+        setSimMetaStr(state, 'rule:pinned_joker_id', inst.id);
+      }
     }
     for (let i = 0; i < challenge.consumables.length; i++) {
       state.consumables.push(createConsumableInstance(state, challenge.consumables[i].id));
@@ -1106,6 +1457,7 @@ export function startRun(
   state.handsLeft = state.handsPerRound;
   state.discardsLeft = state.discardsPerRound;
   state.drawPile = state.fullDeck.map((c) => c.id);
+  rotateRoundJokerTargets(state);
   syncBankruptAt(state);
 
   // Re-generate Ante 1 Blinds now that deck anteScaling, stake, and challenge bans are finalized
@@ -1129,9 +1481,142 @@ export function stepSimTick(state: SimState): SimState {
   return { ...state, tick: state.tick + 1 };
 }
 
+const CERTIFICATE_SEALS: SealId[] = ['Gold', 'Red', 'Blue', 'Purple'];
+
+function runSettingBlindJokers(state: SimState, events: SimEvent[]): void {
+  const blind = getActiveBlind(state);
+  const probMultiplier = getProbabilityMultiplier(state.jokers);
+  const rand = (k: string) => nextRandom(state.rng, k);
+  const randInt = (k: string, max: number) => nextRandomInt(state.rng, k, max);
+  const isFace = (c: CardInstance) => isCardFace(c, state.jokers);
+  const isSuit = (c: CardInstance, s: Suit) => isCardSuit(c, s, state.jokers);
+
+  const initialIds = state.jokers.map((j) => j.id);
+  const destroyedCardIds = new Set<string>();
+
+  for (let sIdx = 0; sIdx < initialIds.length; sIdx++) {
+    const sourceIdx = state.jokers.findIndex((j) => j.id === initialIds[sIdx]);
+    if (sourceIdx < 0) continue;
+    const sourceJoker = state.jokers[sourceIdx];
+    if (sourceJoker.debuffed) continue;
+
+    const resolved = resolveCopiedJoker(state.jokers, sourceIdx);
+    if (!resolved) continue;
+    const targetJoker = resolved.target;
+    const targetIndex = resolved.targetIndex;
+    const isBlueprint = targetIndex !== sourceIdx;
+
+    if (targetJoker.key === 'j_burglar' || targetJoker.key === 'j_certificate') {
+      // Handled in dedicated Burglar / Certificate steps to guarantee zero double-triggers
+      continue;
+    }
+
+    if (targetJoker.key === 'j_marble') {
+      const suit = pickRandom(SUITS, state.rng, `marble_s_${state.round}_${sIdx}`) ?? 'Spades';
+      const rank = pickRandom(RANKS, state.rng, `marble_r_${state.round}_${sIdx}`) ?? '2';
+      const stone = createCardInstance(state, suit, rank, { enhancement: 'm_stone' });
+      state.fullDeck.push(stone);
+      events.push({
+        type: 'CARD_CREATED',
+        message: 'Marble Joker added a Stone Card',
+        sound: 'card1',
+        payload: { cardId: stone.id },
+      });
+      notifyJokersCardAdded(state, stone, events);
+      continue;
+    }
+
+    if (targetJoker.key === 'j_riff_raff') {
+      const spawnCount = Math.max(1, Math.floor(safeNum(Number(targetJoker.state.extra ?? 2), 2)));
+      for (let k = 0; k < spawnCount; k++) {
+        if (state.jokers.length >= getEffectiveJokerSlots(state)) break;
+        const def = pickJokerDefFromPool(state, `riff_raff_${state.round}_${sIdx}_${k}`, {
+          forcedRarity: 1,
+        });
+        if (def) {
+          const spawned = createJokerInstance(state, def.key, {
+            eternal: state.tracking.allEternal && def.eternalCompat,
+          });
+          state.jokers.push(spawned);
+          events.push({
+            type: 'CARD_CREATED',
+            message: `Riff-Raff created ${def.name}`,
+            sound: 'card1',
+            payload: { jokerId: spawned.id, key: spawned.key },
+          });
+        }
+      }
+      syncBankruptAt(state);
+      continue;
+    }
+
+    if (targetJoker.key === 'j_madness') {
+      if (!isBlueprint && (blind.slot === 'Small' || blind.slot === 'Big')) {
+        const curX = safeNum(Number(targetJoker.state.x_mult ?? targetJoker.state.Xmult ?? 1), 1);
+        const step = safeNum(Number(targetJoker.state.extra ?? 0.5), 0.5);
+        targetJoker.state.x_mult = Math.round((curX + step) * 100) / 100;
+        const victims = state.jokers.filter((j) => j.id !== targetJoker.id && !j.eternal);
+        const victim = pickRandom(victims, state.rng, `madness_${state.round}_${sIdx}`);
+        if (victim) {
+          state.jokers = state.jokers.filter((j) => j.id !== victim.id);
+          events.push({
+            type: 'JOKER_DESTROYED',
+            message: `Madness destroyed ${JOKER_MAP[victim.key]?.name ?? victim.key}`,
+            sound: 'slice1',
+            payload: { jokerId: victim.id, key: victim.key },
+          });
+          syncBankruptAt(state);
+        }
+      }
+      continue;
+    }
+
+    const stepDestroyedJokers = new Set<string>();
+    const res = evaluateJokerHook(targetJoker.key, {
+      stage: 'setting_blind',
+      state,
+      joker: targetJoker,
+      jokerIndex: targetIndex,
+      isBlueprint,
+      blueprintSource: isBlueprint ? sourceJoker : undefined,
+      probMultiplier,
+      rand,
+      randInt,
+      isFace,
+      isSuit,
+    });
+    if (res) {
+      applyLifecycleHookResult(state, sourceJoker, res, events, stepDestroyedJokers, destroyedCardIds);
+    }
+    if (stepDestroyedJokers.size > 0) {
+      for (let i = 0; i < state.jokers.length; i++) {
+        const j = state.jokers[i];
+        if (stepDestroyedJokers.has(j.id)) {
+          events.push({
+            type: 'JOKER_DESTROYED',
+            message: `${JOKER_MAP[j.key]?.name ?? j.key} destroyed`,
+            sound: 'slice1',
+            payload: { jokerId: j.id, key: j.key },
+          });
+        }
+      }
+      state.jokers = state.jokers.filter((j) => !stepDestroyedJokers.has(j.id));
+      syncBankruptAt(state);
+    }
+  }
+
+  if (destroyedCardIds.size > 0) {
+    const removed = state.fullDeck.filter((c) => destroyedCardIds.has(c.id));
+    state.fullDeck = state.fullDeck.filter((c) => !destroyedCardIds.has(c.id));
+    state.tracking.cardsDestroyedTotal += removed.length;
+    notifyJokersCardsDestroyed(state, removed, events);
+  }
+}
+
 function selectActiveBlindInternal(state: SimState, events: SimEvent[]): void {
   const blind = getActiveBlind(state);
   blind.status = 'Current';
+  blind.triggered = false;
   state.round += 1;
   state.stats.highestRound = Math.max(state.stats.highestRound, state.round);
   state.roundChips = 0;
@@ -1151,40 +1636,42 @@ function selectActiveBlindInternal(state: SimState, events: SimEvent[]): void {
   state.tracking.verdantLeafSold = false;
   state.tracking.ceruleanBellForcedCardId = null;
   state.tracking.oxMostPlayedHand = state.tracking.mostPlayedHand;
+  setSimMetaNum(state, 'water_lost_discards', 0);
+  setSimMetaNum(state, 'needle_lost_hands', 0);
   for (let i = 0; i < POKER_HAND_IDS.length; i++) {
     state.handLevels[POKER_HAND_IDS[i]].playedThisRound = 0;
   }
-  rotateRoundJokerTargets(state);
 
-  // Compute hands & discards for round
+  // Chicot disables Boss Blind automatically (incl. Wall 4x->2x, Violet Vessel 6x->2x)
+  if (blind.slot === 'Boss' && countActiveJoker(state, 'j_chicot') > 0) {
+    disableActiveBossBlind(state);
+  }
+
+  // Compute base hands & discards before boss/Burglar overrides
   const troubadourCount = countActiveJoker(state, 'j_troubadour');
   const drunkardCount = countActiveJoker(state, 'j_drunkard');
   const merryAndyCount = countActiveJoker(state, 'j_merry_andy');
-  const burglarCount = countActiveJoker(state, 'j_burglar');
 
-  state.handsLeft = Math.max(
+  let baseHands = Math.max(
     1,
-    state.handsPerRound + state.tracking.handsDeltaNextRound - troubadourCount + burglarCount * 3
+    state.handsPerRound + state.tracking.handsDeltaNextRound - troubadourCount
   );
-  state.discardsLeft =
-    burglarCount > 0
-      ? 0
-      : Math.max(0, state.discardsPerRound + state.tracking.discardsDeltaNextRound + drunkardCount + merryAndyCount * 3);
+  let baseDiscards = Math.max(
+    0,
+    state.discardsPerRound + state.tracking.discardsDeltaNextRound + drunkardCount + merryAndyCount * 3
+  );
   state.tracking.handsDeltaNextRound = 0;
   state.tracking.discardsDeltaNextRound = 0;
-
-  // Chicot disables Boss Blind automatically
-  if (blind.slot === 'Boss' && countActiveJoker(state, 'j_chicot') > 0) {
-    blind.disabled = true;
-  }
 
   // Boss Blind start-of-round effects
   if (blind.slot === 'Boss' && !blind.disabled) {
     if (blind.key === 'bl_water') {
-      state.discardsLeft = 0;
+      setSimMetaNum(state, 'water_lost_discards', baseDiscards);
+      baseDiscards = 0;
       blind.triggered = true;
     } else if (blind.key === 'bl_needle') {
-      state.handsLeft = 1;
+      setSimMetaNum(state, 'needle_lost_hands', Math.max(0, baseHands - 1));
+      baseHands = 1;
       blind.triggered = true;
     } else if (blind.key === 'bl_final_acorn' && state.jokers.length > 0) {
       for (let i = 0; i < state.jokers.length; i++) state.jokers[i].faceDown = true;
@@ -1194,10 +1681,24 @@ function selectActiveBlindInternal(state: SimState, events: SimEvent[]): void {
     applyCrimsonHeartDebuff(state);
   }
 
-  // Trigger `setting_blind` Joker hooks (Ceremonial Dagger, Marble, Riff-Raff, Madness, Cartomancer, etc.)
-  runNonScoringHooks(state, 'setting_blind', events, { allowBlueprint: true });
+  // Engine-owned j_burglar (runs AFTER Needle/Water & Crimson Heart; Blueprint/Brainstorm compatible!)
+  let burglarBonusHands = 0;
+  let hasBurglar = false;
+  for (let i = 0; i < state.jokers.length; i++) {
+    const resolved = resolveCopiedJoker(state.jokers, i);
+    if (resolved && resolved.target.key === 'j_burglar') {
+      hasBurglar = true;
+      burglarBonusHands += Math.max(1, safeNum(Number(resolved.target.state.extra ?? 3), 3));
+    }
+  }
+  state.handsLeft = Math.max(1, baseHands + burglarBonusHands);
+  state.discardsLeft = hasBurglar ? 0 : baseDiscards;
 
-  // Refresh card debuffs after setting_blind hooks (e.g. if Chicot/Ceremonial altered jokers)
+  // Trigger `setting_blind` Jokers left-to-right (Marble, Riff-Raff, Madness, Ceremonial Dagger, Cartomancer, etc.)
+  runSettingBlindJokers(state, events);
+
+  // Refresh card debuffs & bankrupt threshold after setting_blind
+  syncBankruptAt(state);
   state.phase = 'PLAYING';
   refreshCardDebuffs(state);
 
@@ -1213,9 +1714,29 @@ function selectActiveBlindInternal(state: SimState, events: SimEvent[]): void {
   state.selectedCardIds = [];
 
   const drawn = drawCardsToHand(state, getEffectiveHandSize(state), { isInitialDraw: true });
+
+  // Engine-owned j_certificate (Blueprint/Brainstorm compatible: add random sealed card directly to hand & deck)
+  for (let i = 0; i < state.jokers.length; i++) {
+    const resolved = resolveCopiedJoker(state.jokers, i);
+    if (!resolved || resolved.target.key !== 'j_certificate') continue;
+    const suit = pickRandom(SUITS, state.rng, `cert_s_${state.round}_${i}`) ?? 'Spades';
+    const rank = pickRandom(RANKS, state.rng, `cert_r_${state.round}_${i}`) ?? 'Ace';
+    const seal = pickRandom(CERTIFICATE_SEALS, state.rng, `cert_seal_${state.round}_${i}`) ?? 'Gold';
+    const certCard = createCardInstance(state, suit, rank, { seal });
+    state.fullDeck.push(certCard);
+    state.hand.push(certCard.id);
+    events.push({
+      type: 'CARD_CREATED',
+      message: `Certificate added ${rank} of ${suit} (${seal} Seal)`,
+      sound: 'card1',
+      payload: { cardId: certCard.id, seal },
+    });
+    notifyJokersCardAdded(state, certCard, events);
+  }
+  refreshCardDebuffs(state);
   sortHandIds(state, state.sortMode);
 
-  // Trigger `first_hand_drawn` Joker hooks (Certificate, etc.)
+  // Trigger `first_hand_drawn` Joker hooks (excluding engine-owned j_certificate)
   runNonScoringHooks(state, 'first_hand_drawn', events, { allowBlueprint: true });
 
   // Enforce Cerulean Bell forced card
@@ -1369,6 +1890,10 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
       ) {
         return fail(state, 'Invalid joker reorder indices');
       }
+      const pinnedId = getSimMetaStr(state, 'rule:pinned_joker_id');
+      if (pinnedId && state.jokers[0]?.id === pinnedId && (fromIndex === 0 || toIndex === 0)) {
+        return fail(state, 'Pinned Joker must remain in the leftmost slot');
+      }
       const [moved] = state.jokers.splice(fromIndex, 1);
       state.jokers.splice(toIndex, 0, moved);
       break;
@@ -1412,6 +1937,7 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
       // The Hook: discard up to 2 random remaining cards from hand before scoring
       const preBeats: Array<Omit<ScoreBeat, 'id' | 'chipsAfter' | 'multAfter'>> = [];
       const activeBlind = getActiveBlind(state);
+      activeBlind.triggered = false;
       if (
         activeBlind.slot === 'Boss' &&
         activeBlind.key === 'bl_hook' &&
@@ -1422,7 +1948,17 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
         const hookVictims = shuffledHand.slice(0, Math.min(2, shuffledHand.length));
         const hookSet = new Set(hookVictims);
         state.hand = state.hand.filter((id) => !hookSet.has(id));
-        state.discardPile.push(...hookVictims);
+        for (let hi = 0; hi < hookVictims.length; hi++) {
+          const hCard = getCardById(state, hookVictims[hi]);
+          if (hCard) {
+            hCard.faceDown = false;
+            if (!hCard.debuffed && hCard.seal === 'Purple' && state.consumables.length < getEffectiveConsumableSlots(state)) {
+              const tarot = pickConsumableDefFromPool(state, 'Tarot', `purple_hook_${state.round}_${hi}`);
+              if (tarot) state.consumables.push(createConsumableInstance(state, tarot.key));
+            }
+          }
+          state.discardPile.push(hookVictims[hi]);
+        }
         activeBlind.triggered = true;
         preBeats.push({
           kind: 'boss_modify',
@@ -1463,6 +1999,8 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
       }
       state.playArea = [];
       state.scoringBeatIndex = state.lastHandBeats.length;
+      syncBankruptAt(state);
+      refreshCardDebuffs(state);
 
       const savedByMrBones = state.lastHandBeats.some((b) => b.kind === 'mr_bones_save');
       const blindWon = state.roundChips >= state.targetChips || savedByMrBones;
@@ -1483,6 +2021,7 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
         const blind = getActiveBlind(state);
         const isSerpent = blind.slot === 'Boss' && blind.key === 'bl_serpent' && !blind.disabled;
         const need = isSerpent ? 3 : Math.max(0, getEffectiveHandSize(state) - state.hand.length);
+        if (isSerpent) blind.triggered = true;
         const drawn = drawCardsToHand(state, need, { afterHandPlayed: true });
         sortHandIds(state, state.sortMode);
 
@@ -1525,6 +2064,15 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
         return fail(state, `Select 1 to ${state.maxSelectCards} cards to discard`);
       }
 
+      // Golden Needle challenge: discards cost $X
+      const discardCost = getSimMetaNum(state, 'rule:discard_cost') ?? 0;
+      if (discardCost > 0) {
+        if (state.dollars - discardCost < state.bankruptAt) {
+          return fail(state, `Need $${discardCost} to discard`);
+        }
+        state.dollars = safeNum(state.dollars - discardCost, state.dollars);
+      }
+
       const selectedSet = new Set(state.selectedCardIds);
       const discardedIds = state.hand.filter((id) => selectedSet.has(id));
       const discardedCards = discardedIds
@@ -1536,22 +2084,63 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
       state.tracking.discardsUsedTotal += 1;
       state.stats.cardsDiscarded += discardedCards.length;
 
+      const destroyedCardIds = new Set<string>();
+      const destroyedJokerIds = new Set<string>();
+
+      // Engine-owned j_burnt (first discard of round: upgrade level of discarded poker hand; Blueprint compatible!)
+      if (state.tracking.discardsUsedThisRound === 1 && discardedCards.length > 0) {
+        const discEval = evaluatePokerHand(discardedCards, state.jokers);
+        for (let j = 0; j < state.jokers.length; j++) {
+          const resolved = resolveCopiedJoker(state.jokers, j);
+          if (!resolved || resolved.target.key !== 'j_burnt') continue;
+          const hl = state.handLevels[discEval.handId];
+          if (hl) {
+            hl.level += 1;
+            hl.chips += hl.lChips;
+            hl.mult += hl.lMult;
+            hl.visible = true;
+            events.push({
+              type: 'CONSUMABLE_USED',
+              message: `Burnt Joker: ${discEval.handId} Lv.${hl.level}!`,
+              sound: 'tarot1',
+              payload: { handId: discEval.handId, level: hl.level },
+            });
+          }
+        }
+      }
+
+      // Engine-owned j_trading (first discard of round with 1 card: destroy card & earn +$3 per active Trading Card)
+      if (state.tracking.discardsUsedThisRound === 1 && discardedCards.length === 1) {
+        const tradingCount = countActiveJoker(state, 'j_trading');
+        if (tradingCount > 0) {
+          destroyedCardIds.add(discardedCards[0].id);
+          const payout = 3 * tradingCount;
+          state.dollars = safeNum(state.dollars + payout, state.dollars);
+          events.push({
+            type: 'CARD_DESTROYED',
+            message: `Trading Card: +$${payout}`,
+            sound: 'coin1',
+            payload: { cardId: discardedCards[0].id, dollars: payout },
+          });
+        }
+      }
+
       // Trigger `discard` Joker hooks left-to-right for each discarded card
       const probMultiplier = getProbabilityMultiplier(state.jokers);
       const rand = (k: string) => nextRandom(state.rng, k);
       const randInt = (k: string, max: number) => nextRandomInt(state.rng, k, max);
       const isFace = (c: CardInstance) => isCardFace(c, state.jokers);
       const isSuit = (c: CardInstance, s: Suit) => isCardSuit(c, s, state.jokers);
-      const destroyedCardIds = new Set<string>();
-      const destroyedJokerIds = new Set<string>();
 
       for (let cIdx = 0; cIdx < discardedCards.length; cIdx++) {
         const card = discardedCards[cIdx];
+        card.faceDown = false;
         for (let j = 0; j < state.jokers.length; j++) {
           const sourceJoker = state.jokers[j];
           if (sourceJoker.debuffed || destroyedJokerIds.has(sourceJoker.id)) continue;
           const resolved = resolveCopiedJoker(state.jokers, j);
           if (!resolved) continue;
+          if (resolved.target.key === 'j_burnt' || resolved.target.key === 'j_trading') continue;
           const res = evaluateJokerHook(resolved.target.key, {
             stage: 'discard',
             state,
@@ -1611,6 +2200,7 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
       const blind = getActiveBlind(state);
       const isSerpent = blind.slot === 'Boss' && blind.key === 'bl_serpent' && !blind.disabled;
       const need = isSerpent ? 3 : Math.max(0, getEffectiveHandSize(state) - state.hand.length);
+      if (isSerpent) blind.triggered = true;
       const drawn = drawCardsToHand(state, need);
       sortHandIds(state, state.sortMode);
       enforceCeruleanBellSelection(state);
@@ -1718,6 +2308,12 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
           cost: offer.cost,
         });
         state.jokers.push(joker);
+        if (joker.key === 'j_chaos') {
+          state.freeRerolls += 1;
+        }
+        if (joker.key === 'j_astronomer') {
+          repriceCurrentShop(state);
+        }
         syncBankruptAt(state);
       } else if (offer.kind === 'playing_card') {
         state.dollars = safeNum(state.dollars - offer.cost, state.dollars);
@@ -1739,6 +2335,8 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
           offer.sold = true;
           const res = applyConsumable(state, offer.key, [], { edition: offer.edition });
           events.push(...res.events);
+          syncBankruptAt(state);
+          refreshCardDebuffs(state);
         } else {
           const hasRoom =
             offer.edition === 'e_negative' ||
@@ -1752,6 +2350,10 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
         }
       }
 
+      if (hasChallengeRule(state, 'inflation')) {
+        state.tracking.inflationCostBump += 1;
+        repriceCurrentShop(state);
+      }
       state.stats.cardsPurchased += 1;
       runNonScoringHooks(state, 'buying_card', events, { itemKey: offer.key, itemKind: offer.kind });
       events.push({
@@ -1782,6 +2384,10 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
         state.tracking.vouchersRedeemedTotal += 1;
         applyVoucherEffect(state, vOffer.key);
       }
+      if (hasChallengeRule(state, 'inflation')) {
+        state.tracking.inflationCostBump += 1;
+        repriceCurrentShop(state);
+      }
 
       events.push({
         type: 'VOUCHER_REDEEMED',
@@ -1806,6 +2412,10 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
 
       state.dollars = safeNum(state.dollars - bOffer.cost, state.dollars);
       bOffer.opened = true;
+      if (hasChallengeRule(state, 'inflation')) {
+        state.tracking.inflationCostBump += 1;
+        repriceCurrentShop(state);
+      }
       openBoosterPack(state, bOffer.key, bOffer.kind, bOffer.size, bOffer.extra, bOffer.choose);
       runNonScoringHooks(state, 'open_booster', events, { itemKey: bOffer.key, itemKind: 'booster' });
 
@@ -1837,6 +2447,12 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
           rental: pCard.rental,
         });
         state.jokers.push(joker);
+        if (state.shop && joker.key === 'j_chaos') {
+          state.freeRerolls += 1;
+        }
+        if (state.shop && joker.key === 'j_astronomer') {
+          repriceCurrentShop(state);
+        }
         syncBankruptAt(state);
         pCard.taken = true;
         events.push({
@@ -1869,13 +2485,15 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
         }
         const res = applyConsumable(state, pCard.key, targets, { edition: pCard.edition });
         events.push(...res.events);
+        syncBankruptAt(state);
+        refreshCardDebuffs(state);
         pCard.taken = true;
         state.selectedCardIds = [];
       }
 
       state.pack.chooseRemaining -= 1;
       if (state.pack.chooseRemaining <= 0) {
-        closeOpenPack(state);
+        closeOpenPack(state, events);
       }
       break;
     }
@@ -1885,7 +2503,7 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
         return fail(state, 'No Booster Pack currently open');
       }
       runNonScoringHooks(state, 'skipping_booster', events);
-      closeOpenPack(state);
+      closeOpenPack(state, events);
       break;
     }
 
@@ -1893,6 +2511,28 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
       if (state.phase !== 'SHOP') {
         return fail(state, 'Can only advance round from SHOP');
       }
+
+      // Engine-owned j_perkeo (Blueprint/Brainstorm compatible): create Negative copy of 1 random held consumable at end of shop
+      for (let i = 0; i < state.jokers.length; i++) {
+        const resolved = resolveCopiedJoker(state.jokers, i);
+        if (!resolved || resolved.target.key !== 'j_perkeo') continue;
+        if (state.consumables.length === 0) break;
+        const src = pickRandom(state.consumables, state.rng, `perkeo_${state.round}_${i}`);
+        if (src) {
+          const negCopy = createConsumableInstance(state, src.key, {
+            edition: 'e_negative',
+            cost: src.cost,
+          });
+          state.consumables.push(negCopy);
+          events.push({
+            type: 'CARD_CREATED',
+            message: `Perkeo copied ${CONSUMABLE_MAP[src.key]?.name ?? src.key}`,
+            sound: 'negative',
+            payload: { key: src.key, edition: 'e_negative' },
+          });
+        }
+      }
+
       state.shop = null;
 
       if (state.activeBlindSlot === 'Small') {
@@ -1906,8 +2546,10 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
         state.ante += 1;
         state.stats.highestAnte = Math.max(state.stats.highestAnte, state.ante);
         state.bossRerolledThisAnte = false;
-        for (let i = 0; i < state.fullDeck.length; i++) {
-          state.fullDeck[i].playedThisAnte = false;
+        if (!hasChallengeRule(state, 'debuff_played_cards')) {
+          for (let i = 0; i < state.fullDeck.length; i++) {
+            state.fullDeck[i].playedThisAnte = false;
+          }
         }
         state.blinds = generateAnteBlinds(state);
         state.activeBlindSlot = 'Small';
@@ -1927,16 +2569,45 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
       state.jokers.splice(idx, 1);
       state.dollars = safeNum(state.dollars + joker.sellValue, state.dollars);
 
-      // Luchador disables active Boss Blind on sell
+      // Engine-owned j_luchador: disables active Boss Blind & restores flipped/debuffed cards
       if (joker.key === 'j_luchador' && !joker.debuffed) {
         const blind = getActiveBlind(state);
-        if (blind.slot === 'Boss' && (state.phase === 'PLAYING' || blind.status === 'Current')) {
-          blind.disabled = true;
+        if (
+          blind.slot === 'Boss' &&
+          (state.phase === 'PLAYING' || state.phase === 'SCORING' || blind.status === 'Current')
+        ) {
+          disableActiveBossBlind(state);
         }
       }
-      // Diet Cola grants a Double Tag on sell
+      // Engine-owned j_diet_cola: grants a Double Tag on sell
       if (joker.key === 'j_diet_cola' && !joker.debuffed) {
         grantTag(state, 'tag_double', events);
+      }
+      // Engine-owned j_invisible: after 2 rounds, selling duplicates 1 random other Joker (removing Negative)
+      if (joker.key === 'j_invisible' && !joker.debuffed) {
+        const rounds = safeNum(Number(joker.state.invis_rounds ?? 0), 0);
+        const needed = safeNum(Number(joker.state.extra ?? 2), 2);
+        if (rounds >= needed && state.jokers.length > 0) {
+          const chosen = pickRandom(state.jokers, state.rng, `invisible_dup_${state.round}`) ?? state.jokers[0];
+          const clone = createJokerInstance(state, chosen.key, {
+            edition: chosen.edition === 'e_negative' ? 'none' : chosen.edition,
+            eternal: chosen.eternal,
+            perishable: chosen.perishable,
+            rental: chosen.rental,
+            cost: chosen.cost,
+          });
+          clone.perishableTally = chosen.perishableTally;
+          clone.extraSellValue = chosen.extraSellValue;
+          clone.sellValue = chosen.sellValue;
+          clone.state = { ...chosen.state };
+          state.jokers.push(clone);
+          events.push({
+            type: 'CARD_CREATED',
+            message: `Invisible Joker duplicated ${JOKER_MAP[chosen.key]?.name ?? chosen.key}`,
+            sound: 'tarot1',
+            payload: { jokerId: clone.id, key: clone.key },
+          });
+        }
       }
       // Verdant Leaf undebuffs cards when any Joker is sold
       const activeBlind = getActiveBlind(state);
@@ -2017,7 +2688,11 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
 
       state.dollars = safeNum(state.dollars - 10, state.dollars);
       state.bossRerolledThisAnte = true;
-      const newBoss = pickBossBlind(state);
+      const newBoss = pickBossBlind(state, undefined, state.blinds.Boss.key);
+      const bossDollars =
+        state.tracking.noReward || hasSimFlag(state, 'rule:no_reward_Boss')
+          ? 0
+          : newBoss.dollars;
       state.blinds.Boss = {
         slot: 'Boss',
         key: newBoss.key,
@@ -2025,7 +2700,7 @@ export function dispatchSim(prevState: SimState, action: SimAction): SimStepResu
         status: state.blinds.Boss.status,
         mult: newBoss.mult,
         targetChips: computeTargetChips(state, newBoss.mult),
-        dollars: newBoss.dollars,
+        dollars: bossDollars,
         tagKey: null,
         bossColor: newBoss.bossColor,
         triggered: false,

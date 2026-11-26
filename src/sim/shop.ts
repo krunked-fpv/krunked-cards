@@ -34,7 +34,9 @@ import {
   type Suit,
 } from '../contracts/index.ts';
 import {
+  BOOSTER_MAP,
   BOOSTERS,
+  CHALLENGE_MAP,
   CONSUMABLE_MAP,
   DECK_MAP,
   EDITION_DEFS,
@@ -44,6 +46,7 @@ import {
   POKER_HANDS,
   SPECTRALS,
   TAROTS,
+  VOUCHER_MAP,
   VOUCHERS,
   evaluateJokerHook,
 } from '../data/index.ts';
@@ -56,6 +59,110 @@ import { nextRandom, nextRandomInt, pickRandom, shuffleDeterministic, weightedPi
 
 export function safeNum(val: number, fallback = 0): number {
   return Number.isFinite(val) ? val : fallback;
+}
+
+// ============================================================================
+// Pure Serializable Metadata Helpers (stored cleanly in tracking.bannedOthers)
+// ============================================================================
+
+const SIM_META_PREFIX = '__sim:';
+
+export function hasSimFlag(state: SimState, flag: string): boolean {
+  const token = `${SIM_META_PREFIX}${flag}`;
+  return state.tracking.bannedOthers.includes(token);
+}
+
+export function addSimFlag(state: SimState, flag: string): void {
+  const token = `${SIM_META_PREFIX}${flag}`;
+  if (!state.tracking.bannedOthers.includes(token)) {
+    state.tracking.bannedOthers.push(token);
+  }
+}
+
+export function removeSimFlag(state: SimState, flag: string): void {
+  const token = `${SIM_META_PREFIX}${flag}`;
+  const idx = state.tracking.bannedOthers.indexOf(token);
+  if (idx >= 0) state.tracking.bannedOthers.splice(idx, 1);
+}
+
+export function getSimMetaStr(state: SimState, key: string): string | null {
+  const prefix = `${SIM_META_PREFIX}${key}=`;
+  for (let i = 0; i < state.tracking.bannedOthers.length; i++) {
+    const entry = state.tracking.bannedOthers[i];
+    if (entry.startsWith(prefix)) {
+      return entry.slice(prefix.length);
+    }
+  }
+  return null;
+}
+
+export function setSimMetaStr(state: SimState, key: string, value: string): void {
+  const prefix = `${SIM_META_PREFIX}${key}=`;
+  const token = `${prefix}${value}`;
+  for (let i = 0; i < state.tracking.bannedOthers.length; i++) {
+    if (state.tracking.bannedOthers[i].startsWith(prefix)) {
+      state.tracking.bannedOthers[i] = token;
+      return;
+    }
+  }
+  state.tracking.bannedOthers.push(token);
+}
+
+export function getSimMetaNum(state: SimState, key: string): number | null {
+  const raw = getSimMetaStr(state, key);
+  if (raw === null) return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function setSimMetaNum(state: SimState, key: string, value: number): void {
+  setSimMetaStr(state, key, String(safeNum(value, 0)));
+}
+
+export function getUnusedDiscardsTotal(state: SimState): number {
+  return Math.max(0, Math.floor(getSimMetaNum(state, 'unused_discards') ?? 0));
+}
+
+export function addUnusedDiscards(state: SimState, delta: number): void {
+  const safeDelta = Math.max(0, Math.floor(safeNum(delta, 0)));
+  if (safeDelta <= 0) return;
+  setSimMetaNum(state, 'unused_discards', getUnusedDiscardsTotal(state) + safeDelta);
+}
+
+export function normalizeEdition(raw?: string | null): EditionId {
+  if (!raw || raw === 'none') return 'none';
+  if (raw === 'e_foil' || raw === 'foil') return 'e_foil';
+  if (raw === 'e_holo' || raw === 'holo' || raw === 'holographic') return 'e_holo';
+  if (raw === 'e_polychrome' || raw === 'polychrome') return 'e_polychrome';
+  if (raw === 'e_negative' || raw === 'negative') return 'e_negative';
+  return 'none';
+}
+
+export function normalizeSeal(raw?: string | null): SealId {
+  if (!raw || raw === 'none') return 'none';
+  const lower = raw.toLowerCase();
+  if (lower === 'gold' || lower === 'g') return 'Gold';
+  if (lower === 'red' || lower === 'r') return 'Red';
+  if (lower === 'blue' || lower === 'b') return 'Blue';
+  if (lower === 'purple' || lower === 'p') return 'Purple';
+  return 'none';
+}
+
+export function hasShowman(state: SimState): boolean {
+  return countActiveJoker(state, 'j_ring_master') > 0 || countActiveJoker(state, 'j_showman') > 0;
+}
+
+export function getChallengeCustomRuleValue(state: SimState, ruleId: string): number | string | boolean | undefined {
+  if (!state.challengeId) return undefined;
+  const ch = CHALLENGE_MAP[state.challengeId];
+  const found = ch?.rules.custom?.find((r) => r.id === ruleId);
+  return found ? (found.value ?? true) : undefined;
+}
+
+export function hasChallengeRule(state: SimState, ruleId: string): boolean {
+  if (hasSimFlag(state, `rule:${ruleId}`)) return true;
+  if (getSimMetaStr(state, `rule:${ruleId}`) !== null) return true;
+  return getChallengeCustomRuleValue(state, ruleId) !== undefined;
 }
 
 export function allocUid(state: SimState, prefix: string): string {
@@ -108,7 +215,18 @@ export function getEffectiveHandSize(state: SimState): number {
     else if (j.key === 'j_troubadour') size += 2;
     else if (j.key === 'j_stuntman') size -= 2;
     else if (j.key === 'j_merry_andy') size -= 1;
-    else if (j.key === 'j_turtle_bean') size += Number(j.state.h_size ?? 5);
+    else if (j.key === 'j_turtle_bean') {
+      size += Math.max(0, safeNum(Number(j.state.h_size ?? j.state.extra ?? 5), 0));
+    }
+  }
+  // Luxury Tax challenge: -1 hand size for every $X owned
+  const dollarStep =
+    getSimMetaNum(state, 'rule:minus_hand_size_per_X_dollar') ??
+    (typeof getChallengeCustomRuleValue(state, 'minus_hand_size_per_X_dollar') === 'number'
+      ? Number(getChallengeCustomRuleValue(state, 'minus_hand_size_per_X_dollar'))
+      : null);
+  if (dollarStep && dollarStep > 0 && state.dollars > 0) {
+    size -= Math.floor(state.dollars / dollarStep);
   }
   const blind = getActiveBlind(state);
   if (
@@ -369,12 +487,16 @@ export function drawCardsToHand(
     if (isBossActive) {
       if (blind.key === 'bl_house' && opts?.isInitialDraw) {
         card.faceDown = true;
+        blind.triggered = true;
       } else if (blind.key === 'bl_fish' && opts?.afterHandPlayed) {
         card.faceDown = true;
+        blind.triggered = true;
       } else if (blind.key === 'bl_mark' && isCardFace(card, state.jokers)) {
         card.faceDown = true;
+        blind.triggered = true;
       } else if (blind.key === 'bl_wheel' && nextRandom(state.rng, 'wheel_flip') < (1 * probMult) / 7) {
         card.faceDown = true;
+        blind.triggered = true;
       }
     }
     if (!card.faceDown && state.tracking.flippedCardsChance > 0) {
@@ -441,9 +563,16 @@ export function rollEdition(
   state: SimState,
   key: string,
   mod = 1,
-  allowNegative = true
+  allowNegative = true,
+  guaranteed = false
 ): EditionId {
   const r = nextRandom(state.rng, key);
+  if (guaranteed) {
+    if (allowNegative && r > 0.925) return 'e_negative';
+    if (r > 0.85) return 'e_polychrome';
+    if (r > 0.5) return 'e_holo';
+    return 'e_foil';
+  }
   const rate = Math.max(1, state.editionRate);
   if (allowNegative && r > 1 - 0.003 * mod) return 'e_negative';
   if (r > 1 - 0.006 * rate * mod) return 'e_polychrome';
@@ -487,10 +616,12 @@ export function pickJokerDefFromPool(
   opts?: { forcedRarity?: Rarity; excludeKeys?: Set<string> }
 ): JokerDef | null {
   if (JOKERS.length === 0) return null;
-  const allowDuplicates = countActiveJoker(state, 'j_ring_master') > 0;
+  const allowDuplicates = hasShowman(state);
   const banned = new Set(state.tracking.bannedKeys);
   const owned = new Set(state.jokers.map((j) => j.key));
-  const grosMichelExtinct = banned.has('j_gros_michel');
+  const grosMichelExtinct =
+    banned.has('j_gros_michel') ||
+    state.tracking.bannedOthers.includes('__extinct_gros_michel');
   const rarity = opts?.forcedRarity ?? rollRarity(state, `${key}_rarity`);
 
   const filterPool = (targetRarity: Rarity | null, enforceUniqueness: boolean): JokerDef[] =>
@@ -512,6 +643,7 @@ export function pickJokerDefFromPool(
   if (pool.length === 0) pool = filterPool(null, true);
   if (pool.length === 0) pool = filterPool(rarity, false);
   if (pool.length === 0) pool = filterPool(null, false);
+  if (pool.length === 0) pool = JOKERS.filter((j) => !banned.has(j.key));
   if (pool.length === 0) pool = JOKERS;
 
   return pickRandom(pool, state.rng, `${key}_pick`) ?? pool[0] ?? null;
@@ -525,7 +657,7 @@ export function pickConsumableDefFromPool(
 ): ConsumableDef | null {
   const source = set === 'Tarot' ? TAROTS : set === 'Planet' ? PLANETS : SPECTRALS;
   if (source.length === 0) return null;
-  const allowDuplicates = countActiveJoker(state, 'j_ring_master') > 0;
+  const allowDuplicates = hasShowman(state);
   const banned = new Set(state.tracking.bannedKeys);
   const owned = new Set(state.consumables.map((c) => c.key));
 
@@ -548,6 +680,8 @@ export function pickConsumableDefFromPool(
 
   let pool = filterPool(true);
   if (pool.length === 0) pool = filterPool(false);
+  if (pool.length === 0) pool = source.filter((c) => !banned.has(c.key) && !c.hidden);
+  if (pool.length === 0) pool = source.filter((c) => !banned.has(c.key));
   if (pool.length === 0) pool = source;
   return pickRandom(pool, state.rng, key) ?? pool[0] ?? null;
 }
@@ -607,12 +741,134 @@ function buildJokerOffer(
   };
 }
 
+function buildSingleShopOffer(
+  state: SimState,
+  slotKey: string,
+  isReroll: boolean,
+  usedKeys: Set<string>
+): ShopOffer {
+  const noShopJokers = hasChallengeRule(state, 'no_shop_jokers') || state.jokerRate <= 0;
+  const kindWeights: Array<{ item: ShopOffer['kind']; weight: number }> = [
+    { item: 'joker', weight: noShopJokers ? 0 : Math.max(0, state.jokerRate) },
+    { item: 'tarot', weight: TAROTS.length > 0 ? Math.max(0, state.tarotRate) : 0 },
+    { item: 'planet', weight: PLANETS.length > 0 ? Math.max(0, state.planetRate) : 0 },
+    { item: 'spectral', weight: SPECTRALS.length > 0 ? Math.max(0, state.spectralRate) : 0 },
+    { item: 'playing_card', weight: Math.max(0, state.playingCardRate) },
+  ];
+
+  const fallbackKind: ShopOffer['kind'] = noShopJokers
+    ? TAROTS.length > 0
+      ? 'tarot'
+      : PLANETS.length > 0
+        ? 'planet'
+        : 'playing_card'
+    : 'joker';
+  const chosenKind = weightedPick(kindWeights, state.rng, `${slotKey}_kind`) ?? fallbackKind;
+
+  if (chosenKind === 'joker' && !noShopJokers) {
+    return buildJokerOffer(state, slotKey, { excludeKeys: usedKeys });
+  }
+  if (chosenKind === 'tarot' || chosenKind === 'planet' || chosenKind === 'spectral') {
+    const set: ConsumableSet =
+      chosenKind === 'tarot' ? 'Tarot' : chosenKind === 'planet' ? 'Planet' : 'Spectral';
+    const def = pickConsumableDefFromPool(state, set, `${slotKey}_cons`, usedKeys);
+    if (def) {
+      usedKeys.add(def.key);
+      const cost = calcShopItemCost(def.cost, 'none', state, {
+        isPlanetOrCelestial: set === 'Planet',
+        isCouponEligible: !isReroll,
+      });
+      return {
+        id: allocUid(state, 'offer'),
+        kind: chosenKind,
+        key: def.key,
+        cost,
+        sold: false,
+        edition: 'none',
+      };
+    }
+    if (!noShopJokers) {
+      return buildJokerOffer(state, slotKey, { excludeKeys: usedKeys });
+    }
+  }
+
+  // Playing card (Magic Trick / Illusion, or fallback when jokers & consumables disabled)
+  const suit = pickRandom(SUITS, state.rng, `${slotKey}_suit`) ?? 'Spades';
+  const rank = pickRandom(RANKS, state.rng, `${slotKey}_rank`) ?? 'Ace';
+  const hasIllusion = state.vouchers.includes('v_illusion');
+  const enhancement: EnhancementId =
+    hasIllusion && nextRandom(state.rng, `${slotKey}_enh_roll`) < 0.4
+      ? (pickRandom(ENHANCEMENT_POOL, state.rng, `${slotKey}_enh`) ?? 'm_bonus')
+      : 'none';
+  const edition: EditionId =
+    hasIllusion && nextRandom(state.rng, `${slotKey}_ed_roll`) < 0.2
+      ? rollEdition(state, `${slotKey}_ed`, 1, false, true)
+      : 'none';
+  const cost = calcShopItemCost(1, edition, state, { isCouponEligible: !isReroll });
+  return {
+    id: allocUid(state, 'offer'),
+    kind: 'playing_card',
+    key: `${suit}_${rank}`,
+    cost,
+    sold: false,
+    edition,
+    enhancement,
+    seal: 'none',
+    suit,
+    rank,
+  };
+}
+
+export function generateAdditionalShopOffer(state: SimState): ShopOffer {
+  const usedKeys = new Set<string>(
+    (state.shop?.offers ?? []).filter((o) => !o.sold).map((o) => o.key)
+  );
+  const slotIndex = state.shop?.offers.length ?? state.shopSlots;
+  const slotKey = `shop_extra_${state.ante}_${state.round}_${slotIndex}`;
+  return buildSingleShopOffer(state, slotKey, true, usedKeys);
+}
+
+export function repriceCurrentShop(state: SimState): void {
+  if (!state.shop) return;
+  for (let i = 0; i < state.shop.offers.length; i++) {
+    const offer = state.shop.offers[i];
+    if (offer.sold || offer.cost === 0) continue;
+    let baseCost = 3;
+    if (offer.kind === 'joker') {
+      baseCost = JOKER_MAP[offer.key]?.cost ?? 4;
+    } else if (offer.kind === 'playing_card') {
+      baseCost = 1;
+    } else {
+      baseCost = CONSUMABLE_MAP[offer.key]?.cost ?? (offer.kind === 'spectral' ? 4 : 3);
+    }
+    offer.cost = calcShopItemCost(baseCost, offer.edition, state, {
+      rental: offer.rental,
+      isPlanetOrCelestial: offer.kind === 'planet',
+    });
+  }
+  for (let i = 0; i < state.shop.vouchers.length; i++) {
+    const v = state.shop.vouchers[i];
+    if (v.redeemed) continue;
+    const baseCost = VOUCHER_MAP[v.key]?.cost ?? 10;
+    v.cost = calcShopItemCost(baseCost, 'none', state);
+  }
+  for (let i = 0; i < state.shop.boosters.length; i++) {
+    const b = state.shop.boosters[i];
+    if (b.opened || b.cost === 0) continue;
+    const baseCost =
+      BOOSTER_MAP[b.key]?.cost ?? (b.size === 'Mega' ? 8 : b.size === 'Jumbo' ? 6 : 4);
+    b.cost = calcShopItemCost(baseCost, 'none', state, {
+      isPlanetOrCelestial: b.kind === 'Celestial',
+    });
+  }
+}
+
 export function generateShopOffers(state: SimState, isReroll: boolean): ShopOffer[] {
   const offers: ShopOffer[] = [];
   const usedKeys = new Set<string>();
 
-  // Apply queued shop tags (Uncommon/Rare/Foil/Holo/Polychrome/Negative) on shop entry
-  if (!isReroll && state.tracking.pendingShopTags.length > 0) {
+  // Apply queued shop tags (Uncommon/Rare/Foil/Holo/Polychrome/Negative) on shop entry or reroll
+  if (state.tracking.pendingShopTags.length > 0) {
     const remainingTags: string[] = [];
     for (let i = 0; i < state.tracking.pendingShopTags.length; i++) {
       const tag = state.tracking.pendingShopTags[i];
@@ -640,68 +896,9 @@ export function generateShopOffers(state: SimState, isReroll: boolean): ShopOffe
     state.tracking.pendingShopTags = remainingTags;
   }
 
-  const kindWeights: Array<{ item: ShopOffer['kind']; weight: number }> = [
-    { item: 'joker', weight: Math.max(0, state.jokerRate) },
-    { item: 'tarot', weight: TAROTS.length > 0 ? Math.max(0, state.tarotRate) : 0 },
-    { item: 'planet', weight: PLANETS.length > 0 ? Math.max(0, state.planetRate) : 0 },
-    { item: 'spectral', weight: SPECTRALS.length > 0 ? Math.max(0, state.spectralRate) : 0 },
-    { item: 'playing_card', weight: Math.max(0, state.playingCardRate) },
-  ];
-
   while (offers.length < state.shopSlots) {
     const slotKey = `shop_slot_${state.ante}_${state.round}_${offers.length}`;
-    const chosenKind = weightedPick(kindWeights, state.rng, `${slotKey}_kind`) ?? 'joker';
-
-    if (chosenKind === 'joker') {
-      offers.push(buildJokerOffer(state, slotKey, { excludeKeys: usedKeys }));
-    } else if (chosenKind === 'tarot' || chosenKind === 'planet' || chosenKind === 'spectral') {
-      const set: ConsumableSet =
-        chosenKind === 'tarot' ? 'Tarot' : chosenKind === 'planet' ? 'Planet' : 'Spectral';
-      const def = pickConsumableDefFromPool(state, set, `${slotKey}_cons`, usedKeys);
-      if (!def) {
-        offers.push(buildJokerOffer(state, slotKey, { excludeKeys: usedKeys }));
-      } else {
-        usedKeys.add(def.key);
-        const cost = calcShopItemCost(def.cost, 'none', state, {
-          isPlanetOrCelestial: set === 'Planet',
-          isCouponEligible: !isReroll,
-        });
-        offers.push({
-          id: allocUid(state, 'offer'),
-          kind: chosenKind,
-          key: def.key,
-          cost,
-          sold: false,
-          edition: 'none',
-        });
-      }
-    } else {
-      // Playing card (Magic Trick / Illusion)
-      const suit = pickRandom(SUITS, state.rng, `${slotKey}_suit`) ?? 'Spades';
-      const rank = pickRandom(RANKS, state.rng, `${slotKey}_rank`) ?? 'Ace';
-      const hasIllusion = state.vouchers.includes('v_illusion');
-      const enhancement: EnhancementId =
-        hasIllusion && nextRandom(state.rng, `${slotKey}_enh_roll`) < 0.4
-          ? (pickRandom(ENHANCEMENT_POOL, state.rng, `${slotKey}_enh`) ?? 'm_bonus')
-          : 'none';
-      const edition: EditionId =
-        hasIllusion && nextRandom(state.rng, `${slotKey}_ed_roll`) < 0.2
-          ? rollEdition(state, `${slotKey}_ed`, 1, false)
-          : 'none';
-      const cost = calcShopItemCost(1, edition, state, { isCouponEligible: !isReroll });
-      offers.push({
-        id: allocUid(state, 'offer'),
-        kind: 'playing_card',
-        key: `${suit}_${rank}`,
-        cost,
-        sold: false,
-        edition,
-        enhancement,
-        seal: 'none',
-        suit,
-        rank,
-      });
-    }
+    offers.push(buildSingleShopOffer(state, slotKey, isReroll, usedKeys));
   }
 
   return offers;
@@ -838,16 +1035,19 @@ export function openBoosterPack(
 
   const cards: PackCardOffer[] = [];
   const usedKeys = new Set<string>();
+  const banned = new Set(state.tracking.bannedKeys);
   const hasOmenGlobe = state.vouchers.includes('v_omen_globe');
   const hasTelescope = state.vouchers.includes('v_telescope');
+  let placedTelescope = false;
 
   for (let i = 0; i < extra; i++) {
     const slotKey = `pack_${boosterKey}_${state.ante}_${state.round}_${i}`;
 
     if (kind === 'Arcana') {
-      // 0.3% chance for The Soul
+      // 0.3% chance for The Soul (unless banned)
       if (
         CONSUMABLE_MAP['c_soul'] &&
+        !banned.has('c_soul') &&
         !usedKeys.has('c_soul') &&
         nextRandom(state.rng, `${slotKey}_soul`) < 0.003
       ) {
@@ -871,6 +1071,7 @@ export function openBoosterPack(
     } else if (kind === 'Spectral') {
       if (
         CONSUMABLE_MAP['c_soul'] &&
+        !banned.has('c_soul') &&
         !usedKeys.has('c_soul') &&
         nextRandom(state.rng, `${slotKey}_soul`) < 0.003
       ) {
@@ -880,6 +1081,7 @@ export function openBoosterPack(
       }
       if (
         CONSUMABLE_MAP['c_black_hole'] &&
+        !banned.has('c_black_hole') &&
         !usedKeys.has('c_black_hole') &&
         nextRandom(state.rng, `${slotKey}_bh`) < 0.003
       ) {
@@ -892,22 +1094,29 @@ export function openBoosterPack(
       usedKeys.add(sKey);
       cards.push({ id: allocUid(state, 'pcard'), kind: 'spectral', key: sKey, edition: 'none', taken: false });
     } else if (kind === 'Celestial') {
+      if (hasTelescope && !placedTelescope) {
+        placedTelescope = true;
+        const favPlanet = PLANETS.find((p) => p.handType === state.tracking.mostPlayedHand);
+        const favKey =
+          favPlanet?.key ??
+          Object.entries(PLANET_HAND_FALLBACK).find(
+            ([, hand]) => hand === state.tracking.mostPlayedHand
+          )?.[0];
+        if (favKey && !banned.has(favKey)) {
+          usedKeys.add(favKey);
+          cards.push({ id: allocUid(state, 'pcard'), kind: 'planet', key: favKey, edition: 'none', taken: false });
+          continue;
+        }
+      }
       if (
         CONSUMABLE_MAP['c_black_hole'] &&
+        !banned.has('c_black_hole') &&
         !usedKeys.has('c_black_hole') &&
         nextRandom(state.rng, `${slotKey}_bh`) < 0.003
       ) {
         usedKeys.add('c_black_hole');
         cards.push({ id: allocUid(state, 'pcard'), kind: 'spectral', key: 'c_black_hole', edition: 'none', taken: false });
         continue;
-      }
-      if (i === 0 && hasTelescope) {
-        const favPlanet = PLANETS.find((p) => p.handType === state.tracking.mostPlayedHand);
-        if (favPlanet) {
-          usedKeys.add(favPlanet.key);
-          cards.push({ id: allocUid(state, 'pcard'), kind: 'planet', key: favPlanet.key, edition: 'none', taken: false });
-          continue;
-        }
       }
       const planet = pickConsumableDefFromPool(state, 'Planet', `${slotKey}_planet`, usedKeys);
       const pKey = planet?.key ?? 'c_pluto';
@@ -939,7 +1148,7 @@ export function openBoosterPack(
           : 'none';
       const edition: EditionId =
         nextRandom(state.rng, `${slotKey}_ed_roll`) < 0.2
-          ? rollEdition(state, `${slotKey}_ed`, 1, false)
+          ? rollEdition(state, `${slotKey}_ed`, 1, false, true)
           : 'none';
       const seal: SealId =
         nextRandom(state.rng, `${slotKey}_seal_roll`) < 0.2
@@ -981,12 +1190,13 @@ export function computeCashoutBreakdown(state: SimState): CashoutBreakdown {
   const blind = getActiveBlind(state);
   const deckCfg = DECK_MAP[state.deckId]?.config;
 
-  // 1. Blind Reward ($0 for Small Blind on Red Stake+ or noReward challenge)
-  const blindDollars = state.tracking.noReward
-    ? 0
-    : blind.slot === 'Small' && state.stake >= 2
+  // 1. Blind Reward ($0 for Small Blind on Red Stake+, noReward, or no_reward_specific challenge)
+  const blindDollars =
+    state.tracking.noReward || hasSimFlag(state, `rule:no_reward_${blind.slot}`)
       ? 0
-      : blind.dollars;
+      : blind.slot === 'Small' && state.stake >= 2
+        ? 0
+        : blind.dollars;
   if (blindDollars > 0) {
     rows.push({
       label: blind.name,
@@ -996,8 +1206,9 @@ export function computeCashoutBreakdown(state: SimState): CashoutBreakdown {
   }
 
   // 2. Remaining Hands Bonus (Green Deck: $2/hand; standard: $1/hand)
+  const isGreenDeck = !state.challengeId && state.deckId === 'b_green';
   if (!state.tracking.noExtraHandMoney) {
-    const handBonus = deckCfg?.extraHandBonus ?? 1;
+    const handBonus = deckCfg?.extraHandBonus ?? (isGreenDeck ? 2 : 1);
     if (state.handsLeft > 0 && handBonus > 0) {
       rows.push({
         label: 'Remaining Hands',
@@ -1009,7 +1220,7 @@ export function computeCashoutBreakdown(state: SimState): CashoutBreakdown {
   }
 
   // 3. Remaining Discards Bonus (Green Deck: $1/discard)
-  const discardBonus = deckCfg?.extraDiscardBonus ?? 0;
+  const discardBonus = deckCfg?.extraDiscardBonus ?? (isGreenDeck ? 1 : 0);
   if (state.discardsLeft > 0 && discardBonus > 0) {
     rows.push({
       label: 'Remaining Discards',
