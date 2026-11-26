@@ -834,7 +834,7 @@ const ICONIC_JOKERS: NamedJokerArt[] = [
   { gx: 5, gy: 11, bg: '#fff3c4', trim: '#f5b82e', kind: 'cavendish', accent: '#4bc292' }, // Cavendish
   { gx: 2, gy: 12, bg: '#291522', trim: '#fe5f55', kind: 'vampire', accent: '#f2e9e4' }, // Vampire
   { gx: 4, gy: 12, bg: '#0c2336', trim: '#2ef2ff', kind: 'hologram', accent: '#8cffff' }, // Hologram
-  { gx: 6, gy: 12, bg: '#38223d', trim: '#f5c23b', kind: 'baron', accent: '#fe5f55' }, // Baron
+  { gx: 6, gy: 12, bg: '#f4ece0', trim: '#b8293d', kind: 'baron', accent: '#f5c23b' }, // Baron
   { gx: 2, gy: 13, bg: '#f5f2eb', trim: '#4f6367', kind: 'photograph', accent: '#fe5f55' }, // Photograph
   { gx: 5, gy: 14, bg: '#fff4d6', trim: '#f5a623', kind: 'cat', accent: '#fe5f55' }, // Lucky Cat
   { gx: 7, gy: 14, bg: '#3d251e', trim: '#f3b958', kind: 'bull', accent: '#fe5f55' }, // Bull
@@ -915,7 +915,15 @@ function drawIconicJokerCell(ctx: CanvasRenderingContext2D, ox: number, oy: numb
     return;
   }
 
-  drawCardBase(ctx, ox, oy, art.bg, 'rgba(0,0,0,0.14)', OUTLINE, art.trim);
+  // Authentic light cream card frame around colored artwork window so Negative shader always yields an iconic dark inverted border
+  drawCardBase(ctx, ox, oy, '#f7f3ea', '#dad2c2', OUTLINE);
+  ctx.fillStyle = art.bg;
+  ctx.fillRect(ox + 6, oy + 6, 59, 83);
+  ctx.fillStyle = art.trim;
+  ctx.fillRect(ox + 6, oy + 6, 59, 2);
+  ctx.fillRect(ox + 6, oy + 87, 59, 2);
+  ctx.fillRect(ox + 6, oy + 6, 2, 83);
+  ctx.fillRect(ox + 63, oy + 6, 2, 83);
 
   switch (art.kind) {
     case 'jimbo':

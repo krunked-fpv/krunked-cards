@@ -47,8 +47,8 @@ export interface JuiceState {
   scaleAmt: number;
   r: number;
   rAmt: number;
-  startTime: number;
-  endTime: number;
+  elapsed: number;
+  duration: number;
 }
 
 /**
@@ -105,21 +105,22 @@ export class Moveable {
     this.initialized = true;
   }
 
-  juiceUp(amount = 0.4, rotAmt?: number, nowSec = performance.now() / 1000): void {
-    const a = Math.min(0.65, Math.max(0.1, amount));
+  juiceUp(amount = 0.4, rotAmt?: number, _nowSec?: number): void {
+    const a = Math.min(0.55, Math.max(0.1, amount));
     const rAmt = rotAmt ?? (Math.random() > 0.5 ? 1 : -1) * (0.28 + Math.random() * 0.16);
-    this.vScale = Math.max(0.55, 1 - 0.6 * a);
+    this.vScale = Math.max(0.68, Math.min(1.25, 1 - 0.5 * a));
+    this.velScale = 0;
     this.juice = {
       scale: 0,
       scaleAmt: a,
       r: 0,
       rAmt,
-      startTime: nowSec,
-      endTime: nowSec + 0.4,
+      elapsed: 0,
+      duration: 0.4,
     };
   }
 
-  step(dt: number, nowSec: number, reducedMotion: boolean, pixelScale: number): void {
+  step(dt: number, _nowSec: number, reducedMotion: boolean, pixelScale: number): void {
     if (!this.initialized) {
       this.snapToTarget();
       return;
@@ -136,21 +137,23 @@ export class Moveable {
       this.vr += (this.tr - this.vr) * k;
       const targetS = this.tScale + (this.dragging ? 0.08 : this.hovered ? 0.04 : 0);
       this.vScale += (targetS - this.vScale) * k;
+      this.vScale = Math.max(0.55, Math.min(1.5, this.vScale));
       this.tiltX *= 0.85;
       this.tiltY *= 0.85;
       this.juice = null;
       return;
     }
 
-    // Update harmonic juice wave
+    // Update harmonic juice wave using monotonic frame dt (immune to clock domain drift)
     let juiceScale = 0;
     let juiceR = 0;
     if (this.juice) {
-      const elapsed = nowSec - this.juice.startTime;
-      if (elapsed >= 0.4) {
+      this.juice.elapsed += safeDt;
+      if (this.juice.elapsed >= this.juice.duration) {
         this.juice = null;
       } else {
-        const remain = Math.max(0, 1 - elapsed / 0.4);
+        const elapsed = this.juice.elapsed;
+        const remain = Math.max(0, Math.min(1, 1 - elapsed / this.juice.duration));
         juiceScale = this.juice.scaleAmt * Math.sin(50.8 * elapsed) * remain * remain * remain;
         juiceR = this.juice.rAmt * Math.sin(40.8 * elapsed) * remain * remain;
         this.juice.scale = juiceScale;
@@ -195,16 +198,18 @@ export class Moveable {
     this.vh += (this.th - this.vh) * (1 - Math.exp(-20 * safeDt));
 
     // Scale spring: +0.10 dragging, +0.05 hovering, +juice.scale
-    const desScale =
-      this.tScale + (this.dragging ? 0.1 : this.hovered ? 0.05 : 0) + juiceScale;
-    this.velScale = expScale * this.velScale + (1 - expScale) * (desScale - this.vScale) * 24 * safeDt;
-    this.vScale += this.velScale;
+    const desScale = Math.max(
+      0.65,
+      Math.min(1.45, this.tScale + (this.dragging ? 0.1 : this.hovered ? 0.05 : 0) + juiceScale)
+    );
+    this.velScale = expScale * this.velScale + (1 - expScale) * (desScale - this.vScale) * 20 * safeDt;
+    this.vScale = Math.max(0.55, Math.min(1.55, this.vScale + this.velScale));
 
     // Rotation spring with horizontal velocity lean (`des_r = base_r + 0.015 * (vel.x/dt) + juice.r * 2`)
     const velXUnitsPerSec = this.velX / (safeDt * pxPerUnit);
-    const desR = this.tr + Math.max(-0.42, Math.min(0.42, 0.015 * velXUnitsPerSec)) + juiceR * 2.0;
-    this.velR = expR * this.velR + (1 - expR) * (desR - this.vr) * 28 * safeDt;
-    this.vr += this.velR;
+    const desR = this.tr + Math.max(-0.42, Math.min(0.42, 0.015 * velXUnitsPerSec)) + juiceR * 1.4;
+    this.velR = expR * this.velR + (1 - expR) * (desR - this.vr) * 24 * safeDt;
+    this.vr = Math.max(-1.2, Math.min(1.2, this.vr + this.velR));
 
     // Smooth tilt decay when not hovered
     if (!this.hovered) {

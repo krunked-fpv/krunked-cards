@@ -337,21 +337,33 @@ export class UiOverlay {
 
     // 2. Left Console Rail
     const preview = state.phase === 'PLAYING' ? previewSelectedHand(state) : null;
+    const hideStaleHandMath =
+      state.phase === 'SHOP' || state.phase === 'BLIND_SELECT' || state.phase === 'PACK_OPEN';
     const shownChips = choreo.active
       ? choreo.displayChips
-      : preview
-        ? preview.baseChips
-        : state.currentHandChips;
+      : hideStaleHandMath
+        ? 0
+        : preview
+          ? preview.baseChips
+          : state.currentHandChips;
     const shownMult = choreo.active
       ? choreo.displayMult
-      : preview
-        ? preview.baseMult
-        : state.currentHandMult;
+      : hideStaleHandMath
+        ? 0
+        : preview
+          ? preview.baseMult
+          : state.currentHandMult;
     const shownHandName = choreo.active
       ? choreo.handName || state.lastHandName || ''
-      : preview
-        ? preview.displayName
-        : '';
+      : state.phase === 'SHOP'
+        ? 'Shop'
+        : state.phase === 'BLIND_SELECT'
+          ? 'Choose Blind'
+          : state.phase === 'PACK_OPEN'
+            ? 'Booster Pack'
+            : preview
+              ? preview.displayName
+              : '';
     const shownLevel = preview
       ? preview.level
       : shownHandName && state.handLevels[shownHandName as PokerHandId]
@@ -866,9 +878,9 @@ export class UiOverlay {
           : `<div class="kc-blind-status-pill">${esc(b.status)}</div>`;
 
         const skipBlock =
-          slot !== 'Boss' && isCurrent && tag
+          slot !== 'Boss' && tag
             ? `
-            <div class="kc-skip-box">
+            <div class="kc-skip-box ${isCurrent ? '' : 'upcoming-skip'}">
               <div class="kc-skip-tag-row">
                 <canvas class="kc-tag-canvas" width="34" height="34" data-tag-x="${tag.pos.x}" data-tag-y="${tag.pos.y}"></canvas>
                 <div>
@@ -876,7 +888,11 @@ export class UiOverlay {
                   <div class="kc-skip-tag-desc">${esc(tag.desc)}</div>
                 </div>
               </div>
-              <button class="kc-btn kc-btn-red kc-btn-sm interactive" data-act="skip-blind">Skip Blind</button>
+              ${
+                isCurrent
+                  ? `<button class="kc-btn kc-btn-red kc-btn-sm interactive" data-act="skip-blind">Skip Blind</button>`
+                  : `<div class="kc-muted-sm" style="text-align:center;">Skip Reward Preview</div>`
+              }
             </div>
           `
             : slot === 'Boss' && canRerollBoss
@@ -1047,7 +1063,7 @@ export class UiOverlay {
       .join('');
 
     return `
-      <div class="kc-pack-banner" style="left:${geom.packTray.x}px;top:${geom.packTray.y - 26}px;width:${geom.packTray.w}px;">
+      <div class="kc-pack-banner" style="left:${geom.packTray.x}px;top:${geom.packTray.y + 8}px;width:${geom.packTray.w}px;">
         <div>
           <span class="kc-pack-title">${esc(def?.name ?? pack.kind + ' Pack')}</span>
           <span class="kc-pack-sub">Choose ${pack.chooseRemaining} remaining</span>
@@ -1855,19 +1871,29 @@ export class UiOverlay {
     `;
     this.tooltipEl.classList.remove('hidden');
 
-    // Clamp strictly inside viewport
-    const tw = this.tooltipEl.offsetWidth || 230;
+    // Clamp strictly inside viewport without overlapping sibling hand/joker cards
+    const tw = this.tooltipEl.offsetWidth || 236;
     const th = this.tooltipEl.offsetHeight || 110;
     const vw = window.innerWidth;
     const vh = window.innerHeight;
 
-    let tx = card.moveable.vx + card.moveable.vw * 0.56;
-    if (tx + tw + 12 > vw) {
-      tx = card.moveable.vx - card.moveable.vw * 0.56 - tw;
+    let tx = card.moveable.vx - tw * 0.5;
+    let ty: number;
+    if (card.kind === 'hand' || card.kind === 'play' || card.kind === 'pack_card') {
+      // Anchor cleanly ABOVE the card so neighboring cards stay 100% unobstructed
+      ty = card.moveable.vy - card.moveable.vh * 0.54 - th - 12;
+      if (ty < 12) ty = card.moveable.vy + card.moveable.vh * 0.54 + 12;
+    } else if (card.kind === 'joker' || card.kind === 'consumable') {
+      // Anchor cleanly BELOW top-row jokers/consumables
+      ty = card.moveable.vy + card.moveable.vh * 0.54 + 14;
+    } else {
+      tx = card.moveable.vx + card.moveable.vw * 0.56;
+      if (tx + tw + 12 > vw) {
+        tx = card.moveable.vx - card.moveable.vw * 0.56 - tw;
+      }
+      ty = card.moveable.vy - th * 0.5;
     }
     tx = Math.max(12, Math.min(vw - tw - 12, tx));
-
-    let ty = card.moveable.vy - th * 0.5;
     ty = Math.max(12, Math.min(vh - th - 12, ty));
 
     this.tooltipEl.style.left = `${Math.round(tx)}px`;
@@ -2183,11 +2209,13 @@ export class UiOverlay {
       /* Blind Select Arena */
       .kc-blind-arena {
         position: absolute; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;
+        align-items: center;
       }
       .kc-blind-col {
         background: rgba(36, 44, 48, 0.95);
         border: 3px solid #1b2224; border-radius: 14px;
         padding: 12px; display: flex; flex-direction: column; gap: 10px;
+        min-height: 360px; max-height: 460px; height: 100%;
         box-shadow: 0 6px 0 rgba(0,0,0,0.4);
         pointer-events: auto;
       }
@@ -2284,7 +2312,7 @@ export class UiOverlay {
       .kc-modal-card.narrow { width: min(360px, 90vw); }
       .kc-modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
       .kc-modal-head h2 { font-size: 20px; font-weight: 900; }
-      .kc-modal-scroll { overflow-y: auto; max-height: 68vh; padding-right: 4px; }
+      .kc-modal-scroll { overflow-y: auto; max-height: 76vh; padding-right: 4px; padding-bottom: 6px; }
 
       .kc-tab-row { display: flex; gap: 6px; }
       .kc-tab-row.wrap { flex-wrap: wrap; }
@@ -2360,8 +2388,8 @@ export class UiOverlay {
 
       /* Options Grid */
       .kc-options-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
-      .kc-opt-section { background: #222a2d; border-radius: 12px; padding: 12px 14px; }
-      .kc-opt-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0; font-size: 14px; font-weight: 800; }
+      .kc-opt-section { background: #222a2d; border-radius: 12px; padding: 10px 14px; }
+      .kc-opt-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 3px 0; font-size: 13px; font-weight: 800; }
       .kc-pill-group { display: flex; gap: 5px; }
       .kc-pill-btn {
         background: #374244; color: #fff; border: 2px solid #181f22; border-radius: 7px;
@@ -2401,7 +2429,7 @@ export class UiOverlay {
 
       /* Toast */
       .kc-toast {
-        position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+        position: fixed; bottom: 18px; right: 20px;
         z-index: 95; background: #232b2e; border: 2px solid #f3b958; border-radius: 10px;
         padding: 7px 16px; font-size: 14px; font-weight: 800; color: #fff;
         box-shadow: 0 6px 18px rgba(0,0,0,0.5);
