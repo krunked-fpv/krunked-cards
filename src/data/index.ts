@@ -1,6 +1,8 @@
 import type {
+  JokerDef,
   JokerEvalContext,
   JokerEvalResult,
+  JokerHookFn,
   JokerInstance,
   SimState,
 } from '../contracts/index.ts';
@@ -12,11 +14,29 @@ import { CONSUMABLE_MAP, PLANETS, SPECTRALS, TAROTS } from './consumables.ts';
 import { DECKS, DECK_MAP, STAKES, STAKE_MAP } from './decks-stakes.ts';
 import { EDITION_DEFS, ENHANCEMENT_DEFS, SEAL_DEFS } from './enhancements.ts';
 import { BLIND_AMOUNTS, POKER_HANDS, POKER_HAND_MAP, getBlindAmount } from './hands.ts';
-import { JOKERS, JOKER_HOOKS, JOKER_MAP } from './jokers.ts';
+import { COMMON_JOKERS, COMMON_JOKER_HOOKS } from './jokers-common.ts';
+import { RARE_LEGENDARY_JOKERS, RARE_LEGENDARY_JOKER_HOOKS } from './jokers-rare-legendary.ts';
+import { UNCOMMON_JOKERS, UNCOMMON_JOKER_HOOKS } from './jokers-uncommon.ts';
 import { TAGS, TAG_MAP } from './tags.ts';
 import { VOUCHERS, VOUCHER_MAP } from './vouchers.ts';
 
-export const CATALOG_STAGE: 'wave1' | 'full' = 'wave1';
+export const CATALOG_STAGE: 'wave1' | 'full' = 'full';
+
+export const JOKERS: JokerDef[] = [
+  ...COMMON_JOKERS,
+  ...UNCOMMON_JOKERS,
+  ...RARE_LEGENDARY_JOKERS,
+].sort((a, b) => a.order - b.order);
+
+export const JOKER_MAP: Record<string, JokerDef> = Object.fromEntries(
+  JOKERS.map((j) => [j.key, j])
+);
+
+export const JOKER_HOOKS: Record<string, JokerHookFn> = {
+  ...COMMON_JOKER_HOOKS,
+  ...UNCOMMON_JOKER_HOOKS,
+  ...RARE_LEGENDARY_JOKER_HOOKS,
+};
 
 export {
   POKER_HANDS,
@@ -26,9 +46,6 @@ export {
   ENHANCEMENT_DEFS,
   EDITION_DEFS,
   SEAL_DEFS,
-  JOKERS,
-  JOKER_MAP,
-  JOKER_HOOKS,
   TAROTS,
   PLANETS,
   SPECTRALS,
