@@ -18,6 +18,7 @@ import { notifyJokersCardAdded, notifyJokersCardsDestroyed } from './consumables
 import { evaluatePokerHand, isCardFace, isCardSuit } from './poker.ts';
 import { nextRandom, nextRandomInt } from './prng.ts';
 import {
+  PLANET_HAND_FALLBACK,
   createCardInstance,
   createConsumableInstance,
   createJokerInstance,
@@ -26,6 +27,7 @@ import {
   getEffectiveConsumableSlots,
   getEffectiveJokerSlots,
   getProbabilityMultiplier,
+  hasChallengeRule,
   pickConsumableDefFromPool,
   pickJokerDefFromPool,
   recalcJokerSellValue,
@@ -292,6 +294,11 @@ export function scorePlayedHand(
         });
       }
     }
+
+    // Suit / Face / Pillar / Verdant Leaf boss debuffs trigger the boss blind if any played card is debuffed
+    if (playedCards.some((c) => c.debuffed)) {
+      activeBlind.triggered = true;
+    }
   }
 
   if (!handDebuffed) {
@@ -435,13 +442,19 @@ export function scorePlayedHand(
     if (res.createJoker) {
       const ed = res.createJoker.edition ?? 'none';
       if (ed === 'e_negative' || state.jokers.length < getEffectiveJokerSlots(state)) {
-        const key =
-          res.createJoker.key ??
-          pickJokerDefFromPool(state, `joker_spawn_${sourceJoker.key}`, {
-            forcedRarity: res.createJoker.rarity,
-          })?.key;
+        const picked = res.createJoker.key
+          ? JOKER_MAP[res.createJoker.key]
+          : pickJokerDefFromPool(state, `joker_spawn_${sourceJoker.key}`, {
+              forcedRarity: res.createJoker.rarity,
+            });
+        const key = res.createJoker.key ?? picked?.key;
         if (key) {
-          state.jokers.push(createJokerInstance(state, key, { edition: ed }));
+          state.jokers.push(
+            createJokerInstance(state, key, {
+              edition: ed,
+              eternal: state.tracking.allEternal && (picked?.eternalCompat ?? true),
+            })
+          );
         }
       }
     }
@@ -622,11 +635,34 @@ export function scorePlayedHand(
         } else if (card.enhancement === 'm_glass') {
           cardXMult *= 2;
         } else if (card.enhancement === 'm_lucky') {
+          let luckyHit = false;
           if (rand('lucky_mult') < (1 * probMultiplier) / 5) {
             cardMult += 20;
+            luckyHit = true;
           }
           if (rand('lucky_money') < (1 * probMultiplier) / 15) {
             cardDollars += 20;
+            luckyHit = true;
+          }
+          // Engine-owned j_lucky_cat scaling (+0.25 XMult per Lucky trigger)
+          if (luckyHit) {
+            for (let lj = 0; lj < state.jokers.length; lj++) {
+              const cat = state.jokers[lj];
+              if (cat.debuffed || destroyedJokerIds.has(cat.id) || cat.key !== 'j_lucky_cat') continue;
+              const curX = safeNum(Number(cat.state.x_mult ?? cat.state.Xmult ?? 1), 1);
+              const step = safeNum(Number(cat.state.extra ?? 0.25), 0.25);
+              const nextX = Math.round((curX + step) * 100) / 100;
+              cat.state.x_mult = nextX;
+              pushBeat({
+                kind: 'joker_trigger',
+                sourceType: 'joker',
+                sourceId: cat.id,
+                message: `X${nextX} Mult`,
+                color: PALETTE.MULT,
+                sound: 'tarot1',
+                durationMs: 220,
+              });
+            }
           }
         }
 
@@ -966,7 +1002,8 @@ export function scorePlayedHand(
         const cons = state.consumables[i];
         if (cons.set !== 'Planet') continue;
         const cDef = CONSUMABLE_MAP[cons.key];
-        if (cDef?.handType === handEval.handId) {
+        const handType = cDef?.handType ?? PLANET_HAND_FALLBACK[cons.key];
+        if (handType === handEval.handId) {
           mult = clampFinite(mult * 1.5, mult);
           pushBeat({
             kind: 'consumable_trigger',
@@ -983,10 +1020,28 @@ export function scorePlayedHand(
       }
     }
 
+    // 5e. Rich get Richer challenge rule: Chips cannot exceed current $
+    if (hasChallengeRule(state, 'chips_dollar_cap')) {
+      const cap = Math.max(0, Math.floor(safeNum(state.dollars, 0)));
+      if (chips > cap) {
+        chips = cap;
+        pushBeat({
+          kind: 'boss_modify',
+          sourceType: 'system',
+          message: `Chips capped at $${cap}`,
+          color: PALETTE.GOLD,
+          sound: 'cancel',
+          durationMs: 300,
+        });
+      }
+    }
+
     // ========================================================================
     // STEP 6: Plasma Deck Balance
     // ========================================================================
-    const isPlasma = state.deckId === 'b_plasma' || Boolean(DECK_MAP[state.deckId]?.config.plasma);
+    const isPlasma =
+      !state.challengeId &&
+      (state.deckId === 'b_plasma' || Boolean(DECK_MAP[state.deckId]?.config.plasma));
     if (isPlasma) {
       const avg = Math.floor(clampFinite((chips + mult) / 2, 0));
       chips = avg;
@@ -1074,6 +1129,31 @@ export function scorePlayedHand(
     }
   }
 
+  // 7b-2. Engine-owned j_matador (+$8 per active or copied Matador if Boss Blind triggered, even if hand was debuffed)
+  if (isBossActive && activeBlind.triggered) {
+    for (let i = 0; i < state.jokers.length; i++) {
+      const sourceJoker = state.jokers[i];
+      if (sourceJoker.debuffed || destroyedJokerIds.has(sourceJoker.id)) continue;
+      const resolved = resolveCopiedJoker(state.jokers, i);
+      if (!resolved || resolved.target.key !== 'j_matador') continue;
+      const payout = safeNum(Number(resolved.target.state.extra ?? 8), 8);
+      if (payout > 0) {
+        state.dollars = safeNum(state.dollars + payout, state.dollars);
+        pushBeat({
+          kind: 'joker_trigger',
+          sourceType: 'joker',
+          sourceId: sourceJoker.id,
+          dollarsDelta: payout,
+          message: `+$${payout}`,
+          color: PALETTE.GOLD,
+          sound: 'coin1',
+          escalatePitch: true,
+          durationMs: 280,
+        });
+      }
+    }
+  }
+
   // Remove any jokers destroyed during scoring
   if (destroyedJokerIds.size > 0) {
     for (let i = 0; i < state.jokers.length; i++) {
@@ -1127,10 +1207,10 @@ export function scorePlayedHand(
       durationMs: 560,
     });
   } else if (state.handsLeft <= 0) {
-    // Check Mr. Bones rescue (non-debuffed, roundChips >= 25% of targetChips)
+    // Check Mr. Bones rescue (only invoke Mr. Bones — never invoke end_of_round on other jokers here!)
     for (let i = 0; i < state.jokers.length; i++) {
       const joker = state.jokers[i];
-      if (joker.debuffed) continue;
+      if (joker.debuffed || joker.key !== 'j_mr_bones') continue;
       const hookRes = evaluateJokerHook(joker.key, {
         stage: 'end_of_round',
         state,
@@ -1144,7 +1224,7 @@ export function scorePlayedHand(
       });
       const canSave =
         Boolean(hookRes?.saveRun) ||
-        (joker.key === 'j_mr_bones' && state.roundChips >= state.targetChips * 0.25);
+        state.roundChips >= state.targetChips * 0.25;
       if (canSave) {
         savedByMrBones = true;
         blindCleared = true;

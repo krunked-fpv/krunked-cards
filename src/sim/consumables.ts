@@ -72,7 +72,6 @@ const ENHANCEMENT_CHOICES: EnhancementId[] = [
   'm_wild',
   'm_glass',
   'm_steel',
-  'm_stone',
   'm_gold',
   'm_lucky',
 ];
@@ -538,7 +537,9 @@ export function applyConsumable(
       case 'c_judgement': {
         if (state.jokers.length < getEffectiveJokerSlots(state)) {
           const jDef = pickJokerDefFromPool(state, `judgement_${state.round}`);
-          const inst = createJokerInstance(state, jDef?.key ?? 'j_joker');
+          const inst = createJokerInstance(state, jDef?.key ?? 'j_joker', {
+            eternal: state.tracking.allEternal && (jDef?.eternalCompat ?? true),
+          });
           state.jokers.push(inst);
           events.push({
             type: 'CONSUMABLE_USED',
@@ -623,7 +624,9 @@ export function applyConsumable(
       case 'c_wraith': {
         if (state.jokers.length < getEffectiveJokerSlots(state)) {
           const jDef = pickJokerDefFromPool(state, `wraith_${state.round}`, { forcedRarity: 3 });
-          const inst = createJokerInstance(state, jDef?.key ?? 'j_joker');
+          const inst = createJokerInstance(state, jDef?.key ?? 'j_joker', {
+            eternal: state.tracking.allEternal && (jDef?.eternalCompat ?? true),
+          });
           state.jokers.push(inst);
           state.dollars = 0;
           events.push({
@@ -783,7 +786,9 @@ export function applyConsumable(
           const legDef =
             pickJokerDefFromPool(state, `soul_${state.round}`, { forcedRarity: 4 }) ??
             pickJokerDefFromPool(state, `soul_fb_${state.round}`, { forcedRarity: 3 });
-          const inst = createJokerInstance(state, legDef?.key ?? 'j_joker');
+          const inst = createJokerInstance(state, legDef?.key ?? 'j_joker', {
+            eternal: state.tracking.allEternal && (legDef?.eternalCompat ?? true),
+          });
           state.jokers.push(inst);
           events.push({
             type: 'CONSUMABLE_USED',
