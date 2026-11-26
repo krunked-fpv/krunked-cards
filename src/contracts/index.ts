@@ -974,6 +974,108 @@ export interface DebugBridge {
   resetSave(): void;
 }
 
+// ============================================================================
+// Cross-Module Runtime Contracts (Data <-> Sim <-> Audio <-> Render)
+// ============================================================================
+
+export type JokerHookStage =
+  | 'before'
+  | 'individual_play'
+  | 'individual_hand'
+  | 'joker_main'
+  | 'after'
+  | 'discard'
+  | 'repetition_play'
+  | 'repetition_hand'
+  | 'end_of_round'
+  | 'setting_blind'
+  | 'skip_blind'
+  | 'skipping_booster'
+  | 'buying_card'
+  | 'selling_card'
+  | 'reroll_shop'
+  | 'open_booster'
+  | 'using_consumeable'
+  | 'cards_destroyed'
+  | 'card_added'
+  | 'first_hand_drawn'
+  | 'calc_dollar_bonus';
+
+export interface JokerEvalContext {
+  stage: JokerHookStage;
+  state: SimState;
+  joker: JokerInstance;
+  jokerIndex: number;
+  isBlueprint?: boolean;
+  blueprintSource?: JokerInstance;
+  handEval?: HandEvaluationResult;
+  fullHand?: CardInstance[];
+  scoringHand?: CardInstance[];
+  heldCards?: CardInstance[];
+  card?: CardInstance;
+  removedCards?: CardInstance[];
+  consumable?: ConsumableInstance;
+  itemKey?: string;
+  itemKind?: string;
+  probMultiplier: number;
+  rand: (key: string) => number;
+  randInt: (key: string, max: number) => number;
+  isFace: (card: CardInstance) => boolean;
+  isSuit: (card: CardInstance, suit: Suit) => boolean;
+}
+
+export interface JokerEvalResult {
+  chips?: number;
+  mult?: number;
+  xMult?: number;
+  dollars?: number;
+  repetitions?: number;
+  message?: string;
+  color?: string;
+  sound?: SoundKey;
+  levelUpHand?: PokerHandId;
+  createConsumable?: { set: ConsumableSet; key?: string; edition?: EditionId };
+  createJoker?: { key?: string; rarity?: Rarity; edition?: EditionId };
+  destroySelf?: boolean;
+  destroyCardId?: string;
+  destroyJokerId?: string;
+  cloneCardId?: string;
+  addStoneCard?: boolean;
+  addSellValue?: number;
+  disableBoss?: boolean;
+  saveRun?: boolean;
+  setCardEnhancement?: { cardId: string; enhancement: EnhancementId };
+}
+
+export type JokerHookFn = (ctx: JokerEvalContext) => JokerEvalResult | null;
+
+export interface SimStepResult {
+  state: SimState;
+  beats: ScoreBeat[];
+  events: SimEvent[];
+}
+
+export interface HandPreview {
+  handId: PokerHandId;
+  displayName: string;
+  baseChips: number;
+  baseMult: number;
+  level: number;
+  scoringCardIds: string[];
+}
+
+export interface IAudioEngine {
+  unlock(): Promise<void>;
+  setSettings(settings: Pick<RenderSettings, 'masterVolume' | 'musicVolume' | 'sfxVolume'>): void;
+  setCustomPack(sounds: Record<SoundKey, string> | null): Promise<void>;
+  setMusicContext(track: MusicTrackId, intensity?: number): void;
+  setFireIntensity(intensity: number): void;
+  playSfx(key: SoundKey, opts?: { pitch?: number; volume?: number }): void;
+  update(dt: number): void;
+  getMode(): 'builtin' | 'custom';
+  dispose(): void;
+}
+
 declare global {
   interface Window {
     __KRUNKED_DEBUG__?: DebugBridge;
