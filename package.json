@@ -1,0 +1,27 @@
+{
+  "name": "krunked-cards",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Krunked Cards — 1:1 Roguelike Poker Deckbuilder built with TypeScript, WebGL2, and Web Audio API",
+  "scripts": {
+    "extract": "tsx tools/extract-assets.ts",
+    "oracle": "tsx tools/oracle-dump.ts",
+    "dev": "vite",
+    "play": "vite --port 4173 --strictPort",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "verify:assets": "tsx scripts/verify/verify-assets.ts",
+    "verify:sim": "tsx scripts/verify/verify-sim.ts",
+    "verify": "npm run typecheck && npm run test && npm run verify:assets && npm run verify:sim",
+    "build": "tsc --noEmit && vite build",
+    "export:dna": "tsx export-dna.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.6",
+    "vitest": "^2.1.8"
+  }
+}
