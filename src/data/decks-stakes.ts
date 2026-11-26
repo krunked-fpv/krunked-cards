@@ -22,6 +22,123 @@ export const DECKS: DeckDef[] = [
     },
   },
   {
+    key: 'b_yellow',
+    name: 'Yellow Deck',
+    order: 3,
+    pos: { x: 1, y: 2 },
+    desc: 'Start with extra $10',
+    config: {
+      dollars: 10,
+    },
+  },
+  {
+    key: 'b_green',
+    name: 'Green Deck',
+    order: 4,
+    pos: { x: 2, y: 2 },
+    desc: 'At end of each Round: $2 per remaining Hand, $1 per remaining Discard. Earn no Interest',
+    config: {
+      extraHandBonus: 2,
+      extraDiscardBonus: 1,
+      noInterest: true,
+    },
+  },
+  {
+    key: 'b_black',
+    name: 'Black Deck',
+    order: 5,
+    pos: { x: 3, y: 2 },
+    desc: '+1 Joker slot, -1 hand every round',
+    config: {
+      jokerSlots: 1,
+      hands: -1,
+    },
+  },
+  {
+    key: 'b_magic',
+    name: 'Magic Deck',
+    order: 6,
+    pos: { x: 0, y: 3 },
+    desc: 'Start run with the Crystal Ball voucher and 2 copies of The Fool',
+    config: {
+      vouchers: ['v_crystal_ball'],
+      consumables: ['c_fool', 'c_fool'],
+    },
+  },
+  {
+    key: 'b_nebula',
+    name: 'Nebula Deck',
+    order: 7,
+    pos: { x: 3, y: 0 },
+    desc: 'Start run with the Telescope voucher, -1 consumable slot',
+    config: {
+      vouchers: ['v_telescope'],
+      consumableSlots: -1,
+    },
+  },
+  {
+    key: 'b_ghost',
+    name: 'Ghost Deck',
+    order: 8,
+    pos: { x: 6, y: 2 },
+    desc: 'Spectral cards may appear in the shop, start with a Hex card',
+    config: {
+      spectralRate: 2,
+      consumables: ['c_hex'],
+    },
+  },
+  {
+    key: 'b_abandoned',
+    name: 'Abandoned Deck',
+    order: 9,
+    pos: { x: 3, y: 3 },
+    desc: 'Start run with no Face Cards in your deck',
+    config: {
+      removeFaces: true,
+    },
+  },
+  {
+    key: 'b_checkered',
+    name: 'Checkered Deck',
+    order: 10,
+    pos: { x: 1, y: 3 },
+    desc: 'Start run with 26 Spades and 26 Hearts in deck',
+    config: {
+      checkered: true,
+    },
+  },
+  {
+    key: 'b_zodiac',
+    name: 'Zodiac Deck',
+    order: 11,
+    pos: { x: 3, y: 4 },
+    desc: 'Start run with Tarot Merchant, Planet Merchant, and Overstock',
+    config: {
+      vouchers: ['v_tarot_merchant', 'v_planet_merchant', 'v_overstock_norm'],
+    },
+  },
+  {
+    key: 'b_painted',
+    name: 'Painted Deck',
+    order: 12,
+    pos: { x: 4, y: 3 },
+    desc: '+2 hand size, -1 Joker slot',
+    config: {
+      handSize: 2,
+      jokerSlots: -1,
+    },
+  },
+  {
+    key: 'b_anaglyph',
+    name: 'Anaglyph Deck',
+    order: 13,
+    pos: { x: 2, y: 4 },
+    desc: 'After defeating each Boss Blind, gain a Double Tag',
+    config: {
+      anaglyph: true,
+    },
+  },
+  {
     key: 'b_plasma',
     name: 'Plasma Deck',
     order: 14,
@@ -30,6 +147,16 @@ export const DECKS: DeckDef[] = [
     config: {
       anteScaling: 2,
       plasma: true,
+    },
+  },
+  {
+    key: 'b_erratic',
+    name: 'Erratic Deck',
+    order: 15,
+    pos: { x: 2, y: 3 },
+    desc: 'All Ranks and Suits in deck are randomized',
+    config: {
+      randomizeRankSuit: true,
     },
   },
 ];
