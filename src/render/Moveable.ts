@@ -969,7 +969,7 @@ export class CardSceneManager {
         const pStep = pCount > 1 ? Math.min(pCardW + 24, (g.packTray.w - pCardW - 40) / (pCount - 1)) : 0;
         const pSpan = pStep * Math.max(0, pCount - 1);
         const pStartX = g.packTray.x + g.packTray.w * 0.5 - pSpan * 0.5;
-        const pY = g.packTray.y + g.packTray.h * 0.48;
+        const pY = g.packTray.y + 52 + pCardH * 0.52;
 
         avail.forEach((pc, idx) => {
           const m = ensureMoveable(pc.id, pStartX + idx * pStep, pY - 30, pCardW, pCardH);
