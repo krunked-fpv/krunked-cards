@@ -1,7 +1,9 @@
 // ============================================================================
 // Krunked Cards — Exact Exponential Spring Physics & Interactive Card Layout
-// Implements spec-exact Moveable springs (exp_xy, exp_scale, exp_r, juiceUp)
-// and computes responsive screen-space card trays across 1280x720 -> 1920x1080.
+// Implements spec-exact Moveable springs (exp_xy, exp_scale, exp_r, juiceUp),
+// 3D card flip animations, authentic non-standard Joker shapes, 2-layer
+// soulPos floating parallax wiring, scoring card emphasis, and the iconic
+// single-Ace Title Screen centerpiece.
 // ============================================================================
 
 import {
@@ -41,6 +43,9 @@ export type VisualEntityKind =
   | 'shop_booster'
   | 'pack_card'
   | 'title_showcase';
+
+export type CardShapeKind = 'half' | 'square' | 'photo' | 'wee';
+export type SoulShaderKind = 'hologram' | 'soul_gem' | 'default';
 
 export interface JuiceState {
   scale: number;
@@ -82,14 +87,23 @@ export class Moveable {
   velR = 0;
   velScale = 0;
 
-  // Hover & drag visual states
+  // Hover, drag, tilt, dissolve & 3D flip visual states
   hovered = false;
   dragging = false;
   tiltX = 0;
   tiltY = 0;
+  targetTiltX = 0;
+  targetTiltY = 0;
   dissolve = 0;
   juice: JuiceState | null = null;
   initialized = false;
+
+  // 3D horizontal flip animation (0..1; 1 = settled, flips cleanly at 0.5)
+  flipProgress = 1;
+  flipDuration = 0.30;
+  flipDelay = 0;
+  flipPrevFaceDown = false;
+  lastKnownFaceDown: boolean | null = null;
 
   snapToTarget(): void {
     this.vx = this.tx;
@@ -103,6 +117,36 @@ export class Moveable {
     this.velR = 0;
     this.velScale = 0;
     this.initialized = true;
+  }
+
+  triggerFlip(fromFaceDown: boolean, duration = 0.30, delay = 0): void {
+    this.flipPrevFaceDown = fromFaceDown;
+    this.flipProgress = 0;
+    this.flipDuration = Math.max(0.12, duration);
+    this.flipDelay = Math.max(0, delay);
+  }
+
+  syncFaceDown(faceDown: boolean, reducedMotion: boolean): void {
+    if (this.lastKnownFaceDown !== null && this.lastKnownFaceDown !== faceDown) {
+      if (reducedMotion) {
+        this.flipProgress = 1;
+      } else {
+        this.triggerFlip(this.lastKnownFaceDown, 0.30, 0);
+      }
+    }
+    this.lastKnownFaceDown = faceDown;
+  }
+
+  getFlipScaleX(): number {
+    if (this.flipProgress >= 1) return 1;
+    if (this.flipDelay > 0) return 1;
+    return Math.max(0.03, Math.abs(Math.cos(this.flipProgress * Math.PI)));
+  }
+
+  getDisplayFaceDown(actualFaceDown: boolean): boolean {
+    if (this.flipProgress >= 1) return actualFaceDown;
+    if (this.flipDelay > 0 || this.flipProgress < 0.5) return this.flipPrevFaceDown;
+    return actualFaceDown;
   }
 
   juiceUp(amount = 0.4, rotAmt?: number, _nowSec?: number): void {
@@ -140,8 +184,21 @@ export class Moveable {
       this.vScale = Math.max(0.55, Math.min(1.5, this.vScale));
       this.tiltX *= 0.85;
       this.tiltY *= 0.85;
+      this.targetTiltX = 0;
+      this.targetTiltY = 0;
+      this.flipProgress = 1;
+      this.flipDelay = 0;
       this.juice = null;
       return;
+    }
+
+    // Step 3D flip animation
+    if (this.flipProgress < 1) {
+      if (this.flipDelay > 0) {
+        this.flipDelay = Math.max(0, this.flipDelay - safeDt);
+      } else {
+        this.flipProgress = Math.min(1, this.flipProgress + safeDt / this.flipDuration);
+      }
     }
 
     // Update harmonic juice wave using monotonic frame dt (immune to clock domain drift)
@@ -197,10 +254,10 @@ export class Moveable {
     this.vw += (this.tw - this.vw) * (1 - Math.exp(-20 * safeDt));
     this.vh += (this.th - this.vh) * (1 - Math.exp(-20 * safeDt));
 
-    // Scale spring: +0.10 dragging, +0.05 hovering, +juice.scale
+    // Scale spring: +0.10 dragging, +0.055 hovering, +juice.scale
     const desScale = Math.max(
       0.65,
-      Math.min(1.45, this.tScale + (this.dragging ? 0.1 : this.hovered ? 0.05 : 0) + juiceScale)
+      Math.min(1.48, this.tScale + (this.dragging ? 0.1 : this.hovered ? 0.055 : 0) + juiceScale)
     );
     this.velScale = expScale * this.velScale + (1 - expScale) * (desScale - this.vScale) * 20 * safeDt;
     this.vScale = Math.max(0.55, Math.min(1.55, this.vScale + this.velScale));
@@ -211,11 +268,16 @@ export class Moveable {
     this.velR = expR * this.velR + (1 - expR) * (desR - this.vr) * 24 * safeDt;
     this.vr = Math.max(-1.2, Math.min(1.2, this.vr + this.velR));
 
-    // Smooth tilt decay when not hovered
+    // Smooth spring-damped hover tilt toward targetTilt (or 0 when unhovered)
+    const tiltK = 1 - Math.exp(-15 * safeDt);
+    const goalTX = this.hovered ? this.targetTiltX : this.targetTiltX * 0.85;
+    const goalTY = this.hovered ? this.targetTiltY : this.targetTiltY * 0.85;
+    this.tiltX += (goalTX - this.tiltX) * tiltK;
+    this.tiltY += (goalTY - this.tiltY) * tiltK;
     if (!this.hovered) {
-      const tk = Math.exp(-12 * safeDt);
-      this.tiltX *= tk;
-      this.tiltY *= tk;
+      const decay = Math.exp(-10 * safeDt);
+      this.targetTiltX *= decay;
+      this.targetTiltY *= decay;
     }
   }
 }
@@ -240,6 +302,16 @@ export interface VisualCard {
   facePos?: AtlasPos;
   sealPos?: AtlasPos;
   stickers: AtlasPos[];
+
+  // Optional 2-layer floating soulPos, shader overlays, shapes & 3D flip
+  soulAtlas?: AtlasKey;
+  soulPos?: AtlasPos;
+  soulShader?: SoulShaderKind;
+  floatingGlow?: 'black_hole';
+  overlayEffect?: 'booster' | 'voucher';
+  nonScoring?: boolean;
+  cardShape?: CardShapeKind;
+  flipScaleX?: number;
 
   edition: EditionId;
   enhancement?: EnhancementId;
@@ -287,7 +359,7 @@ export interface TableGeometry {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers mapping cards/items to exact Atlas Coordinates
+// Helpers mapping cards/items to exact Atlas Coordinates & Authentic Shapes
 // ---------------------------------------------------------------------------
 
 const SUIT_TO_ROW: Record<Suit, number> = {
@@ -350,6 +422,57 @@ export function getCardFacePos(suit: Suit, rank: Rank): AtlasPos {
   return { x: RANK_TO_COL[rank] ?? 0, y: SUIT_TO_ROW[suit] ?? 0 };
 }
 
+function getJokerShapeDimensions(
+  jokerKey: string,
+  baseW: number,
+  baseH: number
+): { tw: number; th: number; cardShape?: CardShapeKind } {
+  switch (jokerKey) {
+    case 'j_half':
+      return { tw: baseW, th: Math.round(baseH * 0.65), cardShape: 'half' };
+    case 'j_square':
+      return { tw: baseW, th: baseW, cardShape: 'square' };
+    case 'j_photograph':
+      return { tw: baseW, th: baseW, cardShape: 'photo' };
+    case 'j_wee':
+      return { tw: Math.round(baseW * 0.7), th: Math.round(baseH * 0.7), cardShape: 'wee' };
+    default:
+      return { tw: baseW, th: baseH };
+  }
+}
+
+function getJokerSoulFields(
+  jokerKey: string,
+  displayFaceDown: boolean
+): Pick<VisualCard, 'soulAtlas' | 'soulPos' | 'soulShader'> {
+  if (displayFaceDown) return {};
+  const def = JOKER_MAP[jokerKey];
+  if (!def?.soulPos) return {};
+  return {
+    soulAtlas: 'Joker',
+    soulPos: def.soulPos,
+    soulShader: jokerKey === 'j_hologram' ? 'hologram' : 'default',
+  };
+}
+
+function getConsumableSpecialFields(
+  key: string
+): Pick<VisualCard, 'soulAtlas' | 'soulPos' | 'soulShader' | 'floatingGlow'> {
+  if (key === 'c_soul') {
+    return {
+      soulAtlas: 'centers',
+      soulPos: { x: 0, y: 1 },
+      soulShader: 'soul_gem',
+    };
+  }
+  if (key === 'c_black_hole') {
+    return {
+      floatingGlow: 'black_hole',
+    };
+  }
+  return {};
+}
+
 // ---------------------------------------------------------------------------
 // Responsive Table Layout Calculator (1280x720 through 1920x1080+)
 // ---------------------------------------------------------------------------
@@ -371,7 +494,7 @@ export function computeTableGeometry(viewportW: number, viewportH: number): Tabl
   const cardW = Math.round(cardH * aspect);
   const highlightLift = Math.round(cardH * 0.2);
 
-  // Top row: Jokers (left ~66%) & Consumables (right ~32%)
+  // Top row: Jokers (left ~67%) & Consumables (right ~33%)
   const topRowH = Math.round(cardH + 22);
   const gap = 14;
   const jokerW = Math.round((tableW - gap) * 0.67);
@@ -380,7 +503,7 @@ export function computeTableGeometry(viewportW: number, viewportH: number): Tabl
   const jokerTray: RectPx = { x: tableX, y: 14, w: jokerW, h: topRowH };
   const consumableTray: RectPx = { x: tableX + jokerW + gap, y: 14, w: consW, h: topRowH };
 
-  // Bottom row: Hand tray + Deck stack on right, leaving 58px at very bottom for action bar
+  // Bottom row: Hand tray + Deck stack on right, leaving 62px at very bottom for action bar
   const actionBarH = 62;
   const handTrayH = Math.round(cardH + highlightLift + 16);
   const deckW = Math.round(cardW + 22);
@@ -404,12 +527,12 @@ export function computeTableGeometry(viewportW: number, viewportH: number): Tabl
   const midH = Math.max(cardH + 16, handTray.y - midY - 10);
   const playArea: RectPx = { x: tableX, y: midY, w: tableW, h: midH };
 
-  // Shop trays (inside Shop container area below top row)
-  const shopTopY = jokerTray.y + jokerTray.h + 24;
+  // Shop trays (inside Shop container area below top row with clear counter headroom)
+  const shopTopY = jokerTray.y + jokerTray.h + 28;
   const shopControlsW = Math.round(Math.min(200, Math.max(152, tableW * 0.22)));
   const shopRightX = tableX + shopControlsW + 16;
   const shopRightW = tableW - shopControlsW - 16;
-  const shopCardRowH = Math.round(cardH + 54);
+  const shopCardRowH = Math.round(cardH + 52);
 
   const shopOfferTray: RectPx = {
     x: shopRightX,
@@ -417,7 +540,7 @@ export function computeTableGeometry(viewportW: number, viewportH: number): Tabl
     w: shopRightW,
     h: shopCardRowH,
   };
-  const shopBottomY = shopOfferTray.y + shopOfferTray.h + 16;
+  const shopBottomY = shopOfferTray.y + shopOfferTray.h + 14;
   const shopVoucherW = Math.round(shopRightW * 0.34);
   const shopVoucherTray: RectPx = {
     x: shopRightX,
@@ -584,8 +707,14 @@ export class CardSceneManager {
       if (isHit) {
         const hw = Math.max(1, m.vw * 0.5);
         const hh = Math.max(1, m.vh * 0.5);
-        m.tiltX = Math.max(-1, Math.min(1, (pointerX - m.vx) / hw));
-        m.tiltY = Math.max(-1, Math.min(1, (pointerY - m.vy) / hh));
+        m.targetTiltX = Math.max(-1, Math.min(1, (pointerX - m.vx) / hw));
+        m.targetTiltY = Math.max(-1, Math.min(1, (pointerY - m.vy) / hh));
+      } else if (vc.kind === 'title_showcase') {
+        // Gentle magnetic cursor tracking for the iconic Title Ace of Spades
+        const spanX = Math.max(240, this.geometry.viewportW * 0.45);
+        const spanY = Math.max(180, this.geometry.viewportH * 0.45);
+        m.targetTiltX = Math.max(-0.55, Math.min(0.55, (pointerX - m.vx) / spanX));
+        m.targetTiltY = Math.max(-0.55, Math.min(0.55, (pointerY - m.vy) / spanY));
       }
     }
     return hit;
@@ -601,7 +730,8 @@ export class CardSceneManager {
     highContrast: boolean,
     reducedMotion: boolean,
     dt: number,
-    nowSec: number
+    nowSec: number,
+    scoringCardIds?: ReadonlySet<string> | null
   ): void {
     this.geometry = computeTableGeometry(viewportW, viewportH);
     const g = this.geometry;
@@ -614,7 +744,15 @@ export class CardSceneManager {
     const nextVisuals: VisualCard[] = [];
     const seenIds = new Set<string>();
 
-    const ensureMoveable = (id: string, spawnX: number, spawnY: number, w: number, h: number): Moveable => {
+    const ensureMoveable = (
+      id: string,
+      spawnX: number,
+      spawnY: number,
+      w: number,
+      h: number,
+      initialFlipFromBack = false,
+      flipDelay = 0
+    ): Moveable => {
       seenIds.add(id);
       let m = this.moveables.get(id);
       if (!m) {
@@ -628,58 +766,51 @@ export class CardSceneManager {
         m.vw = w;
         m.vh = h;
         m.initialized = true;
+        if (initialFlipFromBack && !reducedMotion) {
+          m.triggerFlip(true, 0.32, flipDelay);
+        }
         this.moveables.set(id, m);
       }
       return m;
     };
 
-    // --- TITLE PHASE: Fanned Showcase Cards behind the Krunked Cards Logo ---
+    // --- TITLE PHASE: Iconic Dramatic Single Oversized Ace of Spades in Vortex Core ---
     if (state.phase === 'TITLE') {
-      const showcaseW = Math.round(g.cardW * 1.18);
-      const showcaseH = Math.round(g.cardH * 1.18);
+      const showcaseW = Math.round(g.cardW * 1.65);
+      const showcaseH = Math.round(g.cardH * 1.65);
       const cx = g.viewportW * 0.5;
-      const cy = g.viewportH * 0.41;
-      const items: Array<{
-        id: string;
-        baseAtlas: AtlasKey;
-        basePos: AtlasPos;
-        faceAtlas?: AtlasKey;
-        facePos?: AtlasPos;
-        edition: EditionId;
-      }> = [
-        { id: 'title_c0', baseAtlas: 'centers', basePos: { x: 1, y: 0 }, faceAtlas, facePos: getCardFacePos('Spades', 'Ace'), edition: 'e_foil' },
-        { id: 'title_c1', baseAtlas: 'Joker', basePos: { x: 0, y: 3 }, edition: 'e_holo' },
-        { id: 'title_c2', baseAtlas: 'Joker', basePos: { x: 0, y: 0 }, edition: 'e_polychrome' },
-        { id: 'title_c3', baseAtlas: 'Joker', basePos: { x: 6, y: 12 }, edition: 'e_negative' },
-        { id: 'title_c4', baseAtlas: 'centers', basePos: { x: 6, y: 0 }, faceAtlas, facePos: getCardFacePos('Hearts', 'King'), edition: 'none' },
-      ];
-      items.forEach((it, i) => {
-        const offset = i - 2;
-        const bob = reducedMotion ? 0 : Math.sin(nowSec * 1.7 + i * 1.1) * 7;
-        const m = ensureMoveable(it.id, cx + offset * (showcaseW * 0.88), cy, showcaseW, showcaseH);
-        m.tx = cx + offset * (showcaseW * 0.92);
-        m.ty = cy + Math.abs(offset) * 14 + bob;
-        m.tw = showcaseW;
-        m.th = showcaseH;
-        m.tr = offset * 0.085 + (reducedMotion ? 0 : Math.sin(nowSec * 1.1 + i) * 0.02);
-        m.tScale = i === 2 ? 1.08 : 0.96;
-        nextVisuals.push({
-          id: it.id,
-          kind: 'title_showcase',
-          index: i,
-          moveable: m,
-          zIndex: i === 2 ? 20 : 10 + i,
-          selected: false,
-          draggable: false,
-          baseAtlas: it.baseAtlas,
-          basePos: it.basePos,
-          faceAtlas: it.faceAtlas,
-          facePos: it.facePos,
-          stickers: [],
-          edition: it.edition,
-          debuffed: false,
-          faceDown: false,
-        });
+      const cy = g.viewportH * 0.49;
+      const bob = reducedMotion ? 0 : Math.sin(nowSec * 1.55) * 6;
+      const sway = reducedMotion ? 0 : Math.sin(nowSec * 0.92) * 0.042;
+      const isNewTitleAce = !this.moveables.has('title_ace');
+      const m = ensureMoveable('title_ace', cx, cy + 20, showcaseW, showcaseH, false, 0);
+      if (isNewTitleAce && !reducedMotion) {
+        m.juiceUp(0.32, 0.14, nowSec);
+      }
+      m.tx = cx;
+      m.ty = cy + bob;
+      m.tw = showcaseW;
+      m.th = showcaseH;
+      m.tr = sway;
+      m.tScale = 1.0;
+
+      nextVisuals.push({
+        id: 'title_ace',
+        kind: 'title_showcase',
+        index: 0,
+        moveable: m,
+        zIndex: 20,
+        selected: false,
+        draggable: false,
+        baseAtlas: 'centers',
+        basePos: { x: 1, y: 0 },
+        faceAtlas,
+        facePos: getCardFacePos('Spades', 'Ace'),
+        stickers: [],
+        edition: 'none',
+        debuffed: false,
+        faceDown: false,
+        flipScaleX: m.getFlipScaleX(),
       });
     } else {
       // --- 1. JOKER TRAY (Always visible during run) ---
@@ -695,14 +826,18 @@ export class CardSceneManager {
 
       state.jokers.forEach((joker, idx) => {
         const def = JOKER_MAP[joker.key];
-        const m = ensureMoveable(joker.id, jStartX + idx * jStep, jCenterY, jCardW, jCardH);
+        const shape = getJokerShapeDimensions(joker.key, jCardW, jCardH);
+        const m = ensureMoveable(joker.id, jStartX + idx * jStep, jCenterY, shape.tw, shape.th);
+        m.syncFaceDown(joker.faceDown, reducedMotion);
+
         m.tx = jStartX + idx * jStep;
-        m.ty = jCenterY + (reducedMotion ? 0 : Math.sin(nowSec * 1.6 + idx * 0.9) * 1.5);
-        m.tw = jCardW;
-        m.th = jCardH;
-        m.tr = reducedMotion ? 0 : Math.sin(nowSec * 1.1 + idx * 1.4) * 0.014;
+        m.ty = jCenterY + (reducedMotion ? 0 : Math.sin(nowSec * 1.65 + idx * 0.95) * 1.8);
+        m.tw = shape.tw;
+        m.th = shape.th;
+        m.tr = reducedMotion ? 0 : Math.sin(nowSec * 1.12 + idx * 1.4) * 0.016;
         m.tScale = 1;
 
+        const displayFaceDown = m.getDisplayFaceDown(joker.faceDown);
         const stickers: AtlasPos[] = [];
         if (joker.eternal) stickers.push({ x: 0, y: 0 });
         if (joker.perishable) stickers.push({ x: 0, y: 2 });
@@ -716,12 +851,15 @@ export class CardSceneManager {
           zIndex: 30 + idx,
           selected: false,
           draggable: true,
-          baseAtlas: joker.faceDown ? 'centers' : 'Joker',
-          basePos: joker.faceDown ? deckBack : (def?.pos ?? { x: 0, y: 0 }),
+          baseAtlas: displayFaceDown ? 'centers' : 'Joker',
+          basePos: displayFaceDown ? deckBack : (def?.pos ?? { x: 0, y: 0 }),
+          ...getJokerSoulFields(joker.key, displayFaceDown),
+          cardShape: displayFaceDown ? undefined : shape.cardShape,
+          flipScaleX: m.getFlipScaleX(),
           stickers,
-          edition: joker.edition,
+          edition: displayFaceDown ? 'none' : joker.edition,
           debuffed: joker.debuffed,
-          faceDown: joker.faceDown,
+          faceDown: displayFaceDown,
           jokerData: joker,
         });
       });
@@ -739,11 +877,12 @@ export class CardSceneManager {
       state.consumables.forEach((cons, idx) => {
         const def = CONSUMABLE_MAP[cons.key];
         const m = ensureMoveable(cons.id, cStartX + idx * cStep, cCenterY, cCardW, cCardH);
+        const extraBob = cons.key === 'c_soul' || cons.key === 'c_black_hole' ? 3.5 : 2.0;
         m.tx = cStartX + idx * cStep;
-        m.ty = cCenterY + (reducedMotion ? 0 : Math.sin(nowSec * 1.9 + idx * 1.2) * 2);
+        m.ty = cCenterY + (reducedMotion ? 0 : Math.sin(nowSec * 1.9 + idx * 1.2) * extraBob);
         m.tw = cCardW;
         m.th = cCardH;
-        m.tr = reducedMotion ? 0 : Math.cos(nowSec * 1.2 + idx) * 0.018;
+        m.tr = reducedMotion ? 0 : Math.cos(nowSec * 1.2 + idx) * 0.02;
         m.tScale = 1;
 
         nextVisuals.push({
@@ -756,6 +895,8 @@ export class CardSceneManager {
           draggable: false,
           baseAtlas: 'Tarot',
           basePos: def?.pos ?? { x: 0, y: 0 },
+          ...getConsumableSpecialFields(cons.key),
+          flipScaleX: m.getFlipScaleX(),
           stickers: [],
           edition: cons.edition,
           debuffed: false,
@@ -767,22 +908,41 @@ export class CardSceneManager {
       // --- 3. PLAY AREA (PLAYING / SCORING) ---
       if (state.phase === 'PLAYING' || state.phase === 'SCORING') {
         const pCount = state.playArea.length;
-        const pStep = pCount > 1 ? Math.min(g.cardW + 16, (g.playArea.w - g.cardW - 40) / (pCount - 1)) : 0;
+        const pStep = pCount > 1 ? Math.min(g.cardW + 18, (g.playArea.w - g.cardW - 40) / (pCount - 1)) : 0;
         const pSpan = pStep * Math.max(0, pCount - 1);
         const pStartX = g.playArea.x + g.playArea.w * 0.5 - pSpan * 0.5;
         const pCenterY = g.playArea.y + g.playArea.h * 0.5;
+        const hasScoringFilter =
+          state.phase === 'SCORING' && scoringCardIds != null && scoringCardIds.size > 0;
 
         state.playArea.forEach((cid, idx) => {
           const card = cardById.get(cid);
           if (!card) return;
+          const isNonScoring = hasScoringFilter && !scoringCardIds!.has(cid);
           const m = ensureMoveable(card.id, pStartX + idx * pStep, pCenterY + 60, g.cardW, g.cardH);
+          m.syncFaceDown(card.faceDown, reducedMotion);
+
           m.tx = pStartX + idx * pStep;
-          m.ty = pCenterY;
+          m.ty = pCenterY + (isNonScoring ? 8 : hasScoringFilter ? -5 : 0);
           m.tw = g.cardW;
           m.th = g.cardH;
           m.tr = 0;
-          m.tScale = 1.04;
-          nextVisuals.push(makePlayingCardVisual(card, 'play', idx, m, 60 + idx, false, false, faceAtlas, deckBack));
+          m.tScale = isNonScoring ? 0.96 : hasScoringFilter ? 1.07 : 1.04;
+
+          nextVisuals.push(
+            makePlayingCardVisual(
+              card,
+              'play',
+              idx,
+              m,
+              60 + idx + (isNonScoring ? 0 : 6),
+              false,
+              false,
+              faceAtlas,
+              deckBack,
+              isNonScoring
+            )
+          );
         });
       }
 
@@ -806,19 +966,30 @@ export class CardSceneManager {
           if (!card) return;
           const isSelected = state.selectedCardIds.includes(cid);
           const normOff = hCount > 1 ? (idx - midIdx) / Math.max(1, midIdx) : 0;
-          const arcY = normOff * normOff * 12;
-          const arcRot = normOff * 0.06;
+          const arcY = normOff * normOff * 15;
+          const arcRot = normOff * 0.072;
 
-          // Newly drawn cards fly smoothly out of the Deck Pile!
+          // Newly drawn cards fly smoothly out of the Deck Pile and flip face-up!
           const spawnX = g.deckPile.x + g.deckPile.w * 0.5;
           const spawnY = g.deckPile.y + g.deckPile.h * 0.5;
-          const m = ensureMoveable(card.id, spawnX, spawnY, g.cardW, g.cardH);
+          const m = ensureMoveable(
+            card.id,
+            spawnX,
+            spawnY,
+            g.cardW,
+            g.cardH,
+            !card.faceDown,
+            0.03 * idx
+          );
+          m.syncFaceDown(card.faceDown, reducedMotion);
+
+          const idleBreath = reducedMotion ? 0 : Math.sin(nowSec * 1.4 + idx * 0.75) * 1.2;
           m.tx = hStartX + idx * hStep;
-          m.ty = hBaseY + arcY - (isSelected ? g.highlightLift : 0);
+          m.ty = hBaseY + arcY + idleBreath - (isSelected ? g.highlightLift : 0);
           m.tw = g.cardW;
           m.th = g.cardH;
           m.tr = arcRot;
-          m.tScale = isSelected ? 1.03 : 1.0;
+          m.tScale = isSelected ? 1.035 : 1.0;
 
           nextVisuals.push(
             makePlayingCardVisual(
@@ -830,7 +1001,8 @@ export class CardSceneManager {
               isSelected,
               state.phase === 'PLAYING' || state.phase === 'PACK_OPEN',
               faceAtlas,
-              deckBack
+              deckBack,
+              false
             )
           );
         });
@@ -878,19 +1050,23 @@ export class CardSceneManager {
         const sY = g.shopOfferTray.y + sCardH * 0.5 + 10;
 
         activeOffers.forEach((offer, idx) => {
-          const m = ensureMoveable(offer.id, sStartX + idx * sStep, sY + 24, sCardW, sCardH);
+          const shape =
+            offer.kind === 'joker'
+              ? getJokerShapeDimensions(offer.key, sCardW, sCardH)
+              : { tw: sCardW, th: sCardH, cardShape: undefined };
+          const m = ensureMoveable(offer.id, sStartX + idx * sStep, sY + 24, shape.tw, shape.th);
           m.tx = sStartX + idx * sStep;
-          m.ty = sY;
-          m.tw = sCardW;
-          m.th = sCardH;
-          m.tr = reducedMotion ? 0 : Math.sin(nowSec * 1.4 + idx) * 0.015;
+          m.ty = sY + (reducedMotion ? 0 : Math.sin(nowSec * 1.55 + idx * 1.1) * 2.0);
+          m.tw = shape.tw;
+          m.th = shape.th;
+          m.tr = reducedMotion ? 0 : Math.sin(nowSec * 1.4 + idx) * 0.018;
           m.tScale = 1;
 
-          const vis = makeOfferVisual(offer, 'shop_offer', idx, m, 70 + idx, faceAtlas);
+          const vis = makeOfferVisual(offer, 'shop_offer', idx, m, 70 + idx, faceAtlas, shape.cardShape);
           nextVisuals.push(vis);
         });
 
-        // Vouchers
+        // Vouchers (with shimmering voucher.fs overlay pass!)
         const activeVouchers = state.shop.vouchers.filter((v) => !v.redeemed);
         activeVouchers.forEach((vo, idx) => {
           const vDef = VOUCHER_MAP[vo.key];
@@ -901,10 +1077,10 @@ export class CardSceneManager {
           const vy = g.shopVoucherTray.y + sCardH * 0.5 + 10;
           const m = ensureMoveable(vo.id, vx, vy + 24, sCardW, sCardH);
           m.tx = vx;
-          m.ty = vy;
+          m.ty = vy + (reducedMotion ? 0 : Math.sin(nowSec * 1.7 + idx * 1.3) * 2.2);
           m.tw = sCardW;
           m.th = sCardH;
-          m.tr = reducedMotion ? 0 : Math.cos(nowSec * 1.3 + idx) * 0.018;
+          m.tr = reducedMotion ? 0 : Math.cos(nowSec * 1.3 + idx) * 0.022;
           m.tScale = 1;
           nextVisuals.push({
             id: vo.id,
@@ -916,6 +1092,7 @@ export class CardSceneManager {
             draggable: false,
             baseAtlas: 'Voucher',
             basePos: vDef?.pos ?? { x: 0, y: 0 },
+            overlayEffect: 'voucher',
             stickers: [],
             edition: 'none',
             debuffed: false,
@@ -925,7 +1102,7 @@ export class CardSceneManager {
           });
         });
 
-        // Boosters
+        // Boosters (with glossy booster.fs foil sheen overlay pass!)
         const activeBoosters = state.shop.boosters.filter((b) => !b.opened);
         const bStep = activeBoosters.length > 1 ? Math.min(sCardW + 34, (g.shopBoosterTray.w - sCardW - 36) / (activeBoosters.length - 1)) : 0;
         const bSpan = bStep * Math.max(0, activeBoosters.length - 1);
@@ -935,10 +1112,10 @@ export class CardSceneManager {
           const bDef = BOOSTER_MAP[bo.key];
           const m = ensureMoveable(bo.id, bStartX + idx * bStep, bY + 24, sCardW, sCardH);
           m.tx = bStartX + idx * bStep;
-          m.ty = bY;
+          m.ty = bY + (reducedMotion ? 0 : Math.sin(nowSec * 1.85 + idx * 1.6) * 2.4);
           m.tw = sCardW;
           m.th = sCardH;
-          m.tr = reducedMotion ? 0 : Math.sin(nowSec * 1.7 + idx * 1.5) * 0.022;
+          m.tr = reducedMotion ? 0 : Math.sin(nowSec * 1.7 + idx * 1.5) * 0.024;
           m.tScale = 1;
           nextVisuals.push({
             id: bo.id,
@@ -950,6 +1127,7 @@ export class CardSceneManager {
             draggable: false,
             baseAtlas: 'Booster',
             basePos: bDef?.pos ?? { x: 0, y: 0 },
+            overlayEffect: 'booster',
             stickers: [],
             edition: 'none',
             debuffed: false,
@@ -972,14 +1150,26 @@ export class CardSceneManager {
         const pY = g.packTray.y + 52 + pCardH * 0.52;
 
         avail.forEach((pc, idx) => {
-          const m = ensureMoveable(pc.id, pStartX + idx * pStep, pY - 30, pCardW, pCardH);
+          const shape =
+            pc.kind === 'joker'
+              ? getJokerShapeDimensions(pc.key, pCardW, pCardH)
+              : { tw: pCardW, th: pCardH, cardShape: undefined };
+          const m = ensureMoveable(
+            pc.id,
+            g.packTray.x + g.packTray.w * 0.5,
+            pY - 36,
+            shape.tw,
+            shape.th,
+            true,
+            idx * 0.06
+          );
           m.tx = pStartX + idx * pStep;
           m.ty = pY + (reducedMotion ? 0 : Math.sin(nowSec * 2 + idx) * 3);
-          m.tw = pCardW;
-          m.th = pCardH;
-          m.tr = (idx - (pCount - 1) * 0.5) * 0.035;
+          m.tw = shape.tw;
+          m.th = shape.th;
+          m.tr = (idx - (pCount - 1) * 0.5) * 0.038;
           m.tScale = 1;
-          const vis = makePackCardVisual(pc, idx, m, 95 + idx, faceAtlas);
+          const vis = makePackCardVisual(pc, idx, m, 95 + idx, faceAtlas, deckBack, shape.cardShape);
           nextVisuals.push(vis);
         });
       }
@@ -1001,6 +1191,7 @@ export class CardSceneManager {
     // Step every spring
     for (const vc of nextVisuals) {
       vc.moveable.step(dt, nowSec, reducedMotion, g.pixelScale);
+      vc.flipScaleX = vc.moveable.getFlipScaleX();
     }
 
     // Prune stale moveables
@@ -1023,8 +1214,10 @@ function makePlayingCardVisual(
   selected: boolean,
   draggable: boolean,
   faceAtlas: AtlasKey,
-  deckBack: AtlasPos
+  deckBack: AtlasPos,
+  nonScoring: boolean
 ): VisualCard {
+  const displayFaceDown = moveable.getDisplayFaceDown(card.faceDown);
   const isStone = card.enhancement === 'm_stone';
   return {
     id: card.id,
@@ -1035,16 +1228,18 @@ function makePlayingCardVisual(
     selected,
     draggable,
     baseAtlas: 'centers',
-    basePos: card.faceDown ? deckBack : (ENHANCEMENT_POS[card.enhancement] ?? { x: 1, y: 0 }),
-    faceAtlas: card.faceDown || isStone ? undefined : faceAtlas,
-    facePos: card.faceDown || isStone ? undefined : getCardFacePos(card.suit, card.rank),
-    sealPos: !card.faceDown && card.seal !== 'none' ? SEAL_POS[card.seal] : undefined,
+    basePos: displayFaceDown ? deckBack : (ENHANCEMENT_POS[card.enhancement] ?? { x: 1, y: 0 }),
+    faceAtlas: displayFaceDown || isStone ? undefined : faceAtlas,
+    facePos: displayFaceDown || isStone ? undefined : getCardFacePos(card.suit, card.rank),
+    sealPos: !displayFaceDown && card.seal !== 'none' ? SEAL_POS[card.seal] : undefined,
     stickers: [],
-    edition: card.faceDown ? 'none' : card.edition,
+    edition: displayFaceDown ? 'none' : card.edition,
     enhancement: card.enhancement,
     seal: card.seal,
     debuffed: card.debuffed,
-    faceDown: card.faceDown,
+    faceDown: displayFaceDown,
+    nonScoring,
+    flipScaleX: moveable.getFlipScaleX(),
     cardData: card,
   };
 }
@@ -1055,7 +1250,8 @@ function makeOfferVisual(
   index: number,
   moveable: Moveable,
   zIndex: number,
-  faceAtlas: AtlasKey
+  faceAtlas: AtlasKey,
+  cardShape?: CardShapeKind
 ): VisualCard {
   const stickers: AtlasPos[] = [];
   if (offer.eternal) stickers.push({ x: 0, y: 0 });
@@ -1074,6 +1270,8 @@ function makeOfferVisual(
       draggable: false,
       baseAtlas: 'Joker',
       basePos: def?.pos ?? { x: 0, y: 0 },
+      ...getJokerSoulFields(offer.key, false),
+      cardShape,
       stickers,
       edition: offer.edition,
       debuffed: false,
@@ -1119,6 +1317,7 @@ function makeOfferVisual(
     draggable: false,
     baseAtlas: 'Tarot',
     basePos: cDef?.pos ?? { x: 0, y: 0 },
+    ...getConsumableSpecialFields(offer.key),
     stickers,
     edition: offer.edition,
     debuffed: false,
@@ -1133,8 +1332,31 @@ function makePackCardVisual(
   index: number,
   moveable: Moveable,
   zIndex: number,
-  faceAtlas: AtlasKey
+  faceAtlas: AtlasKey,
+  deckBack: AtlasPos,
+  cardShape?: CardShapeKind
 ): VisualCard {
+  const displayFaceDown = moveable.getDisplayFaceDown(false);
+  if (displayFaceDown) {
+    return {
+      id: pc.id,
+      kind: 'pack_card',
+      index,
+      moveable,
+      zIndex,
+      selected: false,
+      draggable: false,
+      baseAtlas: 'centers',
+      basePos: deckBack,
+      stickers: [],
+      edition: 'none',
+      debuffed: false,
+      faceDown: true,
+      flipScaleX: moveable.getFlipScaleX(),
+      packCardData: pc,
+    };
+  }
+
   const stickers: AtlasPos[] = [];
   if (pc.eternal) stickers.push({ x: 0, y: 0 });
   if (pc.perishable) stickers.push({ x: 0, y: 2 });
@@ -1152,6 +1374,9 @@ function makePackCardVisual(
       draggable: false,
       baseAtlas: 'Joker',
       basePos: def?.pos ?? { x: 0, y: 0 },
+      ...getJokerSoulFields(pc.key, false),
+      cardShape,
+      flipScaleX: moveable.getFlipScaleX(),
       stickers,
       edition: pc.edition,
       debuffed: false,
@@ -1175,6 +1400,7 @@ function makePackCardVisual(
       faceAtlas: isStone ? undefined : faceAtlas,
       facePos: isStone ? undefined : getCardFacePos(pc.suit ?? 'Hearts', pc.rank ?? 'Ace'),
       sealPos: pc.seal && pc.seal !== 'none' ? SEAL_POS[pc.seal] : undefined,
+      flipScaleX: moveable.getFlipScaleX(),
       stickers,
       edition: pc.edition,
       enhancement: enh,
@@ -1195,6 +1421,8 @@ function makePackCardVisual(
     draggable: false,
     baseAtlas: 'Tarot',
     basePos: cDef?.pos ?? { x: 0, y: 0 },
+    ...getConsumableSpecialFields(pc.key),
+    flipScaleX: moveable.getFlipScaleX(),
     stickers,
     edition: pc.edition,
     debuffed: false,
