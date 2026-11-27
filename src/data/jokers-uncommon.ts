@@ -330,7 +330,12 @@ export const UNCOMMON_JOKERS: JokerDef[] = [
     eternalCompat: true,
     config: { extra: 1 },
     descTemplate: 'Retrigger all played cards in final hand of round',
-    formatDesc: () => 'Retrigger all played cards in final hand of round',
+    formatDesc: (_inst, state) => {
+      const active =
+        (state.phase === 'PLAYING' && state.handsLeft === 1) ||
+        (state.phase === 'SCORING' && state.handsLeft === 0);
+      return `Retrigger all played cards in final hand of round${active ? ' (Final hand active!)' : ''}`;
+    },
   },
   {
     key: 'j_fibonacci',
@@ -670,7 +675,15 @@ export const UNCOMMON_JOKERS: JokerDef[] = [
     eternalCompat: false,
     config: {},
     descTemplate: 'Sell this card to disable the current Boss Blind',
-    formatDesc: () => 'Sell this card to disable the current Boss Blind',
+    formatDesc: (_inst, state) => {
+      const blind = state.blinds[state.activeBlindSlot];
+      const bossActive =
+        blind &&
+        blind.slot === 'Boss' &&
+        !blind.disabled &&
+        (state.phase === 'PLAYING' || state.phase === 'SCORING' || blind.status === 'Current');
+      return `Sell this card to disable the current Boss Blind${bossActive ? ' (Boss Active — sell to disable!)' : ''}`;
+    },
   },
   {
     key: 'j_gift',
@@ -948,9 +961,12 @@ export const UNCOMMON_JOKERS: JokerDef[] = [
     eternalCompat: true,
     config: { extra: 3 },
     descTemplate: 'X3 Mult on final hand of round',
-    formatDesc: (inst) => {
+    formatDesc: (inst, state) => {
       const xMult = getStateNum(inst.state, ['extra'], 3);
-      return `X${formatNum(xMult)} Mult on final hand of round`;
+      const active =
+        (state.phase === 'PLAYING' && state.handsLeft === 1) ||
+        (state.phase === 'SCORING' && state.handsLeft === 0);
+      return `X${formatNum(xMult)} Mult on final hand of round${active ? ' (Final hand active!)' : ''}`;
     },
   },
   {

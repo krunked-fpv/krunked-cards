@@ -856,9 +856,9 @@ export const COMMON_JOKERS: JokerDef[] = [
     perishableCompat: true,
     eternalCompat: true,
     config: { extra: 1 },
-    descTemplate: '+1 Mult per Tarot card used this run (Currently +0)',
+    descTemplate: '+1 Mult per Tarot card used this run (Currently +0 Mult)',
     formatDesc: (_inst, state) =>
-      `+1 Mult per Tarot card used this run (Currently +${state.tracking.tarotsUsedTotal})`,
+      `+1 Mult per Tarot card used this run (Currently +${state.tracking.tarotsUsedTotal} Mult)`,
   },
   {
     key: 'j_juggler',
