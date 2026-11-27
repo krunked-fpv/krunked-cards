@@ -1,21 +1,27 @@
 // ============================================================================
-// Krunked Cards — Chunky Pixel-Arcade HUD, Phase Arenas, Rich Tooltips & CRT
-// Crisp zero-overlap layout validated for 1280x720 and 1920x1080 viewports.
+// Krunked Cards — Chunky Pixel-Arcade HUD, 3-Mode Responsive Arenas,
+// Rich Tactical Tooltips, Deck Matrix, Run History & Unified CRT Overlay.
 // ============================================================================
 
 import {
   ATLAS_SPECS,
   PALETTE,
   POKER_HAND_IDS,
+  RANKS,
+  SUITS,
   type ArtPackMode,
   type AtlasKey,
   type BlindSlot,
+  type BossWarningInfo,
   type ConsumableDef,
   type GameSpeed,
   type KeybindConfig,
+  type LayoutMode,
   type PokerHandId,
   type ProfileProgress,
+  type Rank,
   type RenderSettings,
+  type RunHistoryEntry,
   type SimAction,
   type SimState,
   type StakeLevel,
@@ -27,6 +33,7 @@ import {
   BLINDS,
   BOOSTER_MAP,
   BOOSTERS,
+  CHALLENGE_MAP,
   CHALLENGES,
   CONSUMABLE_MAP,
   DECK_MAP,
@@ -50,8 +57,12 @@ import {
 } from '../data/index.ts';
 import {
   getActiveBlind,
+  getBossHandWarning,
+  getConsumablePreview,
+  getDeckBreakdown,
   getEffectiveConsumableSlots,
   getEffectiveJokerSlots,
+  getJokerLiveMeta,
   previewSelectedHand,
 } from '../sim/index.ts';
 import { ensureBuiltinPixelFont } from '../assets/BitmapFont.ts';
@@ -78,6 +89,9 @@ export interface UiCallbacks {
   onPlayButtonSfx(): void;
   hasSavedRun(): boolean;
   getProfile(): ProfileProgress;
+  getRunHistory(): RunHistoryEntry[];
+  onCycleGameSpeed(): GameSpeed;
+  onReplaySeed(deckId: string, stake: StakeLevel, seed: string, challengeId?: string | null): void;
 }
 
 const RARITY_NAMES: Record<number, string> = {
@@ -93,6 +107,38 @@ const UI_SUIT_COLS: Record<Suit, number> = {
   Clubs: 2,
   Spades: 3,
 };
+
+const MATRIX_RANKS: readonly Rank[] = [...RANKS].reverse();
+
+function shortRankLabel(r: Rank): string {
+  if (r === '10') return '10';
+  return r[0]!;
+}
+
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  if (!text) return false;
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fall back to execCommand below
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
 
 function esc(s: string): string {
   return s
@@ -232,7 +278,11 @@ export class UiOverlay {
     | 'boosters'
     | 'blinds'
     | 'tags'
-    | 'decks' = 'jokers';
+    | 'decks'
+    | 'history' = 'jokers';
+  private collectionSearch = '';
+  private collectionFilter: 'all' | 'discovered' | 'undiscovered' = 'all';
+  private collectionRarity: 0 | 1 | 2 | 3 | 4 = 0;
   private newRunTab: 'standard' | 'challenges' = 'standard';
   private newRunDeckId = 'b_red';
   private newRunStake: StakeLevel = 1;
@@ -244,6 +294,10 @@ export class UiOverlay {
   private toastMessage: string | null = null;
   private toastUntil = 0;
 
+  // Boss Intro Banner & Fast-Forward Indicator
+  private bossBannerUntil = 0;
+  private bossBannerActive = false;
+
   // Persistent DOM layers
   private railLayer: HTMLDivElement;
   private tableLayer: HTMLDivElement;
@@ -251,6 +305,8 @@ export class UiOverlay {
   private modalLayer: HTMLDivElement;
   private tooltipEl: HTMLDivElement;
   private toastEl: HTMLDivElement;
+  private bossBannerEl: HTMLDivElement;
+  private ffBadgeEl: HTMLDivElement;
   private crtEl: HTMLDivElement | null = null;
   private folderInput: HTMLInputElement;
   private archiveInput: HTMLInputElement;
@@ -261,9 +317,16 @@ export class UiOverlay {
   private lastModalKey = '';
   private lastCrtAmount = -1;
   private lastHighContrast = false;
+  private lastViewportW = 1280;
+  private lastViewportH = 720;
+  private lastMode: LayoutMode = 'desktop';
+  private lastPhaseForInspect: SimState['phase'] | null = null;
   private lastHoveredCard: VisualCard | null = null;
   private lastHoverX = 0;
   private lastHoverY = 0;
+  private inspectedCard: VisualCard | null = null;
+  private inspectX = 0;
+  private inspectY = 0;
   private hoveredTagKey: string | null = null;
   private lastAnimTick = -1;
 
@@ -306,6 +369,14 @@ export class UiOverlay {
     this.toastEl = document.createElement('div');
     this.toastEl.className = 'kc-toast hidden';
 
+    this.bossBannerEl = document.createElement('div');
+    this.bossBannerEl.className = 'kc-boss-banner hidden';
+    this.bossBannerEl.setAttribute('aria-live', 'polite');
+
+    this.ffBadgeEl = document.createElement('div');
+    this.ffBadgeEl.className = 'kc-ff-badge hidden';
+    this.ffBadgeEl.textContent = '>> 2.6x';
+
     // Unified Full-Screen CRT Post Overlay covering both WebGL2 canvas & HUD
     this.crtEl = document.getElementById('crt-overlay') as HTMLDivElement | null;
     if (!this.crtEl) {
@@ -343,6 +414,8 @@ export class UiOverlay {
       this.railLayer,
       this.tableLayer,
       this.popupLayer,
+      this.bossBannerEl,
+      this.ffBadgeEl,
       this.modalLayer,
       this.tooltipEl,
       this.toastEl,
@@ -380,6 +453,7 @@ export class UiOverlay {
 
   toggleRunInfo(): void {
     this.activeModal = this.activeModal === 'RUN_INFO' ? null : 'RUN_INFO';
+    if (this.activeModal) this.dismissInspect();
     this.invalidateModal();
   }
 
@@ -389,6 +463,7 @@ export class UiOverlay {
       this.rebindingField = null;
     } else if (phase !== 'TITLE') {
       this.activeModal = 'PAUSE';
+      this.dismissInspect();
     }
     this.invalidateModal();
   }
@@ -396,17 +471,66 @@ export class UiOverlay {
   openModal(modal: ActiveModal): void {
     this.activeModal = modal;
     this.rebindingField = null;
+    if (modal !== null) this.dismissInspect();
     this.invalidateModal();
   }
 
+  getSelectedOwnedId(): string | null {
+    return this.selectedOwnedId;
+  }
+
   setSelectedOwned(id: string | null): void {
-    this.selectedOwnedId = this.selectedOwnedId === id ? null : id;
+    const next = id === null ? null : this.selectedOwnedId === id ? null : id;
+    if (next === this.selectedOwnedId) return;
+    this.selectedOwnedId = next;
     this.lastTableKey = '';
   }
 
   showToast(msg: string, durationMs = 2400): void {
     this.toastMessage = msg;
     this.toastUntil = performance.now() + durationMs;
+  }
+
+  showBossBanner(name: string, desc: string, bossColor: string): void {
+    const safeColor = bossColor || '#a84024';
+    this.bossBannerEl.style.setProperty('--boss-col', safeColor);
+    this.bossBannerEl.innerHTML = `
+      <div class="kc-boss-banner-tag">BOSS BLIND</div>
+      <div class="kc-boss-banner-name">${esc(name)}</div>
+      <div class="kc-boss-banner-desc">${esc(desc)}</div>
+    `;
+    this.bossBannerEl.classList.remove('hidden');
+    // Restart entry animation cleanly
+    this.bossBannerEl.classList.remove('animate-in');
+    void this.bossBannerEl.offsetWidth;
+    this.bossBannerEl.classList.add('animate-in');
+    this.bossBannerUntil = performance.now() + 2600;
+    this.bossBannerActive = true;
+  }
+
+  dismissBossBanner(): void {
+    this.bossBannerUntil = 0;
+    this.bossBannerActive = false;
+    this.bossBannerEl.classList.add('hidden');
+    this.bossBannerEl.classList.remove('animate-in');
+  }
+
+  inspectCard(card: VisualCard, x: number, y: number, state: SimState): void {
+    if (this.activeModal || card.kind === 'title_showcase' || card.kind === 'deck_pile') {
+      return;
+    }
+    this.inspectedCard = card;
+    this.inspectX = x;
+    this.inspectY = y;
+    this.hoveredTagKey = null;
+    this.renderTooltip(card, x, y, state, true);
+  }
+
+  dismissInspect(): void {
+    this.inspectedCard = null;
+    if (!this.lastHoveredCard && !this.hoveredTagKey) {
+      this.tooltipEl.classList.add('hidden');
+    }
   }
 
   invalidateAll(): void {
@@ -426,7 +550,9 @@ export class UiOverlay {
     this.lastHoverY = y;
     if (card) {
       this.hoveredTagKey = null;
-      this.renderTooltip(card, x, y, state);
+      this.renderTooltip(card, x, y, state, false);
+    } else if (this.inspectedCard) {
+      this.renderTooltip(this.inspectedCard, this.inspectX, this.inspectY, state, true);
     } else if (!this.hoveredTagKey) {
       this.tooltipEl.classList.add('hidden');
     }
@@ -493,10 +619,21 @@ export class UiOverlay {
     nowSec: number
   ): void {
     this.lastHighContrast = settings.highContrastSuits;
+    this.lastViewportW = geom.viewportW;
+    this.lastViewportH = geom.viewportH;
+    this.lastMode = geom.mode;
     this.root.classList.toggle('kc-reduced-motion', settings.reducedMotion);
+    this.root.classList.toggle('kc-mode-desktop', geom.mode === 'desktop');
+    this.root.classList.toggle('kc-mode-mobile-landscape', geom.mode === 'mobile-landscape');
+    this.root.classList.toggle('kc-mode-mobile-portrait', geom.mode === 'mobile-portrait');
     this.syncCrtOverlay(settings.crtAmount);
 
-    // 1. Toast visibility
+    if (this.lastPhaseForInspect !== null && this.lastPhaseForInspect !== state.phase) {
+      this.dismissInspect();
+    }
+    this.lastPhaseForInspect = state.phase;
+
+    // 1. Toast, Boss Intro Banner & Fast-Forward Badge visibility
     const nowMs = performance.now();
     if (this.toastMessage && nowMs < this.toastUntil) {
       if (this.toastEl.textContent !== this.toastMessage) {
@@ -507,7 +644,20 @@ export class UiOverlay {
       this.toastEl.classList.add('hidden');
     }
 
-    // 2. Left Console Rail
+    if (this.bossBannerActive && nowMs >= this.bossBannerUntil) {
+      this.dismissBossBanner();
+    }
+
+    const showFf = state.phase === 'SCORING' && Boolean(choreo.fastForward);
+    this.ffBadgeEl.classList.toggle('hidden', !showFf);
+    if (showFf) {
+      const ffx = Math.round(geom.playArea.x + geom.playArea.w - 10);
+      const ffy = Math.round(Math.max(geom.playArea.y + 6, geom.jokerTray.y + geom.jokerTray.h + 18));
+      this.ffBadgeEl.style.left = `${ffx}px`;
+      this.ffBadgeEl.style.top = `${ffy}px`;
+    }
+
+    // 2. HUD (Desktop Rail / Compact Landscape Rail / Portrait Top HUD Dock)
     const preview = state.phase === 'PLAYING' ? previewSelectedHand(state) : null;
     const hideStaleHandMath =
       state.phase === 'SHOP' ||
@@ -550,8 +700,11 @@ export class UiOverlay {
     const activeBlind = getActiveBlind(state);
     const railKey = [
       state.phase,
-      geom.leftRail.w,
-      geom.leftRail.h,
+      geom.mode,
+      geom.hudDock.x,
+      geom.hudDock.y,
+      geom.hudDock.w,
+      geom.hudDock.h,
       activeBlind?.key,
       activeBlind?.disabled,
       state.roundChips,
@@ -565,6 +718,7 @@ export class UiOverlay {
       state.dollars,
       state.ante,
       state.round,
+      settings.gameSpeed,
       state.tags.join(','),
       choreo.flameIntensity > 0.1 ? 'FLAME' : 'NOFLAME',
       this.packManager.getMode(),
@@ -572,15 +726,29 @@ export class UiOverlay {
 
     if (railKey !== this.lastRailKey) {
       this.lastRailKey = railKey;
-      this.renderLeftRail(
-        state,
-        geom,
-        shownHandName,
-        shownLevel,
-        shownChips,
-        shownMult,
-        choreo.flameIntensity > 0.1
-      );
+      if (geom.mode === 'mobile-portrait') {
+        this.renderPortraitHud(
+          state,
+          geom,
+          shownHandName,
+          shownLevel,
+          shownChips,
+          shownMult,
+          choreo.flameIntensity > 0.1,
+          settings.gameSpeed
+        );
+      } else {
+        this.renderLeftRail(
+          state,
+          geom,
+          shownHandName,
+          shownLevel,
+          shownChips,
+          shownMult,
+          choreo.flameIntensity > 0.1,
+          settings.gameSpeed
+        );
+      }
     } else if (state.phase !== 'TITLE') {
       const cb = this.railLayer.querySelector('#kc-chips-box') as HTMLElement | null;
       const mb = this.railLayer.querySelector('#kc-mult-box') as HTMLElement | null;
@@ -595,10 +763,20 @@ export class UiOverlay {
     }
 
     // 3. Table Overlays (Title Screen / Blind Select / Shop / Cashout / Pack / Playing Controls / Trays)
+    const bossWarning = state.phase === 'PLAYING' ? getBossHandWarning(state) : null;
     const tableKey = [
       state.phase,
+      geom.mode,
       geom.viewportW,
       geom.viewportH,
+      geom.actionBar.x,
+      geom.actionBar.y,
+      geom.actionBar.w,
+      geom.actionBar.h,
+      geom.shopControls.x,
+      geom.shopControls.y,
+      geom.shopControls.w,
+      geom.shopControls.h,
       state.ante,
       state.sortMode,
       state.jokers.map((j) => j.id).join(','),
@@ -616,6 +794,7 @@ export class UiOverlay {
       state.blinds.Big.status,
       state.blinds.Boss.status,
       state.blinds.Boss.key,
+      state.blinds.Boss.disabled ? '1' : '0',
       state.bossRerolledThisAnte,
       state.vouchers.join(','),
       state.shop ? JSON.stringify(state.shop) : '',
@@ -623,6 +802,7 @@ export class UiOverlay {
         ? `${state.pack.boosterKey}:${state.pack.chooseRemaining}:${state.pack.cards.map((c) => (c.taken ? '1' : '0')).join('')}`
         : '',
       state.cashout ? `${state.cashout.total}:${state.cashout.rows.length}` : '',
+      bossWarning ? `${bossWarning.severity}:${bossWarning.message}` : '',
       this.selectedOwnedId ?? '',
       this.packManager.getMode(),
       this.packManager.hasCustomPackAvailable() ? '1' : '0',
@@ -632,7 +812,7 @@ export class UiOverlay {
 
     if (tableKey !== this.lastTableKey) {
       this.lastTableKey = tableKey;
-      this.renderTableLayer(state, geom, cards, settings);
+      this.renderTableLayer(state, geom, cards, settings, bossWarning);
     }
 
     // 4. Floating score popups (updated every frame while active)
@@ -641,8 +821,11 @@ export class UiOverlay {
     // 5. Active Modal
     const modalKey = [
       this.activeModal ?? 'NONE',
+      geom.mode,
       this.runInfoTab,
       this.collectionTab,
+      this.collectionFilter,
+      this.collectionRarity,
       this.newRunTab,
       this.newRunDeckId,
       this.newRunStake,
@@ -655,6 +838,9 @@ export class UiOverlay {
       this.packManager.getStatusMessage(),
       state.vouchers.length,
       state.fullDeck.length,
+      state.drawPile.length,
+      state.selectedCardIds.join(','),
+      this.cb.getRunHistory().length,
     ].join('|');
 
     if (modalKey !== this.lastModalKey) {
@@ -669,9 +855,18 @@ export class UiOverlay {
       this.stepAnimatedCanvases(animTick);
     }
 
-    // Refresh tooltip if hovered
+    // 7. Refresh hovered or touch-inspected tooltip (auto-dismiss if inspected card vanished)
     if (this.lastHoveredCard) {
-      this.renderTooltip(this.lastHoveredCard, this.lastHoverX, this.lastHoverY, state);
+      const freshHover = cards.find((c) => c.id === this.lastHoveredCard!.id) ?? this.lastHoveredCard;
+      this.renderTooltip(freshHover, this.lastHoverX, this.lastHoverY, state, false);
+    } else if (this.inspectedCard) {
+      const freshInspect = cards.find((c) => c.id === this.inspectedCard!.id) ?? null;
+      if (freshInspect) {
+        this.inspectedCard = freshInspect;
+        this.renderTooltip(freshInspect, this.inspectX, this.inspectY, state, true);
+      } else {
+        this.dismissInspect();
+      }
     }
   }
 
@@ -761,21 +956,33 @@ export class UiOverlay {
   private bindTagHoverTooltip(el: HTMLElement, tagKey: string): void {
     const td = TAG_MAP[tagKey];
     if (!td) return;
-    el.addEventListener('mouseenter', () => {
+    const show = () => {
       this.hoveredTagKey = tagKey;
       const rect = el.getBoundingClientRect();
       this.showStaticTooltip(
         td.name,
         td.desc,
         [{ label: 'Skip Tag', color: PALETTE.ORANGE }],
-        rect.right + 12,
+        rect.left + rect.width * 0.5,
         rect.top + rect.height * 0.5
       );
+    };
+    el.addEventListener('mouseenter', show);
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (this.hoveredTagKey === tagKey && !this.tooltipEl.classList.contains('hidden')) {
+        this.hoveredTagKey = null;
+        if (!this.lastHoveredCard && !this.inspectedCard) {
+          this.tooltipEl.classList.add('hidden');
+        }
+      } else {
+        show();
+      }
     });
     el.addEventListener('mouseleave', () => {
       if (this.hoveredTagKey === tagKey) {
         this.hoveredTagKey = null;
-        if (!this.lastHoveredCard) {
+        if (!this.lastHoveredCard && !this.inspectedCard) {
           this.tooltipEl.classList.add('hidden');
         }
       }
@@ -806,17 +1013,19 @@ export class UiOverlay {
     this.tooltipEl.classList.remove('hidden');
     const tw = this.tooltipEl.offsetWidth || 248;
     const th = this.tooltipEl.offsetHeight || 110;
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    let tx = anchorX;
-    if (tx + tw + 12 > vw) tx = Math.max(12, anchorX - tw - 54);
-    const ty = Math.max(12, Math.min(vh - th - 12, anchorY - th * 0.5));
+    const vw = this.lastViewportW || window.innerWidth;
+    const vh = this.lastViewportH || window.innerHeight;
+    let tx = anchorX + 24;
+    if (tx + tw + 8 > vw) tx = anchorX - tw * 0.5;
+    let ty = anchorY > vh * 0.52 ? anchorY - th - 22 : anchorY + 24;
+    tx = Math.max(8, Math.min(vw - tw - 8, tx));
+    ty = Math.max(8, Math.min(vh - th - 8, ty));
     this.tooltipEl.style.left = `${Math.round(tx)}px`;
     this.tooltipEl.style.top = `${Math.round(ty)}px`;
   }
 
   // =========================================================================
-  // Left Console Rail
+  // Left Console Rail (Desktop & Mobile Landscape) + Top Portrait HUD Dock
   // =========================================================================
 
   private renderLeftRail(
@@ -826,14 +1035,16 @@ export class UiOverlay {
     handLevel: number,
     chips: number,
     mult: number,
-    flaming: boolean
+    flaming: boolean,
+    gameSpeed: GameSpeed
   ): void {
     if (state.phase === 'TITLE') {
       this.railLayer.innerHTML = '';
       return;
     }
 
-    const r = geom.leftRail;
+    const r = geom.hudDock;
+    const isLandscape = geom.mode === 'mobile-landscape';
     const activeBlind = getActiveBlind(state);
     const blindDef = activeBlind ? BLIND_MAP[activeBlind.key] : undefined;
     const headerColor =
@@ -847,10 +1058,21 @@ export class UiOverlay {
         ? PALETTE.HAND_LEVELS[(handLevel - 1) % PALETTE.HAND_LEVELS.length]!
         : PALETTE.WHITE;
 
-    const compact = r.h < 680;
+    const compact = !isLandscape && (r.h < 680 || geom.compact);
     const isShop = state.phase === 'SHOP';
+    const progressPct =
+      state.targetChips > 0
+        ? Math.min(100, Math.max(0, Math.round((state.roundChips / state.targetChips) * 100)))
+        : 0;
+    const targetMet = state.targetChips > 0 && state.roundChips >= state.targetChips;
+
+    const chipSize = isLandscape ? 32 : 58;
+    const scoreChipSize = isLandscape ? 14 : 22;
+    const roundChipSize = isLandscape ? 15 : 24;
+    const tagSize = isLandscape ? 20 : 34;
 
     // Top Stage: Animated Neon SHOP Sign during Shop phase; Blind Banner otherwise
+    const showBlindDesc = !isLandscape || Boolean(blindDef?.desc);
     const topStageHtml = isShop
       ? `
         <div class="kc-rail-shop-marquee">
@@ -862,34 +1084,36 @@ export class UiOverlay {
         <div class="kc-blind-header" style="--blind-col:${headerColor};">
           <div class="kc-blind-title-bar">${esc(activeBlind?.name ?? 'Small Blind')}</div>
           <div class="kc-blind-body">
-            <canvas class="kc-blind-chip-canvas" width="58" height="58" data-blind-row="${blindDef?.pos.y ?? 0}"></canvas>
+            <canvas class="kc-blind-chip-canvas" width="${chipSize}" height="${chipSize}" data-blind-row="${blindDef?.pos.y ?? 0}"></canvas>
             <div class="kc-blind-meta">
-              <div class="kc-muted-sm">Score at least</div>
+              ${isLandscape ? '' : '<div class="kc-muted-sm">Score at least</div>'}
               <div class="kc-target-score">
-                <canvas class="kc-score-chip-canvas" width="22" height="22"></canvas>
+                <canvas class="kc-score-chip-canvas" width="${scoreChipSize}" height="${scoreChipSize}"></canvas>
                 <span>${fmtNum(state.targetChips)}</span>
               </div>
-              <div class="kc-blind-reward">Reward: <span class="kc-gold">${'$'.repeat(Math.max(1, Math.min(8, activeBlind?.dollars ?? 3)))}</span></div>
+              <div class="kc-blind-reward">${isLandscape ? '' : 'Reward: '}<span class="kc-gold">${'$'.repeat(Math.max(1, Math.min(8, activeBlind?.dollars ?? 3)))}</span></div>
             </div>
           </div>
-          <div class="kc-blind-desc">
-            ${
-              blindDef?.desc
-                ? esc(activeBlind?.disabled ? '(Boss Disabled) ' + blindDef.desc : blindDef.desc)
-                : `Ante ${state.ante} • ${activeBlind?.slot ?? 'Small'} Blind`
-            }
-          </div>
+          ${
+            showBlindDesc
+              ? `<div class="kc-blind-desc">${
+                  blindDef?.desc
+                    ? esc(activeBlind?.disabled ? '(Boss Disabled) ' + blindDef.desc : blindDef.desc)
+                    : `Ante ${state.ante} • ${activeBlind?.slot ?? 'Small'} Blind`
+                }</div>`
+              : ''
+          }
         </div>
       `;
 
-    // Skip Tags Strip: crisp 34x34 pixel sprites from `tags` atlas with rich hover tooltips!
+    // Skip Tags Strip: crisp pixel sprites from `tags` atlas with hover + tap tooltips!
     const tagsHtml =
       state.tags.length > 0
         ? `<div class="kc-rail-tags">${state.tags
-            .slice(-7)
+            .slice(-(isLandscape ? 6 : 7))
             .map((tk) => {
               const td = TAG_MAP[tk];
-              return `<button type="button" class="kc-rail-tag-btn interactive" data-rail-tag="${esc(tk)}" aria-label="${esc(td?.name ?? tk)}"><canvas class="kc-rail-tag-canvas" width="34" height="34" data-tag-x="${td?.pos.x ?? 0}" data-tag-y="${td?.pos.y ?? 0}"></canvas></button>`;
+              return `<button type="button" class="kc-rail-tag-btn interactive" data-rail-tag="${esc(tk)}" aria-label="${esc(td?.name ?? tk)}"><canvas class="kc-rail-tag-canvas" width="${tagSize}" height="${tagSize}" data-tag-x="${td?.pos.x ?? 0}" data-tag-y="${td?.pos.y ?? 0}"></canvas></button>`;
             })
             .join('')}</div>`
         : '';
@@ -900,14 +1124,19 @@ export class UiOverlay {
       : `<span class="kc-hand-placeholder">${esc(displayHandLabel)}</span>`;
 
     this.railLayer.innerHTML = `
-      <aside class="kc-rail ${compact ? 'compact' : ''} ${flaming ? 'rail-flaming' : ''}" style="left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px;">
+      <aside class="kc-rail ${isLandscape ? 'landscape' : compact ? 'compact' : ''} ${flaming ? 'rail-flaming' : ''}" style="left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px;">
         ${topStageHtml}
 
         <div class="kc-inset-box kc-round-score-box">
-          <span class="kc-round-lbl">Round<br/>score</span>
-          <div class="kc-round-score-val">
-            <canvas class="kc-score-chip-canvas" width="24" height="24"></canvas>
-            <span>${fmtNum(state.roundChips)}</span>
+          <div class="kc-round-score-top">
+            <span class="kc-round-lbl">${isLandscape ? 'Score' : 'Round<br/>score'}</span>
+            <div class="kc-round-score-val">
+              <canvas class="kc-score-chip-canvas" width="${roundChipSize}" height="${roundChipSize}"></canvas>
+              <span>${fmtNum(state.roundChips)}</span>
+            </div>
+          </div>
+          <div class="kc-round-progress-track" aria-label="Round progress ${progressPct}%">
+            <div class="kc-round-progress-fill ${targetMet ? 'met' : ''}" style="width:${progressPct}%;"></div>
           </div>
         </div>
 
@@ -929,28 +1158,29 @@ export class UiOverlay {
 
         <div class="kc-rail-mid-grid">
           <div class="kc-rail-buttons">
-            <button class="kc-btn kc-btn-red interactive" data-ui="run-info">Run Info</button>
-            <button class="kc-btn kc-btn-amber interactive" data-ui="options">Options</button>
+            <button class="kc-btn kc-btn-red interactive" data-ui="run-info">${isLandscape ? 'Info' : 'Run Info'}</button>
+            <button class="kc-btn kc-btn-amber interactive" data-ui="options">${isLandscape ? 'Opt' : 'Options'}</button>
+            <button class="kc-btn kc-btn-teal kc-speed-btn interactive" data-ui="cycle-speed" title="Cycle Game Speed">${isLandscape ? `${gameSpeed}x` : `Speed ${gameSpeed}x`}</button>
           </div>
           <div class="kc-rail-stats">
             <div class="kc-stat-pair">
               <div class="kc-stat-card">
-                <div class="kc-stat-lbl">Hands</div>
+                <div class="kc-stat-lbl">${isLandscape ? 'H' : 'Hands'}</div>
                 <div class="kc-stat-val kc-blue">${state.handsLeft}</div>
               </div>
               <div class="kc-stat-card">
-                <div class="kc-stat-lbl">Discards</div>
+                <div class="kc-stat-lbl">${isLandscape ? 'D' : 'Discards'}</div>
                 <div class="kc-stat-val kc-red">${state.discardsLeft}</div>
               </div>
             </div>
             <div class="kc-money-bar">$${state.dollars}</div>
             <div class="kc-stat-pair">
               <div class="kc-stat-card">
-                <div class="kc-stat-lbl">Ante</div>
+                <div class="kc-stat-lbl">${isLandscape ? 'Ante' : 'Ante'}</div>
                 <div class="kc-stat-val kc-amber">${state.ante}<span class="kc-ante-max">/${state.winAnte}</span></div>
               </div>
               <div class="kc-stat-card">
-                <div class="kc-stat-lbl">Round</div>
+                <div class="kc-stat-lbl">${isLandscape ? 'Rnd' : 'Round'}</div>
                 <div class="kc-stat-val kc-amber">${state.round}</div>
               </div>
             </div>
@@ -960,9 +1190,123 @@ export class UiOverlay {
       </aside>
     `;
 
+    this.bindHudEvents(blindDef?.pos.y ?? 0);
+  }
+
+  private renderPortraitHud(
+    state: SimState,
+    geom: TableGeometry,
+    handName: string,
+    handLevel: number,
+    chips: number,
+    mult: number,
+    flaming: boolean,
+    gameSpeed: GameSpeed
+  ): void {
+    if (state.phase === 'TITLE') {
+      this.railLayer.innerHTML = '';
+      return;
+    }
+
+    const d = geom.hudDock;
+    const activeBlind = getActiveBlind(state);
+    const blindDef = activeBlind ? BLIND_MAP[activeBlind.key] : undefined;
+    const isShop = state.phase === 'SHOP';
+    const headerColor = isShop
+      ? '#fe5f55'
+      : activeBlind?.slot === 'Small'
+        ? '#2e659e'
+        : activeBlind?.slot === 'Big'
+          ? '#c77f1e'
+          : activeBlind?.bossColor || '#7d3a5c';
+    const levelColor =
+      handLevel > 0
+        ? PALETTE.HAND_LEVELS[(handLevel - 1) % PALETTE.HAND_LEVELS.length]!
+        : PALETTE.WHITE;
+    const progressPct =
+      state.targetChips > 0
+        ? Math.min(100, Math.max(0, Math.round((state.roundChips / state.targetChips) * 100)))
+        : 0;
+    const targetMet = state.targetChips > 0 && state.roundChips >= state.targetChips;
+
+    const blindBadgeHtml = isShop
+      ? `<div class="kc-port-shop-badge">SHOP</div>`
+      : `<canvas class="kc-blind-chip-canvas kc-port-blind-chip" width="32" height="32" data-blind-row="${blindDef?.pos.y ?? 0}"></canvas>`;
+
+    const tagsHtml =
+      state.tags.length > 0
+        ? `<div class="kc-port-tags">${state.tags
+            .slice(-4)
+            .map((tk) => {
+              const td = TAG_MAP[tk];
+              return `<button type="button" class="kc-rail-tag-btn interactive" data-rail-tag="${esc(tk)}" aria-label="${esc(td?.name ?? tk)}"><canvas class="kc-rail-tag-canvas kc-port-tag-cv" width="20" height="20" data-tag-x="${td?.pos.x ?? 0}" data-tag-y="${td?.pos.y ?? 0}"></canvas></button>`;
+            })
+            .join('')}</div>`
+        : '';
+
+    this.railLayer.innerHTML = `
+      <header class="kc-hud-portrait ${flaming ? 'flaming' : ''}" style="left:${d.x}px;top:${d.y}px;width:${d.w}px;height:${d.h}px;--blind-col:${headerColor};">
+        <div class="kc-port-row-top">
+          <div class="kc-port-blind-block">
+            ${blindBadgeHtml}
+            <div class="kc-port-blind-info">
+              <div class="kc-port-blind-name" style="color:${isShop ? '#f3b958' : '#ffffff'};">${esc(isShop ? 'SHOP' : activeBlind?.name ?? 'Small Blind')}</div>
+              <div class="kc-port-score-line">
+                <canvas class="kc-score-chip-canvas kc-port-chip-ic" width="14" height="14"></canvas>
+                <span class="kc-port-score-now">${fmtNum(state.roundChips)}</span>
+                <span class="kc-port-score-sep">/</span>
+                <span class="kc-port-score-tgt">${fmtNum(state.targetChips)}</span>
+              </div>
+              <div class="kc-round-progress-track port">
+                <div class="kc-round-progress-fill ${targetMet ? 'met' : ''}" style="width:${progressPct}%;"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="kc-port-money">$${state.dollars}</div>
+
+          <div class="kc-port-btns">
+            <button class="kc-btn kc-btn-red kc-port-btn interactive" data-ui="run-info">Info</button>
+            <button class="kc-btn kc-btn-teal kc-port-btn interactive" data-ui="cycle-speed">${gameSpeed}x</button>
+            <button class="kc-btn kc-btn-amber kc-port-btn interactive" data-ui="options">Menu</button>
+          </div>
+        </div>
+
+        <div class="kc-port-row-bot">
+          <div class="kc-port-hand-stage ${flaming ? 'flaming' : ''}">
+            <div class="kc-port-hand-meta">
+              <span class="kc-port-hand-name">${esc(handName || 'Select Cards')}</span>
+              ${
+                handLevel > 0
+                  ? `<span class="kc-lvl-badge kc-port-lvl" style="background:${levelColor};">Lv.${handLevel}</span>`
+                  : ''
+              }
+            </div>
+            <div class="kc-port-math">
+              <div id="kc-chips-box" class="kc-math-pill kc-chips-pill kc-port-pill">${fmtNum(chips)}</div>
+              <div class="kc-math-x kc-port-x">X</div>
+              <div id="kc-mult-box" class="kc-math-pill kc-mult-pill kc-port-pill">${Number.isInteger(mult) ? mult : mult.toFixed(1)}</div>
+            </div>
+          </div>
+
+          <div class="kc-port-stats ${state.tags.length > 0 ? 'has-tags' : ''}">
+            <div class="kc-port-stat"><span class="lbl">H</span><b class="kc-blue">${state.handsLeft}</b></div>
+            <div class="kc-port-stat"><span class="lbl">D</span><b class="kc-red">${state.discardsLeft}</b></div>
+            <div class="kc-port-stat"><span class="lbl">A</span><b class="kc-amber">${state.ante}${state.tags.length > 0 ? '' : '/' + state.winAnte}</b></div>
+            <div class="kc-port-stat"><span class="lbl">R</span><b class="kc-amber">${state.round}</b></div>
+            ${tagsHtml}
+          </div>
+        </div>
+      </header>
+    `;
+
+    this.bindHudEvents(blindDef?.pos.y ?? 0);
+  }
+
+  private bindHudEvents(blindRow: number): void {
     const chipCanvas = this.railLayer.querySelector('.kc-blind-chip-canvas') as HTMLCanvasElement | null;
     if (chipCanvas) {
-      this.registerAnimatedCanvas(chipCanvas, 'BlindChips', blindDef?.pos.y ?? 0, 21);
+      this.registerAnimatedCanvas(chipCanvas, 'BlindChips', blindRow, 21);
     }
 
     const railShopSign = this.railLayer.querySelector('.kc-rail-shop-sign') as HTMLCanvasElement | null;
@@ -991,6 +1335,10 @@ export class UiOverlay {
       this.cb.onPlayButtonSfx();
       this.openModal('OPTIONS');
     });
+    this.railLayer.querySelector('[data-ui="cycle-speed"]')?.addEventListener('click', () => {
+      this.cb.onPlayButtonSfx();
+      this.cb.onCycleGameSpeed();
+    });
   }
 
   // =========================================================================
@@ -1001,14 +1349,18 @@ export class UiOverlay {
     state: SimState,
     geom: TableGeometry,
     cards: readonly VisualCard[],
-    settings: RenderSettings
+    settings: RenderSettings,
+    bossWarning: BossWarningInfo | null
   ): void {
     if (state.phase === 'TITLE') {
-      this.renderTitleScreen(settings);
+      this.renderTitleScreen(settings, geom);
       return;
     }
 
     const parts: string[] = [];
+    const isPortrait = geom.mode === 'mobile-portrait';
+    const isLandscape = geom.mode === 'mobile-landscape';
+    const isMobile = isPortrait || isLandscape;
 
     // 1. Top Joker & Consumable Felt Trays (always visible in run; minimal tint keeps cards crisp!)
     const maxJokers = getEffectiveJokerSlots(state);
@@ -1028,8 +1380,15 @@ export class UiOverlay {
         (c) => c.id === this.selectedOwnedId && (c.kind === 'joker' || c.kind === 'consumable')
       );
       if (ownedVis) {
-        const px = Math.round(ownedVis.moveable.tx);
-        const py = Math.round(ownedVis.moveable.ty + ownedVis.moveable.th * 0.5 + 8);
+        const halfPad = ownedVis.kind === 'consumable' ? 76 : 56;
+        const px = Math.max(
+          halfPad,
+          Math.min(geom.viewportW - halfPad, Math.round(ownedVis.moveable.tx))
+        );
+        const py = Math.min(
+          geom.viewportH - geom.safeInsets.bottom - 34,
+          Math.round(ownedVis.moveable.ty + ownedVis.moveable.th * 0.5 + 6)
+        );
         if (ownedVis.kind === 'joker' && ownedVis.jokerData) {
           const j = ownedVis.jokerData;
           parts.push(`
@@ -1041,13 +1400,8 @@ export class UiOverlay {
           `);
         } else if (ownedVis.kind === 'consumable' && ownedVis.consumableData) {
           const c = ownedVis.consumableData;
-          const def = CONSUMABLE_MAP[c.key];
-          const minSel = def?.minSelect ?? 0;
-          const maxSel = def?.maxSelect ?? 0;
-          const canUse =
-            state.phase !== 'SCORING' &&
-            (minSel === 0 ||
-              (state.selectedCardIds.length >= minSel && state.selectedCardIds.length <= maxSel));
+          const preview = getConsumablePreview(state, c.key, { fromInventory: true });
+          const canUse = state.phase !== 'SCORING' && preview.canUseNow;
           parts.push(`
             <div class="kc-card-actions" style="left:${px}px;top:${py}px;">
               <button class="kc-mini-btn kc-btn-red interactive" ${canUse ? '' : 'disabled'} data-use-cons="${esc(c.id)}">USE</button>
@@ -1064,33 +1418,82 @@ export class UiOverlay {
         state.phase === 'PLAYING' && state.selectedCardIds.length > 0 && state.handsLeft > 0;
       const canDiscard =
         state.phase === 'PLAYING' && state.selectedCardIds.length > 0 && state.discardsLeft > 0;
+      const hasSelected = state.phase === 'PLAYING' && state.selectedCardIds.length > 0;
 
-      // Deck counter right beneath Deck Pile
+      // Live Boss Warning Pill cleanly above hand cards inside open play arena
+      if (state.phase === 'PLAYING' && bossWarning) {
+        const icon =
+          bossWarning.severity === 'block' ? '!' : bossWarning.severity === 'warn' ? '▲' : 'i';
+        const warnY = Math.max(
+          geom.playArea.y + 4,
+          geom.handTray.y - (isLandscape ? 32 : isPortrait ? 38 : 42)
+        );
+        parts.push(`
+          <div class="kc-boss-warn-wrap" style="left:${geom.playArea.x}px;top:${warnY}px;width:${geom.playArea.w}px;">
+            <div class="kc-boss-warning-pill sev-${bossWarning.severity}">
+              <span class="kc-bw-icon">${icon}</span>
+              <span class="kc-bw-boss">${esc(bossWarning.bossName)}:</span>
+              <span class="kc-bw-msg">${esc(bossWarning.message)}</span>
+            </div>
+          </div>
+        `);
+      }
+
+      // Deck counter right beneath Deck Pile (clamped strictly above actionBar)
+      const deckBadgeTop = Math.min(
+        geom.actionBar.y - (isMobile ? 25 : 30),
+        geom.deckPile.y + geom.deckPile.h + (isMobile ? 3 : 8)
+      );
       parts.push(`
-        <button class="kc-deck-badge interactive" data-ui="open-deck" style="left:${geom.deckPile.x}px;top:${geom.deckPile.y + geom.deckPile.h + 8}px;width:${geom.deckPile.w}px;">
+        <button class="kc-deck-badge ${isMobile ? 'compact' : ''} interactive" data-ui="open-deck" style="left:${geom.deckPile.x}px;top:${deckBadgeTop}px;width:${geom.deckPile.w}px;">
           ${state.drawPile.length}/${state.fullDeck.length}
         </button>
       `);
 
-      // Bottom Playing Action Bar
-      const barY = geom.viewportH - 62;
-      parts.push(`
-        <div class="kc-action-bar" style="left:${geom.handTray.x}px;top:${barY}px;width:${geom.handTray.w}px;">
-          <button class="kc-btn kc-btn-blue kc-action-lg interactive" ${canPlay ? '' : 'disabled'} data-act="play">
-            Play Hand
-          </button>
-          <div class="kc-sort-box">
-            <div class="kc-sort-title">Sort Hand</div>
-            <div class="kc-sort-btns">
-              <button class="kc-btn kc-btn-amber kc-btn-sm interactive ${state.sortMode === 'rank' ? 'active' : ''}" data-act="sort-rank">Rank</button>
-              <button class="kc-btn kc-btn-amber kc-btn-sm interactive ${state.sortMode === 'suit' ? 'active' : ''}" data-act="sort-suit">Suit</button>
-            </div>
+      // Bottom Playing Action Bar positioned directly from geom.actionBar
+      const ab = geom.actionBar;
+      if (isMobile) {
+        parts.push(`
+          <div class="kc-action-bar mobile ${isPortrait ? 'portrait' : 'landscape'}" style="left:${ab.x}px;top:${ab.y}px;width:${ab.w}px;height:${ab.h}px;">
+            <button class="kc-btn kc-btn-blue kc-mob-act-primary interactive" ${canPlay ? '' : 'disabled'} data-act="play">
+              Play
+            </button>
+            <button class="kc-btn kc-btn-amber kc-mob-act-sort interactive ${state.sortMode === 'rank' ? 'active' : ''}" data-act="sort-rank">Rank</button>
+            <button class="kc-btn kc-btn-amber kc-mob-act-sort interactive ${state.sortMode === 'suit' ? 'active' : ''}" data-act="sort-suit">Suit</button>
+            ${
+              hasSelected
+                ? `<button class="kc-btn kc-btn-slate kc-mob-act-clear interactive" data-act="clear-select">Clear</button>`
+                : ''
+            }
+            <button class="kc-btn kc-btn-red kc-mob-act-primary interactive" ${canDiscard ? '' : 'disabled'} data-act="discard">
+              Discard
+            </button>
           </div>
-          <button class="kc-btn kc-btn-red kc-action-lg interactive" ${canDiscard ? '' : 'disabled'} data-act="discard">
-            Discard
-          </button>
-        </div>
-      `);
+        `);
+      } else {
+        parts.push(`
+          <div class="kc-action-bar" style="left:${ab.x}px;top:${ab.y}px;width:${ab.w}px;height:${ab.h}px;">
+            <button class="kc-btn kc-btn-blue kc-action-lg interactive" ${canPlay ? '' : 'disabled'} data-act="play">
+              Play Hand
+            </button>
+            <div class="kc-sort-box">
+              <div class="kc-sort-title">Sort Hand</div>
+              <div class="kc-sort-btns">
+                <button class="kc-btn kc-btn-amber kc-btn-sm interactive ${state.sortMode === 'rank' ? 'active' : ''}" data-act="sort-rank">Rank</button>
+                <button class="kc-btn kc-btn-amber kc-btn-sm interactive ${state.sortMode === 'suit' ? 'active' : ''}" data-act="sort-suit">Suit</button>
+                ${
+                  geom.compact && hasSelected
+                    ? `<button class="kc-btn kc-btn-slate kc-btn-sm interactive" data-act="clear-select">Clear</button>`
+                    : ''
+                }
+              </div>
+            </div>
+            <button class="kc-btn kc-btn-red kc-action-lg interactive" ${canDiscard ? '' : 'disabled'} data-act="discard">
+              Discard
+            </button>
+          </div>
+        `);
+      }
     } else if (state.phase === 'BLIND_SELECT') {
       parts.push(this.buildBlindSelectHtml(state, geom));
     } else if (state.phase === 'SHOP' && state.shop) {
@@ -1109,35 +1512,39 @@ export class UiOverlay {
     this.bindTableEvents(state);
   }
 
-  private renderTitleScreen(_settings: RenderSettings): void {
+  private renderTitleScreen(_settings: RenderSettings, geom: TableGeometry): void {
     const mode = this.packManager.getMode();
     const hasCustom = this.packManager.hasCustomPackAvailable();
     const hasSave = this.cb.hasSavedRun();
+    const isPortrait = geom.mode === 'mobile-portrait';
+    const isLandscape = geom.mode === 'mobile-landscape';
 
     const logoK = renderDynaWord('KRUNKED', 'kc-title-letter kc-tl-white', 0);
     const logoC = renderDynaWord('CARDS', 'kc-title-letter kc-tl-red', 7);
+    const padTop = Math.max(isLandscape ? 8 : 14, geom.safeInsets.top + 8);
+    const padBot = Math.max(isLandscape ? 10 : 20, geom.safeInsets.bottom + 12);
 
     this.tableLayer.innerHTML = `
-      <div class="kc-title-screen">
+      <div class="kc-title-screen ${isPortrait ? 'portrait' : isLandscape ? 'landscape' : 'desktop'}" style="padding-top:${padTop}px;padding-bottom:${padBot}px;">
         <div class="kc-title-pack-pill interactive">
           <span class="kc-pack-dot ${mode === 'custom' ? 'custom' : 'builtin'}"></span>
           <button class="kc-pill-mini interactive" data-title="toggle-pack" title="${esc(this.packManager.getStatusMessage())}">
-            ${mode === 'custom' ? 'Original Pack' : hasCustom ? 'Built-In Pixel Art' : 'Built-In Pixel Art'}
+            ${mode === 'custom' ? 'Original Pack' : hasCustom ? 'Built-In Art' : 'Built-In Art'}
           </button>
-          <button class="kc-pill-mini kc-pill-load interactive" data-title="load-pack-folder" title="Load Local Custom Pack (Folder)">Load Folder</button>
+          <button class="kc-pill-mini kc-pill-load interactive" data-title="load-pack-folder" title="Load Local Custom Pack (Folder)">Folder</button>
           <button class="kc-pill-mini kc-pill-load interactive" data-title="load-pack-archive" title="Load Local Custom Pack (.exe / .zip)">.EXE</button>
         </div>
 
         <div class="kc-logo-stage" aria-label="Krunked Cards">
-          <div class="kc-dyna-logo">
+          <div class="kc-dyna-logo ${isPortrait ? 'stacked' : ''}">
             <span class="kc-logo-word">${logoK}</span>
-            <span class="kc-logo-gap"></span>
+            ${isPortrait ? '' : '<span class="kc-logo-gap"></span>'}
             <span class="kc-logo-word">${logoC}</span>
           </div>
         </div>
 
         <div class="kc-title-dock">
-          <div class="kc-title-main-btns">
+          <div class="kc-title-main-btns ${isPortrait ? 'grid-2x2' : ''}">
             <button class="kc-btn kc-btn-blue kc-title-btn interactive" data-title="play">PLAY</button>
             ${
               hasSave
@@ -1183,14 +1590,20 @@ export class UiOverlay {
   }
 
   private buildBlindSelectHtml(state: SimState, geom: TableGeometry): string {
-    const topY = geom.jokerTray.y + geom.jokerTray.h + 24;
-    const h = geom.viewportH - topY - 12;
+    const isPortrait = geom.mode === 'mobile-portrait';
+    const isLandscape = geom.mode === 'mobile-landscape';
+    const topY = geom.jokerTray.y + geom.jokerTray.h + (isLandscape ? 16 : 22);
+    const h = Math.max(160, geom.table.y + geom.table.h - topY);
     const slots: BlindSlot[] = ['Small', 'Big', 'Boss'];
     const canRerollBoss =
       (state.vouchers.includes('v_directors_cut') || state.vouchers.includes('v_retcon')) &&
       (!state.bossRerolledThisAnte || state.vouchers.includes('v_retcon')) &&
       state.dollars - state.bankruptAt >= 10 &&
       state.blinds.Boss.status !== 'Defeated';
+
+    const chipSize = isLandscape ? 42 : isPortrait ? 48 : 72;
+    const scoreChipSize = isLandscape ? 16 : isPortrait ? 18 : 24;
+    const tagSize = isLandscape ? 26 : isPortrait ? 30 : 38;
 
     const cols = slots
       .map((slot) => {
@@ -1205,6 +1618,59 @@ export class UiOverlay {
               ? '#c77f1e'
               : b.bossColor || '#7d3a5c';
 
+        if (isPortrait) {
+          const skipTagRow =
+            slot !== 'Boss' && tag
+              ? `
+                <div class="kc-port-skip-row" data-skip-tag="${esc(tag.key)}">
+                  <canvas class="kc-tag-canvas" width="${tagSize}" height="${tagSize}" data-tag-x="${tag.pos.x}" data-tag-y="${tag.pos.y}"></canvas>
+                  <div class="kc-skip-tag-meta">
+                    <div class="kc-skip-tag-name">${esc(tag.name)}</div>
+                    <div class="kc-skip-tag-desc">${esc(tag.desc)}</div>
+                  </div>
+                </div>
+              `
+              : '';
+          const actionRow = isCurrent
+            ? `
+              <div class="kc-port-blind-actions">
+                <button class="kc-btn kc-btn-amber interactive" data-act="select-blind">Select</button>
+                ${
+                  slot !== 'Boss' && tag
+                    ? `<button class="kc-btn kc-btn-red interactive" data-act="skip-blind">Skip Blind</button>`
+                    : slot === 'Boss' && canRerollBoss
+                      ? `<button class="kc-btn kc-btn-red interactive" data-act="reroll-boss">Reroll Boss ($10)</button>`
+                      : ''
+                }
+              </div>
+            `
+            : slot === 'Boss' && canRerollBoss
+              ? `<div class="kc-port-blind-actions"><button class="kc-btn kc-btn-red kc-btn-sm interactive" data-act="reroll-boss">Reroll Boss ($10)</button></div>`
+              : '';
+
+          return `
+            <div class="kc-blind-col portrait ${isCurrent ? 'active' : 'dimmed'}" style="--col-accent:${colBg};">
+              <div class="kc-port-blind-head" style="background:${colBg};">
+                <span class="kc-port-blind-title">${esc(b.name)}</span>
+                <span class="kc-port-blind-status">${esc(b.status)}</span>
+              </div>
+              <div class="kc-port-blind-mid">
+                <canvas class="kc-blind-col-chip" width="${chipSize}" height="${chipSize}" data-blind-row="${def?.pos.y ?? 0}"></canvas>
+                <div class="kc-port-blind-stats">
+                  <div class="kc-target-score">
+                    <canvas class="kc-score-chip-canvas" width="${scoreChipSize}" height="${scoreChipSize}"></canvas>
+                    <span>${fmtNum(b.targetChips)}</span>
+                  </div>
+                  <div class="kc-blind-reward">Reward: <span class="kc-gold">${'$'.repeat(Math.max(1, Math.min(8, b.dollars)))}</span></div>
+                  ${def?.desc ? `<div class="kc-port-blind-desc">${esc(def.desc)}</div>` : ''}
+                </div>
+              </div>
+              ${skipTagRow}
+              ${actionRow}
+            </div>
+          `;
+        }
+
         const statusBtn = isCurrent
           ? `<button class="kc-btn kc-btn-amber interactive" data-act="select-blind">Select</button>`
           : `<div class="kc-blind-status-pill">${esc(b.status)}</div>`;
@@ -1214,7 +1680,7 @@ export class UiOverlay {
             ? `
             <div class="kc-skip-box ${isCurrent ? '' : 'upcoming-skip'}" data-skip-tag="${esc(tag.key)}">
               <div class="kc-skip-tag-row">
-                <canvas class="kc-tag-canvas" width="38" height="38" data-tag-x="${tag.pos.x}" data-tag-y="${tag.pos.y}"></canvas>
+                <canvas class="kc-tag-canvas" width="${tagSize}" height="${tagSize}" data-tag-x="${tag.pos.x}" data-tag-y="${tag.pos.y}"></canvas>
                 <div class="kc-skip-tag-meta">
                   <div class="kc-skip-tag-name">${esc(tag.name)}</div>
                   <div class="kc-skip-tag-desc">${esc(tag.desc)}</div>
@@ -1236,10 +1702,10 @@ export class UiOverlay {
             <div class="kc-blind-col-top">${statusBtn}</div>
             <div class="kc-blind-col-banner" style="background:${colBg};">${esc(b.name)}</div>
             <div class="kc-blind-col-body">
-              <canvas class="kc-blind-col-chip" width="72" height="72" data-blind-row="${def?.pos.y ?? 0}"></canvas>
-              <div class="kc-muted-sm">Score at least</div>
+              <canvas class="kc-blind-col-chip" width="${chipSize}" height="${chipSize}" data-blind-row="${def?.pos.y ?? 0}"></canvas>
+              ${isLandscape ? '' : '<div class="kc-muted-sm">Score at least</div>'}
               <div class="kc-target-score lg">
-                <canvas class="kc-score-chip-canvas" width="24" height="24"></canvas>
+                <canvas class="kc-score-chip-canvas" width="${scoreChipSize}" height="${scoreChipSize}"></canvas>
                 <span>${fmtNum(b.targetChips)}</span>
               </div>
               <div class="kc-blind-reward">Reward: <span class="kc-gold">${'$'.repeat(Math.max(1, Math.min(8, b.dollars)))}</span></div>
@@ -1252,7 +1718,7 @@ export class UiOverlay {
       .join('');
 
     return `
-      <div class="kc-blind-arena" style="left:${geom.table.x}px;top:${topY}px;width:${geom.table.w}px;height:${h}px;">
+      <div class="kc-blind-arena ${isPortrait ? 'portrait' : isLandscape ? 'landscape' : ''}" style="left:${geom.table.x}px;top:${topY}px;width:${geom.table.w}px;height:${h}px;">
         ${cols}
       </div>
     `;
@@ -1263,75 +1729,102 @@ export class UiOverlay {
     geom: TableGeometry,
     cards: readonly VisualCard[]
   ): string {
-    // Frame sits cleanly below jokerTray/consumableTray X/Y counters (zero overlap!)
-    const boardTop = Math.max(geom.jokerTray.y + geom.jokerTray.h + 20, geom.shopOfferTray.y - 10);
+    const isPortrait = geom.mode === 'mobile-portrait';
+    const isLandscape = geom.mode === 'mobile-landscape';
+    const isMobile = isPortrait || isLandscape;
+
+    const sc = geom.shopControls;
+    const boardTop = Math.max(
+      geom.jokerTray.y + geom.jokerTray.h + (isMobile ? 16 : 20),
+      Math.min(sc.y, geom.shopOfferTray.y) - (isMobile ? 6 : 10)
+    );
     const boardH = geom.viewportH - boardTop + 8;
-    const controlsW = Math.max(132, geom.shopOfferTray.x - geom.table.x - 14);
     const canAfford = (cost: number) => state.dollars - state.bankruptAt >= cost;
     const rerollPrice = state.freeRerolls > 0 ? 0 : state.rerollCost;
     const canReroll = canAfford(rerollPrice);
+
+    const minX = geom.safeInsets.left + (isMobile ? 42 : 52);
+    const maxX = geom.viewportW - geom.safeInsets.right - (isMobile ? 42 : 52);
+    const maxBtnY = geom.viewportH - geom.safeInsets.bottom - (isMobile ? 28 : 34);
 
     const cardButtons: string[] = [];
     for (const vc of cards) {
       if (vc.kind !== 'shop_offer' && vc.kind !== 'shop_voucher' && vc.kind !== 'shop_booster') {
         continue;
       }
-      const cx = Math.round(vc.moveable.tx);
-      const topTagY = Math.round(vc.moveable.ty - vc.moveable.th * 0.5 - 18);
-      const btnY = Math.round(vc.moveable.ty + vc.moveable.th * 0.5 + 8);
+      const cx = Math.max(minX, Math.min(maxX, Math.round(vc.moveable.tx)));
+      const trayTop =
+        vc.kind === 'shop_offer'
+          ? geom.shopOfferTray.y
+          : vc.kind === 'shop_voucher'
+            ? geom.shopVoucherTray.y
+            : geom.shopBoosterTray.y;
+      const topTagY = Math.max(
+        trayTop + 1,
+        Math.round(vc.moveable.ty - vc.moveable.th * 0.5 - (isMobile ? 15 : 18))
+      );
+      const btnY = Math.min(
+        maxBtnY,
+        Math.round(vc.moveable.ty + vc.moveable.th * 0.5 + (isMobile ? 3 : 8))
+      );
       const cost = vc.cost ?? 0;
       const affordable = canAfford(cost);
 
       cardButtons.push(
-        `<div class="kc-price-tag ${affordable ? '' : 'unaffordable'}" style="left:${cx}px;top:${topTagY}px;">$${cost}</div>`
+        `<div class="kc-price-tag ${isMobile ? 'compact' : ''} ${affordable ? '' : 'unaffordable'}" style="left:${cx}px;top:${topTagY}px;">$${cost}</div>`
       );
 
       if (vc.kind === 'shop_offer' && vc.shopOfferData) {
         const o = vc.shopOfferData;
         const canImmediateUse = o.kind === 'tarot' || o.kind === 'planet' || o.kind === 'spectral';
         cardButtons.push(`
-          <div class="kc-card-actions" style="left:${cx}px;top:${btnY}px;">
+          <div class="kc-card-actions ${isMobile ? 'compact' : ''}" style="left:${cx}px;top:${btnY}px;">
             <button class="kc-mini-btn kc-btn-amber interactive" ${affordable ? '' : 'disabled'} data-buy-offer="${esc(o.id)}">BUY</button>
             ${
               canImmediateUse
-                ? `<button class="kc-mini-btn kc-btn-red interactive" ${affordable ? '' : 'disabled'} data-buy-use-offer="${esc(o.id)}">BUY &amp; USE</button>`
+                ? `<button class="kc-mini-btn kc-btn-red interactive" ${affordable ? '' : 'disabled'} data-buy-use-offer="${esc(o.id)}" title="Buy &amp; Use">${isMobile ? 'USE' : 'BUY &amp; USE'}</button>`
                 : ''
             }
           </div>
         `);
       } else if (vc.kind === 'shop_voucher' && vc.voucherOfferData) {
         cardButtons.push(`
-          <div class="kc-card-actions" style="left:${cx}px;top:${btnY}px;">
+          <div class="kc-card-actions ${isMobile ? 'compact' : ''}" style="left:${cx}px;top:${btnY}px;">
             <button class="kc-mini-btn kc-btn-green interactive" ${affordable ? '' : 'disabled'} data-buy-voucher="${esc(vc.voucherOfferData.id)}">REDEEM</button>
           </div>
         `);
       } else if (vc.kind === 'shop_booster' && vc.boosterOfferData) {
         cardButtons.push(`
-          <div class="kc-card-actions" style="left:${cx}px;top:${btnY}px;">
+          <div class="kc-card-actions ${isMobile ? 'compact' : ''}" style="left:${cx}px;top:${btnY}px;">
             <button class="kc-mini-btn kc-btn-purple interactive" ${affordable ? '' : 'disabled'} data-buy-booster="${esc(vc.boosterOfferData.id)}">OPEN</button>
           </div>
         `);
       }
     }
 
+    const nextLabel = isPortrait ? 'Next Round' : 'Next<br/>Round';
+    const rerollLabel = isPortrait
+      ? `Reroll <span class="kc-reroll-cost">${rerollPrice === 0 ? 'FREE' : '$' + rerollPrice}</span>`
+      : `Reroll<br/><span class="kc-reroll-cost">${rerollPrice === 0 ? 'FREE' : '$' + rerollPrice}</span>`;
+
     return `
       <div class="kc-shop-board" style="left:${geom.table.x - 4}px;top:${boardTop}px;width:${geom.table.w + 8}px;height:${boardH}px;"></div>
 
-      <div class="kc-shop-controls" style="left:${geom.table.x + 6}px;top:${geom.shopOfferTray.y}px;width:${controlsW - 10}px;height:${geom.shopOfferTray.h}px;">
+      <div class="kc-shop-controls ${isPortrait ? 'portrait' : isLandscape ? 'landscape' : ''}" style="left:${sc.x}px;top:${sc.y}px;width:${sc.w}px;height:${sc.h}px;">
         <button class="kc-btn kc-btn-red kc-shop-btn interactive" data-act="shop-next">
-          Next<br/>Round
+          ${nextLabel}
         </button>
         <button class="kc-btn kc-btn-green kc-shop-btn interactive" ${canReroll ? '' : 'disabled'} data-act="shop-reroll">
-          Reroll<br/><span class="kc-reroll-cost">${rerollPrice === 0 ? 'FREE' : '$' + rerollPrice}</span>
+          ${rerollLabel}
         </button>
       </div>
 
       <div class="kc-shop-pocket" style="left:${geom.shopOfferTray.x}px;top:${geom.shopOfferTray.y}px;width:${geom.shopOfferTray.w}px;height:${geom.shopOfferTray.h}px;"></div>
       <div class="kc-shop-pocket kc-shop-voucher-pocket" style="left:${geom.shopVoucherTray.x}px;top:${geom.shopVoucherTray.y}px;width:${geom.shopVoucherTray.w}px;height:${geom.shopVoucherTray.h}px;">
-        <span class="kc-pocket-stamp">ANTE ${state.ante} VOUCHER</span>
+        <span class="kc-pocket-stamp ${isMobile ? 'inside' : ''}">ANTE ${state.ante} VOUCHER</span>
       </div>
       <div class="kc-shop-pocket kc-shop-booster-pocket" style="left:${geom.shopBoosterTray.x}px;top:${geom.shopBoosterTray.y}px;width:${geom.shopBoosterTray.w}px;height:${geom.shopBoosterTray.h}px;">
-        <span class="kc-pocket-stamp">BOOSTER PACKS</span>
+        <span class="kc-pocket-stamp ${isMobile ? 'inside' : ''}">BOOSTER PACKS</span>
       </div>
       ${cardButtons.join('')}
     `;
@@ -1339,12 +1832,14 @@ export class UiOverlay {
 
   private buildCashoutHtml(state: SimState, geom: TableGeometry): string {
     const co = state.cashout!;
-    const topY = geom.jokerTray.y + geom.jokerTray.h + 24;
-    const panelW = Math.min(580, geom.table.w - 32);
+    const isMobile = geom.mode !== 'desktop';
+    const topY = geom.jokerTray.y + geom.jokerTray.h + (isMobile ? 18 : 24);
+    const maxH = Math.max(160, geom.table.y + geom.table.h - topY - 4);
+    const panelW = Math.min(580, geom.table.w - (isMobile ? 8 : 32));
     const panelX = Math.round(geom.table.x + (geom.table.w - panelW) * 0.5);
 
     const rowsHtml = co.rows
-      .map((r) => {
+      .map((r, idx) => {
         const absD = Math.abs(r.dollars);
         const dollarPips =
           r.dollars === 0
@@ -1355,7 +1850,7 @@ export class UiOverlay {
                 ? '$'.repeat(absD)
                 : `${'$'.repeat(6)} ($${absD})`;
         return `
-          <div class="kc-cash-row">
+          <div class="kc-cash-row" style="--row-i:${idx};">
             <div class="kc-cash-left">
               <span class="kc-cash-label">${esc(r.label)}</span>
               ${r.detail ? `<span class="kc-cash-detail">${esc(r.detail)}</span>` : ''}
@@ -1368,7 +1863,7 @@ export class UiOverlay {
       .join('');
 
     return `
-      <div class="kc-cashout-panel" style="left:${panelX}px;top:${topY}px;width:${panelW}px;">
+      <div class="kc-cashout-panel ${isMobile ? 'compact' : ''}" style="left:${panelX}px;top:${topY}px;width:${panelW}px;max-height:${maxH}px;">
         <div class="kc-cashout-header">BLIND DEFEATED!</div>
         <button class="kc-btn kc-btn-amber kc-cashout-btn interactive" data-act="finish-cashout">
           Cash Out: $${co.total}
@@ -1387,36 +1882,46 @@ export class UiOverlay {
   ): string {
     const pack = state.pack!;
     const def = BOOSTER_MAP[pack.boosterKey];
+    const isMobile = geom.mode !== 'desktop';
+    const minX = geom.safeInsets.left + 44;
+    const maxX = geom.viewportW - geom.safeInsets.right - 44;
+    const maxBtnY = pack.needsHand
+      ? Math.min(geom.viewportH - geom.safeInsets.bottom - 28, geom.handTray.y - 24)
+      : geom.viewportH - geom.safeInsets.bottom - 30;
 
     const pickBtns = cards
       .filter((c) => c.kind === 'pack_card' && c.packCardData)
       .map((vc) => {
         const pc = vc.packCardData!;
-        const cx = Math.round(vc.moveable.tx);
-        const by = Math.round(vc.moveable.ty + vc.moveable.th * 0.5 + 10);
+        const cx = Math.max(minX, Math.min(maxX, Math.round(vc.moveable.tx)));
+        const by = Math.min(
+          maxBtnY,
+          Math.round(vc.moveable.ty + vc.moveable.th * 0.5 + (isMobile ? 4 : 10))
+        );
         let canPick = true;
         let label = pc.kind === 'joker' || pc.kind === 'playing_card' ? 'SELECT' : 'USE';
         if (pc.kind === 'tarot' || pc.kind === 'spectral') {
+          const preview = getConsumablePreview(state, pc.key, { fromInventory: false });
+          canPick = preview.canUseNow;
           const cDef = CONSUMABLE_MAP[pc.key];
           const minSel = cDef?.minSelect ?? 0;
           const maxSel = cDef?.maxSelect ?? 0;
-          if (minSel > 0) {
-            canPick =
-              state.selectedCardIds.length >= minSel && state.selectedCardIds.length <= maxSel;
-            if (!canPick) label = `PICK ${minSel}${maxSel > minSel ? '-' + maxSel : ''}`;
+          if (!canPick && minSel > 0) {
+            label = `PICK ${minSel}${maxSel > minSel ? '-' + maxSel : ''}`;
           }
         }
         return `
-          <div class="kc-card-actions" style="left:${cx}px;top:${by}px;">
+          <div class="kc-card-actions ${isMobile ? 'compact' : ''}" style="left:${cx}px;top:${by}px;">
             <button class="kc-mini-btn kc-btn-green interactive" ${canPick ? '' : 'disabled'} data-pack-pick="${esc(pc.id)}">${label}</button>
           </div>
         `;
       })
       .join('');
 
+    const bannerTop = geom.packTray.y + (isMobile ? 2 : 8);
     return `
-      <div class="kc-pack-banner" style="left:${geom.packTray.x}px;top:${geom.packTray.y + 8}px;width:${geom.packTray.w}px;">
-        <div>
+      <div class="kc-pack-banner ${isMobile ? 'compact' : ''}" style="left:${geom.packTray.x}px;top:${bannerTop}px;width:${geom.packTray.w}px;">
+        <div class="kc-pack-banner-text">
           <span class="kc-pack-title">${esc(def?.name ?? pack.kind + ' Pack')}</span>
           <span class="kc-pack-sub">Choose ${pack.chooseRemaining} remaining</span>
         </div>
@@ -1427,27 +1932,55 @@ export class UiOverlay {
   }
 
   private buildEndModalHtml(state: SimState, victory: boolean): string {
+    const mostPlayed = state.tracking.mostPlayedHand;
+    const mostPlayedCount = state.handLevels[mostPlayed]?.played ?? 0;
+    const jokerStripHtml =
+      state.jokers.length > 0
+        ? `
+          <div class="kc-end-jokers">
+            <div class="kc-end-jokers-lbl">Final Joker Lineup (${state.jokers.length})</div>
+            <div class="kc-end-jokers-row">
+              ${state.jokers
+                .map((j) => {
+                  const jd = JOKER_MAP[j.key];
+                  return `<canvas class="kc-end-joker-sprite" width="36" height="48" title="${esc(jd?.name ?? j.key)}" data-atlas="Joker" data-ax="${jd?.pos.x ?? 0}" data-ay="${jd?.pos.y ?? 0}"></canvas>`;
+                })
+                .join('')}
+            </div>
+          </div>
+        `
+        : '';
+
     return `
       <div class="kc-end-overlay">
         <div class="kc-modal-card kc-end-card">
           <div class="kc-end-title ${victory ? 'win' : 'lose'}">${victory ? 'YOU WIN!' : 'GAME OVER'}</div>
           <div class="kc-end-stats">
             <div><span>Best Hand</span><strong class="kc-blue">${fmtNum(state.stats.bestHand)}</strong></div>
-            <div><span>Ante Reached</span><strong class="kc-amber">${state.ante} / ${state.winAnte}</strong></div>
-            <div><span>Rounds Won</span><strong class="kc-amber">${state.round}</strong></div>
-            <div><span>Seed</span><strong class="kc-gold">${esc(state.rng.seed)}</strong></div>
+            <div><span>Most Played</span><strong class="kc-amber">${esc(mostPlayed)} (${mostPlayedCount})</strong></div>
+            <div><span>Cards Played</span><strong>${fmtNum(state.stats.cardsPlayed)}</strong></div>
+            <div><span>Ante / Rounds</span><strong class="kc-amber">${state.ante}/${state.winAnte} • R${state.round}</strong></div>
+            <div class="kc-end-seed-row">
+              <span>Seed</span>
+              <span class="kc-seed-copy-group">
+                <strong class="kc-gold">${esc(state.rng.seed)}</strong>
+                <button class="kc-mini-btn kc-btn-slate interactive" data-copy-seed="${esc(state.rng.seed)}">Copy</button>
+              </span>
+            </div>
             ${
               !victory && state.stats.defeatedBy
                 ? `<div><span>Defeated By</span><strong class="kc-red">${esc(state.stats.defeatedBy)}</strong></div>`
                 : ''
             }
           </div>
+          ${jokerStripHtml}
           <div class="kc-end-btns">
             ${
               victory
                 ? `<button class="kc-btn kc-btn-blue interactive" data-act="continue-endless">Continue Endless</button>`
                 : `<button class="kc-btn kc-btn-blue interactive" data-act="new-run-modal">New Run</button>`
             }
+            <button class="kc-btn kc-btn-teal interactive" data-act="replay-seed">Replay Seed</button>
             <button class="kc-btn kc-btn-red interactive" data-act="return-title">Main Menu</button>
           </div>
         </div>
@@ -1456,7 +1989,7 @@ export class UiOverlay {
   }
 
   private bindTableEvents(state: SimState): void {
-    // Register animated BlindChip canvases, score chip sprites, and tag sprites
+    // Register animated BlindChip canvases, score chip sprites, tag sprites, and final Joker lineup sprites
     this.tableLayer.querySelectorAll<HTMLCanvasElement>('.kc-blind-col-chip').forEach((c) => {
       const row = Number(c.dataset.blindRow ?? 0);
       this.registerAnimatedCanvas(c, 'BlindChips', row, 21);
@@ -1466,6 +1999,10 @@ export class UiOverlay {
     });
     this.tableLayer.querySelectorAll<HTMLCanvasElement>('.kc-tag-canvas').forEach((c) => {
       this.drawAtlasCellToCanvas(c, 'tags', Number(c.dataset.tagX ?? 0), Number(c.dataset.tagY ?? 0));
+    });
+    this.tableLayer.querySelectorAll<HTMLCanvasElement>('.kc-end-joker-sprite').forEach((c) => {
+      const atlas = (c.dataset.atlas as AtlasKey) || 'Joker';
+      this.drawAtlasCellToCanvas(c, atlas, Number(c.dataset.ax ?? 0), Number(c.dataset.ay ?? 0));
     });
     this.tableLayer.querySelectorAll<HTMLElement>('[data-skip-tag]').forEach((box) => {
       const tk = box.dataset.skipTag;
@@ -1484,6 +2021,7 @@ export class UiOverlay {
 
     bind('[data-act="play"]', () => this.cb.onDispatch({ type: 'PLAY_HAND' }));
     bind('[data-act="discard"]', () => this.cb.onDispatch({ type: 'DISCARD_HAND' }));
+    bind('[data-act="clear-select"]', () => this.cb.onDispatch({ type: 'DESELECT_ALL' }));
     bind('[data-act="sort-rank"]', () => this.cb.onDispatch({ type: 'SORT_HAND', mode: 'rank' }));
     bind('[data-act="sort-suit"]', () => this.cb.onDispatch({ type: 'SORT_HAND', mode: 'suit' }));
     bind('[data-act="select-blind"]', () => this.cb.onDispatch({ type: 'SELECT_BLIND' }));
@@ -1496,6 +2034,15 @@ export class UiOverlay {
     bind('[data-act="continue-endless"]', () => this.cb.onDispatch({ type: 'CONTINUE_ENDLESS' }));
     bind('[data-act="return-title"]', () => this.cb.onDispatch({ type: 'RETURN_TO_TITLE' }));
     bind('[data-act="new-run-modal"]', () => this.openModal('NEW_RUN'));
+    bind('[data-act="replay-seed"]', () => {
+      this.cb.onReplaySeed(state.deckId, state.stake, state.rng.seed, state.challengeId);
+    });
+    bind('[data-copy-seed]', (el) => {
+      const seed = el.dataset.copySeed || state.rng.seed;
+      void copyTextToClipboard(seed).then((ok) => {
+        this.showToast(ok ? `Copied seed: ${seed}` : `Seed: ${seed}`, 2000);
+      });
+    });
     bind('[data-ui="open-deck"]', () => {
       this.runInfoTab = 'deck';
       this.openModal('RUN_INFO');
@@ -1503,14 +2050,17 @@ export class UiOverlay {
 
     bind('[data-sell-joker]', (el) => {
       this.selectedOwnedId = null;
+      this.dismissInspect();
       this.cb.onDispatch({ type: 'SELL_JOKER', jokerId: el.dataset.sellJoker! });
     });
     bind('[data-sell-cons]', (el) => {
       this.selectedOwnedId = null;
+      this.dismissInspect();
       this.cb.onDispatch({ type: 'SELL_CONSUMABLE', consumableId: el.dataset.sellCons! });
     });
     bind('[data-use-cons]', (el) => {
       this.selectedOwnedId = null;
+      this.dismissInspect();
       this.cb.onDispatch({
         type: 'USE_CONSUMABLE',
         consumableId: el.dataset.useCons!,
@@ -1518,6 +2068,7 @@ export class UiOverlay {
       });
     });
     bind('[data-buy-offer]', (el) => {
+      this.dismissInspect();
       this.cb.onDispatch({
         type: 'SHOP_BUY_OFFER',
         offerId: el.dataset.buyOffer!,
@@ -1525,6 +2076,7 @@ export class UiOverlay {
       });
     });
     bind('[data-buy-use-offer]', (el) => {
+      this.dismissInspect();
       this.cb.onDispatch({
         type: 'SHOP_BUY_OFFER',
         offerId: el.dataset.buyUseOffer!,
@@ -1532,18 +2084,21 @@ export class UiOverlay {
       });
     });
     bind('[data-buy-voucher]', (el) => {
+      this.dismissInspect();
       this.cb.onDispatch({
         type: 'SHOP_BUY_VOUCHER',
         voucherOfferId: el.dataset.buyVoucher!,
       });
     });
     bind('[data-buy-booster]', (el) => {
+      this.dismissInspect();
       this.cb.onDispatch({
         type: 'SHOP_BUY_BOOSTER',
         boosterOfferId: el.dataset.buyBooster!,
       });
     });
     bind('[data-pack-pick]', (el) => {
+      this.dismissInspect();
       this.cb.onDispatch({
         type: 'PACK_PICK',
         packCardId: el.dataset.packPick!,
@@ -1701,7 +2256,7 @@ export class UiOverlay {
 
     return `
       <div class="kc-modal-card wide">
-        <div class="kc-modal-head">
+        <div class="kc-modal-head wrap">
           <h2>New Run</h2>
           <div class="kc-tab-row">
             <button class="kc-tab interactive ${this.newRunTab === 'standard' ? 'active' : ''}" data-nr-tab="standard">Standard</button>
@@ -1709,12 +2264,17 @@ export class UiOverlay {
           </div>
           <button class="kc-btn kc-btn-red kc-btn-sm interactive" data-modal="close">Back</button>
         </div>
-        ${body}
+        <div class="kc-modal-scroll">${body}</div>
       </div>
     `;
   }
 
   private buildRunInfoModalHtml(state: SimState, settings: RenderSettings): string {
+    const preview = state.phase === 'PLAYING' ? previewSelectedHand(state) : null;
+    const deckName = DECK_MAP[state.deckId]?.name ?? state.deckId;
+    const stakeName = STAKE_MAP[state.stake]?.name ?? `Stake ${state.stake}`;
+    const challengeName = state.challengeId ? (CHALLENGE_MAP[state.challengeId]?.name ?? state.challengeId) : null;
+
     let body = '';
     if (this.runInfoTab === 'hands') {
       body = `
@@ -1724,10 +2284,20 @@ export class UiOverlay {
             if (!st || (!st.visible && st.played === 0)) return '';
             const lvlCol = PALETTE.HAND_LEVELS[(st.level - 1) % PALETTE.HAND_LEVELS.length]!;
             const def = POKER_HAND_MAP[hid];
+            const isPreviewed = preview?.handId === hid;
             return `
-              <div class="kc-hand-row" title="${esc(def?.desc ?? '')}">
+              <div class="kc-hand-row ${isPreviewed ? 'previewed' : ''}" title="${esc(def?.desc ?? '')}">
                 <span class="kc-lvl-badge" style="background:${lvlCol};">lvl.${st.level}</span>
-                <span class="kc-hr-name">${esc(hid)}</span>
+                <div class="kc-hr-name-col">
+                  <div class="kc-hr-name-line">
+                    <span class="kc-hr-name">${esc(hid)}</span>
+                    ${isPreviewed ? '<span class="kc-hr-sel-tag">SELECTED</span>' : ''}
+                  </div>
+                  <div class="kc-hr-sub">
+                    <span class="kc-hr-upgrade">+${st.lChips} Chips / +${st.lMult} Mult per Lv</span>
+                    ${def?.example ? `<span class="kc-hr-ex">• ${esc(def.example)}</span>` : ''}
+                  </div>
+                </div>
                 <span class="kc-hr-math">
                   <span class="kc-hr-pill chips">${fmtNum(st.chips)}</span>
                   <span class="kc-hr-x">X</span>
@@ -1783,39 +2353,80 @@ export class UiOverlay {
               })
               .join('')}</div>`;
     } else {
-      const suitCounts: Record<Suit, number> = { Hearts: 0, Diamonds: 0, Spades: 0, Clubs: 0 };
-      for (const c of state.fullDeck) suitCounts[c.suit] = (suitCounts[c.suit] ?? 0) + 1;
+      const bd = getDeckBreakdown(state);
       const uiAtlas: AtlasKey = settings.highContrastSuits ? 'ui_2' : 'ui_1';
-      const suitOrder: Suit[] = ['Hearts', 'Diamonds', 'Spades', 'Clubs'];
       const suitColors = settings.highContrastSuits
         ? PALETTE.SUITS_HIGH_CONTRAST
         : { Hearts: '#fe5f55', Diamonds: '#f06a40', Spades: '#b7c7e8', Clubs: '#6ec4a7' };
+
+      const headerCells = MATRIX_RANKS.map(
+        (rk) => `
+          <th class="kc-dm-th">
+            <div class="kc-dm-rank">${shortRankLabel(rk)}</div>
+            <div class="kc-dm-rtot">${bd.rankRemaining[rk]}</div>
+          </th>
+        `
+      ).join('');
+
+      const rowsHtml = SUITS.map((su) => {
+        const col = suitColors[su];
+        const cells = MATRIX_RANKS.map((rk) => {
+          const cell = bd.matrix[su][rk];
+          const empty = cell.total === 0;
+          const depleted = cell.total > 0 && cell.remaining === 0;
+          const pips: string[] = [];
+          if (cell.enhanced > 0) pips.push('<span class="kc-dm-pip enh" title="Enhanced"></span>');
+          if (cell.editioned > 0) pips.push('<span class="kc-dm-pip ed" title="Edition"></span>');
+          if (cell.sealed > 0) pips.push('<span class="kc-dm-pip seal" title="Seal"></span>');
+          const tip = `${rk} of ${su}: ${cell.remaining}/${cell.total} in draw${cell.enhanced ? `, ${cell.enhanced} enhanced` : ''}${cell.editioned ? `, ${cell.editioned} editioned` : ''}${cell.sealed ? `, ${cell.sealed} sealed` : ''}`;
+          return `
+            <td class="kc-dm-cell ${empty ? 'empty' : depleted ? 'depleted' : ''}" title="${esc(tip)}">
+              <div class="kc-dm-cnt">${empty ? '·' : `${cell.remaining}/${cell.total}`}</div>
+              ${pips.length > 0 ? `<div class="kc-dm-pips">${pips.join('')}</div>` : ''}
+            </td>
+          `;
+        }).join('');
+        return `
+          <tr>
+            <th class="kc-dm-suit-cell" style="color:${col};">
+              <canvas class="kc-mini-sprite" width="16" height="16" data-atlas="${uiAtlas}" data-ax="${UI_SUIT_COLS[su]}" data-ay="1"></canvas>
+              <span class="kc-dm-suit-cnt">${bd.suitRemaining[su]}/${bd.suitTotals[su]}</span>
+            </th>
+            ${cells}
+          </tr>
+        `;
+      }).join('');
+
       body = `
         <div class="kc-deck-summary">
-          <div class="kc-suit-pills">
-            ${suitOrder
-              .map(
-                (su) => `
-              <span class="kc-suit-count-pill">
-                <canvas class="kc-mini-sprite" width="18" height="18" data-atlas="${uiAtlas}" data-ax="${UI_SUIT_COLS[su]}" data-ay="1"></canvas>
-                <span>${su}: <b style="color:${suitColors[su]};">${suitCounts[su]}</b></span>
-              </span>
-            `
-              )
-              .join('')}
-            <span class="kc-suit-count-pill">Draw Pile: <b class="kc-gold">${state.drawPile.length}/${state.fullDeck.length}</b></span>
+          <div class="kc-deck-kpi-strip">
+            <span class="kc-suit-count-pill">Draw: <b class="kc-gold">${bd.remaining}/${bd.total}</b></span>
+            <span class="kc-suit-count-pill">Face: <b class="kc-blue">${bd.faceRemaining}/${bd.faceTotal}</b></span>
+            <span class="kc-suit-count-pill">Stone: <b class="kc-amber">${bd.stoneRemaining}/${bd.stoneTotal}</b></span>
+            <span class="kc-suit-count-pill">Enhanced: <b style="color:#4bc292;">${bd.enhancedTotal}</b></span>
+            <span class="kc-suit-count-pill">Editioned: <b style="color:#d48cf5;">${bd.editionedTotal}</b></span>
+            <span class="kc-suit-count-pill">Sealed: <b class="kc-gold">${bd.sealedTotal}</b></span>
           </div>
-          <div class="kc-deck-cards-grid">
-            ${state.fullDeck
-              .slice(0, 80)
-              .map((c) => {
-                const sym =
-                  c.suit === 'Hearts' ? '♥' : c.suit === 'Diamonds' ? '♦' : c.suit === 'Spades' ? '♠' : '♣';
-                const col = suitColors[c.suit];
-                const inDraw = state.drawPile.includes(c.id);
-                return `<span class="kc-deck-mini-card ${inDraw ? '' : 'used'}" style="color:${col};">${c.rank === '10' ? '10' : c.rank[0]}${sym}</span>`;
-              })
-              .join('')}
+
+          <div class="kc-deck-matrix-wrap">
+            <table class="kc-deck-matrix">
+              <thead>
+                <tr>
+                  <th class="kc-dm-corner">Suit</th>
+                  ${headerCells}
+                </tr>
+              </thead>
+              <tbody>
+                ${rowsHtml}
+              </tbody>
+            </table>
+          </div>
+
+          <div class="kc-dm-legend">
+            <span><i class="kc-dm-pip enh"></i> Enhanced</span>
+            <span><i class="kc-dm-pip ed"></i> Edition</span>
+            <span><i class="kc-dm-pip seal"></i> Seal</span>
+            <span class="kc-dm-legend-note">Cell shows remaining / total in deck</span>
           </div>
         </div>
       `;
@@ -1823,85 +2434,60 @@ export class UiOverlay {
 
     return `
       <div class="kc-modal-card wide">
-        <div class="kc-modal-head">
-          <h2>Run Info — Ante ${state.ante} (${esc(DECK_MAP[state.deckId]?.name ?? state.deckId)} • ${esc(STAKE_MAP[state.stake]?.name ?? 'Stake ' + state.stake)})</h2>
+        <div class="kc-modal-head wrap">
+          <div class="kc-ri-head-meta">
+            <h2>Run Info — Ante ${state.ante}</h2>
+            <div class="kc-ri-badges">
+              <span class="kc-ri-badge">${esc(deckName)}</span>
+              <span class="kc-ri-badge stake">${esc(challengeName ? `Challenge: ${challengeName}` : stakeName)}</span>
+              <span class="kc-ri-badge seed">Seed: <b>${esc(state.rng.seed)}</b></span>
+              <button class="kc-mini-btn kc-btn-teal interactive" data-copy-seed="${esc(state.rng.seed)}">Copy Seed</button>
+            </div>
+          </div>
           <button class="kc-btn kc-btn-red kc-btn-sm interactive" data-modal="close">Close</button>
         </div>
-        <div class="kc-tab-row">
+        <div class="kc-tab-row wrap">
           <button class="kc-tab interactive ${this.runInfoTab === 'hands' ? 'active' : ''}" data-ri-tab="hands">Poker Hands</button>
           <button class="kc-tab interactive ${this.runInfoTab === 'blinds' ? 'active' : ''}" data-ri-tab="blinds">Blinds</button>
           <button class="kc-tab interactive ${this.runInfoTab === 'vouchers' ? 'active' : ''}" data-ri-tab="vouchers">Vouchers (${state.vouchers.length})</button>
-          <button class="kc-tab interactive ${this.runInfoTab === 'deck' ? 'active' : ''}" data-ri-tab="deck">Deck (${state.fullDeck.length})</button>
+          <button class="kc-tab interactive ${this.runInfoTab === 'deck' ? 'active' : ''}" data-ri-tab="deck">Deck (${state.drawPile.length}/${state.fullDeck.length})</button>
         </div>
         <div class="kc-modal-scroll">${body}</div>
       </div>
     `;
   }
 
-  private buildCollectionModalHtml(): string {
-    const profile = this.cb.getProfile();
-    const tabs: Array<[typeof this.collectionTab, string, number]> = [
-      ['jokers', 'Jokers', JOKERS.length],
-      ['tarots', 'Tarots', TAROTS.length],
-      ['planets', 'Planets', PLANETS.length],
-      ['spectrals', 'Spectrals', SPECTRALS.length],
-      ['vouchers', 'Vouchers', VOUCHERS.length],
-      ['boosters', 'Boosters', BOOSTERS.length],
-      ['blinds', 'Blinds', BLINDS.length],
-      ['tags', 'Tags', TAGS.length],
-      ['decks', 'Decks', DECKS.length],
-    ];
-
-    const renderCards = (
-      items: Array<{
-        key: string;
-        name: string;
-        desc: string;
-        atlas: AtlasKey;
-        x: number;
-        y: number;
-        w: number;
-        h: number;
-        discovered: boolean;
-        badgeLabel?: string;
-        badgeColor?: string;
-      }>
-    ) =>
-      items
-        .map(
-          (it) => `
-        <div class="kc-coll-item ${it.discovered ? 'seen' : ''}">
-          <canvas class="kc-mini-sprite" width="${it.w}" height="${it.h}" data-atlas="${it.atlas}" data-ax="${it.x}" data-ay="${it.y}"></canvas>
-          <div class="kc-coll-meta">
-            <div class="kc-coll-head">
-              <span class="kc-coll-name">${esc(it.name)} ${it.discovered ? '<span class="kc-seen-dot">★</span>' : ''}</span>
-              ${it.badgeLabel ? `<span class="kc-coll-pill" style="background:${it.badgeColor};">${esc(it.badgeLabel)}</span>` : ''}
-            </div>
-            <div class="kc-coll-desc">${formatRichDesc(it.desc, this.lastHighContrast)}</div>
-          </div>
-        </div>
-      `
-        )
-        .join('');
-
-    let itemsHtml = '';
+  private getCollectionCatalogItems(profile: ProfileProgress): Array<{
+    key: string;
+    name: string;
+    desc: string;
+    atlas: AtlasKey;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    discovered: boolean;
+    rarity?: number;
+    badgeLabel?: string;
+    badgeColor?: string;
+  }> {
     if (this.collectionTab === 'jokers') {
-      itemsHtml = renderCards(
-        JOKERS.map((j) => ({
-          key: j.key,
-          name: j.name,
-          desc: j.descTemplate,
-          atlas: 'Joker',
-          x: j.pos.x,
-          y: j.pos.y,
-          w: 44,
-          h: 59,
-          discovered: profile.discoveredJokers.includes(j.key),
-          badgeLabel: RARITY_NAMES[j.rarity],
-          badgeColor: PALETTE.RARITY[j.rarity - 1] ?? PALETTE.BLUE,
-        }))
-      );
-    } else if (
+      return JOKERS.map((j) => ({
+        key: j.key,
+        name: j.name,
+        desc: j.descTemplate,
+        atlas: 'Joker' as AtlasKey,
+        x: j.pos.x,
+        y: j.pos.y,
+        w: 44,
+        h: 59,
+        discovered: profile.discoveredJokers.includes(j.key),
+        rarity: j.rarity,
+        badgeLabel: RARITY_NAMES[j.rarity],
+        badgeColor: PALETTE.RARITY[j.rarity - 1] ?? PALETTE.BLUE,
+      }));
+    }
+    if (
       this.collectionTab === 'tarots' ||
       this.collectionTab === 'planets' ||
       this.collectionTab === 'spectrals'
@@ -1912,90 +2498,264 @@ export class UiOverlay {
           : this.collectionTab === 'planets'
             ? PLANETS
             : SPECTRALS;
-      itemsHtml = renderCards(
-        src.map((c) => ({
-          key: c.key,
-          name: c.name,
-          desc: c.desc,
-          atlas: 'Tarot',
-          x: c.pos.x,
-          y: c.pos.y,
-          w: 44,
-          h: 59,
-          discovered: profile.discoveredConsumables.includes(c.key),
-        }))
-      );
-    } else if (this.collectionTab === 'vouchers') {
-      itemsHtml = renderCards(
-        VOUCHERS.map((v) => ({
-          key: v.key,
-          name: v.name,
-          desc: v.desc,
-          atlas: 'Voucher',
-          x: v.pos.x,
-          y: v.pos.y,
-          w: 44,
-          h: 59,
-          discovered: profile.discoveredVouchers.includes(v.key),
-        }))
-      );
-    } else if (this.collectionTab === 'boosters') {
-      itemsHtml = renderCards(
-        BOOSTERS.map((b) => ({
-          key: b.key,
-          name: b.name,
-          desc: b.desc,
-          atlas: 'Booster',
-          x: b.pos.x,
-          y: b.pos.y,
-          w: 44,
-          h: 59,
-          discovered: true,
-        }))
-      );
-    } else if (this.collectionTab === 'blinds') {
-      itemsHtml = renderCards(
-        BLINDS.map((b) => ({
-          key: b.key,
-          name: b.name,
-          desc: b.desc || `${b.mult}x Base • $${b.dollars}`,
-          atlas: 'BlindChips',
-          x: 0,
-          y: b.pos.y,
-          w: 36,
-          h: 36,
-          discovered: profile.discoveredBlinds.includes(b.key),
-        }))
-      );
-    } else if (this.collectionTab === 'tags') {
-      itemsHtml = renderCards(
-        TAGS.map((t) => ({
-          key: t.key,
-          name: t.name,
-          desc: t.desc,
-          atlas: 'tags',
-          x: t.pos.x,
-          y: t.pos.y,
-          w: 36,
-          h: 36,
-          discovered: profile.discoveredTags.includes(t.key),
-        }))
-      );
-    } else {
-      itemsHtml = renderCards(
-        DECKS.map((d) => ({
-          key: d.key,
-          name: d.name,
-          desc: d.desc,
-          atlas: 'centers',
-          x: d.pos.x,
-          y: d.pos.y,
-          w: 44,
-          h: 59,
-          discovered: Boolean(profile.deckMaxStake[d.key]),
-        }))
-      );
+      return src.map((c) => ({
+        key: c.key,
+        name: c.name,
+        desc: c.desc,
+        atlas: 'Tarot' as AtlasKey,
+        x: c.pos.x,
+        y: c.pos.y,
+        w: 44,
+        h: 59,
+        discovered: profile.discoveredConsumables.includes(c.key),
+      }));
     }
+    if (this.collectionTab === 'vouchers') {
+      return VOUCHERS.map((v) => ({
+        key: v.key,
+        name: v.name,
+        desc: v.desc,
+        atlas: 'Voucher' as AtlasKey,
+        x: v.pos.x,
+        y: v.pos.y,
+        w: 44,
+        h: 59,
+        discovered: profile.discoveredVouchers.includes(v.key),
+      }));
+    }
+    if (this.collectionTab === 'boosters') {
+      return BOOSTERS.map((b) => ({
+        key: b.key,
+        name: b.name,
+        desc: b.desc,
+        atlas: 'Booster' as AtlasKey,
+        x: b.pos.x,
+        y: b.pos.y,
+        w: 44,
+        h: 59,
+        discovered: true,
+      }));
+    }
+    if (this.collectionTab === 'blinds') {
+      return BLINDS.map((b) => ({
+        key: b.key,
+        name: b.name,
+        desc: b.desc || `${b.mult}x Base • $${b.dollars}`,
+        atlas: 'BlindChips' as AtlasKey,
+        x: 0,
+        y: b.pos.y,
+        w: 36,
+        h: 36,
+        discovered: profile.discoveredBlinds.includes(b.key),
+      }));
+    }
+    if (this.collectionTab === 'tags') {
+      return TAGS.map((t) => ({
+        key: t.key,
+        name: t.name,
+        desc: t.desc,
+        atlas: 'tags' as AtlasKey,
+        x: t.pos.x,
+        y: t.pos.y,
+        w: 36,
+        h: 36,
+        discovered: profile.discoveredTags.includes(t.key),
+      }));
+    }
+    return DECKS.map((d) => ({
+      key: d.key,
+      name: d.name,
+      desc: d.desc,
+      atlas: 'centers' as AtlasKey,
+      x: d.pos.x,
+      y: d.pos.y,
+      w: 44,
+      h: 59,
+      discovered: Boolean(profile.deckMaxStake[d.key]),
+    }));
+  }
+
+  private buildCollectionCatalogContent(profile: ProfileProgress): {
+    progressHtml: string;
+    itemsHtml: string;
+  } {
+    const allItems = this.getCollectionCatalogItems(profile);
+    const totalCount = allItems.length;
+    const discoveredCount = allItems.filter((it) => it.discovered).length;
+    const pct = totalCount > 0 ? Math.round((discoveredCount / totalCount) * 100) : 0;
+
+    const q = this.collectionSearch.trim().toLowerCase();
+    const filtered = allItems.filter((it) => {
+      if (this.collectionFilter === 'discovered' && !it.discovered) return false;
+      if (this.collectionFilter === 'undiscovered' && it.discovered) return false;
+      if (this.collectionTab === 'jokers' && this.collectionRarity > 0 && it.rarity !== this.collectionRarity) {
+        return false;
+      }
+      if (q && !it.name.toLowerCase().includes(q) && !it.desc.toLowerCase().includes(q)) {
+        return false;
+      }
+      return true;
+    });
+
+    const progressHtml = `
+      <div class="kc-coll-prog-meta">
+        <span>Discovered: <b class="kc-gold">${discoveredCount} / ${totalCount}</b> — <b>${pct}%</b></span>
+        <span class="kc-muted-sm">Showing ${filtered.length}</span>
+      </div>
+      <div class="kc-coll-prog-track">
+        <div class="kc-coll-prog-fill" style="width:${pct}%;"></div>
+      </div>
+    `;
+
+    const itemsHtml =
+      filtered.length === 0
+        ? `<div class="kc-empty-note" style="grid-column:1 / -1;">No matching entries found.</div>`
+        : filtered
+            .map(
+              (it) => `
+            <div class="kc-coll-item ${it.discovered ? 'seen' : ''}">
+              <canvas class="kc-mini-sprite" width="${it.w}" height="${it.h}" data-atlas="${it.atlas}" data-ax="${it.x}" data-ay="${it.y}"></canvas>
+              <div class="kc-coll-meta">
+                <div class="kc-coll-head">
+                  <span class="kc-coll-name">${esc(it.name)} ${it.discovered ? '<span class="kc-seen-dot">★</span>' : ''}</span>
+                  ${it.badgeLabel ? `<span class="kc-coll-pill" style="background:${it.badgeColor};">${esc(it.badgeLabel)}</span>` : ''}
+                </div>
+                <div class="kc-coll-desc">${formatRichDesc(it.desc, this.lastHighContrast)}</div>
+              </div>
+            </div>
+          `
+            )
+            .join('');
+
+    return { progressHtml, itemsHtml };
+  }
+
+  private buildRunHistoryHtml(profile: ProfileProgress): string {
+    const history = this.cb.getRunHistory();
+    const summaryStrip = `
+      <div class="kc-history-kpi-strip">
+        <span class="kc-suit-count-pill">Runs Played: <b class="kc-blue">${profile.runsPlayed}</b></span>
+        <span class="kc-suit-count-pill">Runs Won: <b style="color:#4bc292;">${profile.runsWon}</b></span>
+        <span class="kc-suit-count-pill">Best Hand: <b class="kc-gold">${fmtNum(profile.bestHandScore)}</b></span>
+      </div>
+    `;
+
+    if (history.length === 0) {
+      return `
+        <div class="kc-history-wrap">
+          ${summaryStrip}
+          <div class="kc-empty-note">No finished runs recorded yet. Finish a run to see your history &amp; replay favorite seeds!</div>
+        </div>
+      `;
+    }
+
+    const cardsHtml = history
+      .map((entry, idx) => {
+        const deckName = DECK_MAP[entry.deckId]?.name ?? entry.deckId;
+        const stakeName = STAKE_MAP[entry.stake]?.name ?? `Stake ${entry.stake}`;
+        const challengeName = entry.challengeId
+          ? (CHALLENGE_MAP[entry.challengeId]?.name ?? entry.challengeId)
+          : null;
+        const jokersHtml =
+          entry.jokerKeys.length > 0
+            ? `<div class="kc-hist-jokers">${entry.jokerKeys
+                .slice(0, 10)
+                .map((jk) => {
+                  const jd = JOKER_MAP[jk];
+                  return `<canvas class="kc-mini-sprite kc-hist-joker-cv" width="30" height="40" title="${esc(jd?.name ?? jk)}" data-atlas="Joker" data-ax="${jd?.pos.x ?? 0}" data-ay="${jd?.pos.y ?? 0}"></canvas>`;
+                })
+                .join('')}</div>`
+            : '';
+
+        return `
+          <div class="kc-hist-card ${entry.won ? 'win' : 'loss'}">
+            <div class="kc-hist-top">
+              <span class="kc-hist-badge ${entry.won ? 'win' : 'loss'}">${entry.won ? 'VICTORY' : 'DEFEAT'}</span>
+              <span class="kc-hist-deck">${esc(deckName)} • ${esc(challengeName ? challengeName : stakeName)}</span>
+              <span class="kc-hist-ante">Ante ${entry.ante} • R${entry.round}</span>
+            </div>
+            <div class="kc-hist-mid">
+              <span>Best Hand: <b class="kc-blue">${fmtNum(entry.bestHand)}</b></span>
+              ${!entry.won && entry.defeatedBy ? `<span>Defeated By: <b class="kc-red">${esc(entry.defeatedBy)}</b></span>` : ''}
+              <span class="kc-hist-seed-group">
+                Seed: <b class="kc-gold">${esc(entry.seed || 'N/A')}</b>
+                ${
+                  entry.seed
+                    ? `<button class="kc-mini-btn kc-btn-teal interactive" data-hist-play="${idx}">Play Seed</button>`
+                    : ''
+                }
+              </span>
+            </div>
+            ${jokersHtml}
+          </div>
+        `;
+      })
+      .join('');
+
+    return `
+      <div class="kc-history-wrap">
+        ${summaryStrip}
+        <div class="kc-history-list">${cardsHtml}</div>
+      </div>
+    `;
+  }
+
+  private buildCollectionModalHtml(): string {
+    const profile = this.cb.getProfile();
+    const historyCount = this.cb.getRunHistory().length;
+    const tabs: Array<[typeof this.collectionTab, string, number]> = [
+      ['jokers', 'Jokers', JOKERS.length],
+      ['tarots', 'Tarots', TAROTS.length],
+      ['planets', 'Planets', PLANETS.length],
+      ['spectrals', 'Spectrals', SPECTRALS.length],
+      ['vouchers', 'Vouchers', VOUCHERS.length],
+      ['boosters', 'Boosters', BOOSTERS.length],
+      ['blinds', 'Blinds', BLINDS.length],
+      ['tags', 'Tags', TAGS.length],
+      ['decks', 'Decks', DECKS.length],
+      ['history', 'History', historyCount],
+    ];
+
+    if (this.collectionTab === 'history') {
+      return `
+        <div class="kc-modal-card wide">
+          <div class="kc-modal-head">
+            <h2>Collection &amp; Run History</h2>
+            <button class="kc-btn kc-btn-red kc-btn-sm interactive" data-modal="close">Close</button>
+          </div>
+          <div class="kc-tab-row wrap">
+            ${tabs
+              .map(
+                ([id, lbl, cnt]) =>
+                  `<button class="kc-tab interactive ${this.collectionTab === id ? 'active' : ''}" data-coll-tab="${id}">${lbl} (${cnt})</button>`
+              )
+              .join('')}
+          </div>
+          <div class="kc-modal-scroll">${this.buildRunHistoryHtml(profile)}</div>
+        </div>
+      `;
+    }
+
+    const { progressHtml, itemsHtml } = this.buildCollectionCatalogContent(profile);
+    const rarityFiltersHtml =
+      this.collectionTab === 'jokers'
+        ? `
+          <div class="kc-coll-filter-group">
+            ${([
+              [0, 'All Rarities'],
+              [1, 'Common'],
+              [2, 'Uncommon'],
+              [3, 'Rare'],
+              [4, 'Legendary'],
+            ] as const)
+              .map(
+                ([r, lbl]) =>
+                  `<button class="kc-pill-btn kc-coll-fbtn interactive ${this.collectionRarity === r ? 'active' : ''}" data-coll-rarity="${r}">${lbl}</button>`
+              )
+              .join('')}
+          </div>
+        `
+        : '';
 
     return `
       <div class="kc-modal-card wide">
@@ -2011,7 +2771,24 @@ export class UiOverlay {
             )
             .join('')}
         </div>
-        <div class="kc-modal-scroll kc-coll-grid">${itemsHtml}</div>
+        <div class="kc-coll-toolbar">
+          <input id="kc-coll-search" class="kc-input kc-coll-search interactive" type="search" placeholder="Search name or effect..." value="${esc(this.collectionSearch)}" />
+          <div class="kc-coll-filter-group">
+            ${([
+              ['all', 'All'],
+              ['discovered', 'Discovered'],
+              ['undiscovered', 'Undiscovered'],
+            ] as const)
+              .map(
+                ([f, lbl]) =>
+                  `<button class="kc-pill-btn kc-coll-fbtn interactive ${this.collectionFilter === f ? 'active' : ''}" data-coll-filter="${f}">${lbl}</button>`
+              )
+              .join('')}
+          </div>
+          ${rarityFiltersHtml}
+        </div>
+        <div id="kc-coll-progress" class="kc-coll-progress">${progressHtml}</div>
+        <div id="kc-coll-grid" class="kc-modal-scroll kc-coll-grid">${itemsHtml}</div>
       </div>
     `;
   }
@@ -2214,14 +2991,50 @@ export class UiOverlay {
       });
     });
 
-    // Run Info & Collection tabs
+    // Run Info & Collection tabs, search, filters & Run History replay
     onClick('[data-ri-tab]', (el) => {
       this.runInfoTab = el.dataset.riTab as typeof this.runInfoTab;
       this.invalidateModal();
     });
+    onClick('[data-copy-seed]', (el) => {
+      const seed = el.dataset.copySeed || _state.rng.seed;
+      void copyTextToClipboard(seed).then((ok) => {
+        this.showToast(ok ? `Copied seed: ${seed}` : `Seed: ${seed}`, 2000);
+      });
+    });
     onClick('[data-coll-tab]', (el) => {
       this.collectionTab = el.dataset.collTab as typeof this.collectionTab;
       this.invalidateModal();
+    });
+    onClick('[data-coll-filter]', (el) => {
+      this.collectionFilter = el.dataset.collFilter as typeof this.collectionFilter;
+      this.invalidateModal();
+    });
+    onClick('[data-coll-rarity]', (el) => {
+      this.collectionRarity = (Number(el.dataset.collRarity) || 0) as typeof this.collectionRarity;
+      this.invalidateModal();
+    });
+    const collSearch = this.modalLayer.querySelector<HTMLInputElement>('#kc-coll-search');
+    collSearch?.addEventListener('input', () => {
+      this.collectionSearch = collSearch.value;
+      const grid = this.modalLayer.querySelector<HTMLElement>('#kc-coll-grid');
+      const prog = this.modalLayer.querySelector<HTMLElement>('#kc-coll-progress');
+      if (grid && prog) {
+        const { progressHtml, itemsHtml } = this.buildCollectionCatalogContent(this.cb.getProfile());
+        prog.innerHTML = progressHtml;
+        grid.innerHTML = itemsHtml;
+        grid.querySelectorAll<HTMLCanvasElement>('.kc-mini-sprite').forEach((c) => {
+          const atlas = c.dataset.atlas as AtlasKey;
+          this.drawAtlasCellToCanvas(c, atlas, Number(c.dataset.ax ?? 0), Number(c.dataset.ay ?? 0));
+        });
+      }
+    });
+    onClick('[data-hist-play]', (el) => {
+      const idx = Number(el.dataset.histPlay);
+      const entry = this.cb.getRunHistory()[idx];
+      if (entry && entry.seed) {
+        this.cb.onReplaySeed(entry.deckId, entry.stake, entry.seed, entry.challengeId);
+      }
     });
 
     // Options events
@@ -2289,7 +3102,13 @@ export class UiOverlay {
   // Iconic Rich Viewport-Clamped Card Tooltip
   // =========================================================================
 
-  private renderTooltip(card: VisualCard | null, x: number, y: number, state: SimState): void {
+  private renderTooltip(
+    card: VisualCard | null,
+    x: number,
+    y: number,
+    state: SimState,
+    pinned = false
+  ): void {
     if (!card || this.activeModal || card.kind === 'title_showcase' || card.kind === 'deck_pile') {
       if (!this.hoveredTagKey) this.tooltipEl.classList.add('hidden');
       return;
@@ -2306,35 +3125,64 @@ export class UiOverlay {
         (b) => `<span class="kc-tt-badge" style="background:${b.color};">${esc(b.label)}</span>`
       )
       .join('');
+    const liveHtml = info.livePreview
+      ? `
+        <div class="kc-tt-live ${info.livePreview.ok ? 'ready' : 'blocked'}">
+          <div class="kc-tt-live-head">${esc(info.livePreview.headline)}</div>
+          <div class="kc-tt-live-detail">${esc(info.livePreview.detail)}</div>
+        </div>
+      `
+      : '';
 
+    this.tooltipEl.classList.toggle('pinned', pinned);
     this.tooltipEl.innerHTML = `
       <div class="kc-tt-title">${esc(info.title)}</div>
       <div class="kc-tt-desc">${formatRichDesc(info.desc, this.lastHighContrast)}</div>
+      ${liveHtml}
       ${badgesHtml ? `<div class="kc-tt-badges">${badgesHtml}</div>` : ''}
     `;
     this.tooltipEl.classList.remove('hidden');
 
     const tw = this.tooltipEl.offsetWidth || 248;
     const th = this.tooltipEl.offsetHeight || 116;
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
+    const vw = this.lastViewportW || window.innerWidth;
+    const vh = this.lastViewportH || window.innerHeight;
+    const isDesktop = this.lastMode === 'desktop';
 
     let tx = card.moveable.vx - tw * 0.5;
     let ty: number;
-    if (card.kind === 'hand' || card.kind === 'play' || card.kind === 'pack_card') {
-      ty = card.moveable.vy - card.moveable.vh * 0.54 - th - 12;
-      if (ty < 12) ty = card.moveable.vy + card.moveable.vh * 0.54 + 12;
-    } else if (card.kind === 'joker' || card.kind === 'consumable') {
-      ty = card.moveable.vy + card.moveable.vh * 0.54 + 14;
-    } else {
+
+    if (
+      isDesktop &&
+      !pinned &&
+      (card.kind === 'shop_offer' || card.kind === 'shop_voucher' || card.kind === 'shop_booster')
+    ) {
       tx = card.moveable.vx + card.moveable.vw * 0.56;
-      if (tx + tw + 12 > vw) {
+      if (tx + tw + 8 > vw) {
         tx = card.moveable.vx - card.moveable.vw * 0.56 - tw;
       }
       ty = card.moveable.vy - th * 0.5;
+    } else if (card.moveable.vy > vh * 0.52) {
+      // Lower half -> anchor cleanly above card
+      ty = card.moveable.vy - card.moveable.vh * 0.54 - th - 12;
+      if (ty < 8) {
+        ty = card.moveable.vy + card.moveable.vh * 0.54 + 14;
+      }
+    } else {
+      // Upper half -> anchor cleanly below card (leave clearance for contextual SELL/USE pill if owned)
+      const ownedExtra =
+        (card.kind === 'joker' || card.kind === 'consumable') &&
+        this.selectedOwnedId === card.id
+          ? 36
+          : 0;
+      ty = card.moveable.vy + card.moveable.vh * 0.54 + 14 + ownedExtra;
+      if (ty + th + 8 > vh) {
+        ty = card.moveable.vy - card.moveable.vh * 0.54 - th - 12;
+      }
     }
-    tx = Math.max(12, Math.min(vw - tw - 12, tx));
-    ty = Math.max(12, Math.min(vh - th - 12, ty));
+
+    tx = Math.max(8, Math.min(Math.max(8, vw - tw - 8), tx));
+    ty = Math.max(8, Math.min(Math.max(8, vh - th - 8), ty));
 
     this.tooltipEl.style.left = `${Math.round(tx)}px`;
     this.tooltipEl.style.top = `${Math.round(ty)}px`;
@@ -2592,9 +3440,32 @@ export class UiOverlay {
       }
       .kc-round-score-box {
         display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .kc-round-score-top {
+        display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 8px;
+        width: 100%;
+      }
+      .kc-round-progress-track {
+        width: 100%;
+        height: 6px;
+        background: #111719;
+        border: 2px solid #161d20;
+        border-radius: 99px;
+        overflow: hidden;
+      }
+      .kc-round-progress-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #009dff, #4ce6ff);
+        transition: width 0.2s ease-out, background 0.2s ease-out;
+      }
+      .kc-round-progress-fill.met {
+        background: linear-gradient(90deg, #4bc292, #f3b958);
+        box-shadow: 0 0 8px rgba(243, 185, 88, 0.55);
       }
       .kc-round-lbl {
         font-size: 15px;
@@ -3728,9 +4599,10 @@ export class UiOverlay {
       /* Toast */
       .kc-toast {
         position: fixed;
-        bottom: 16px;
-        right: 18px;
+        bottom: max(16px, env(safe-area-inset-bottom, 0px));
+        right: max(18px, env(safe-area-inset-right, 0px));
         z-index: 95;
+        max-width: calc(100vw - 24px);
         background: var(--kc-slate-md);
         border: 3px solid #f3b958;
         border-radius: 10px;
@@ -3740,19 +4612,1119 @@ export class UiOverlay {
         text-shadow: 0 2px 0 #101618;
         box-shadow: 0 5px 0 var(--kc-border);
       }
+
+      /* =================================================================== */
+      /* Wave 2 Enhancements: Speed Button, Boss Banners/Warnings, FF Badge, */
+      /* 3-Mode Responsive HUDs, Touch Arenas, Deck Matrix & Run History     */
+      /* =================================================================== */
+      .kc-rail-buttons .kc-speed-btn {
+        flex: 0.72;
+        font-size: 15px;
+        padding: 6px 4px;
+      }
+
+      /* Live Boss Warning Pill */
+      .kc-boss-warn-wrap {
+        position: absolute;
+        display: flex;
+        justify-content: center;
+        pointer-events: none;
+        z-index: 34;
+        padding: 0 6px;
+      }
+      .kc-boss-warning-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        max-width: 100%;
+        padding: 5px 12px;
+        border-radius: 9px;
+        border: 2px solid #fe5f55;
+        background: rgba(34, 15, 17, 0.94);
+        font-size: 14px;
+        color: #ffffff;
+        box-shadow: 0 4px 0 rgba(0, 0, 0, 0.65);
+        text-shadow: 0 1px 0 #0f1416;
+        line-height: 1.15;
+      }
+      .kc-boss-warning-pill.sev-block {
+        border-color: #fe5f55;
+        background: rgba(74, 18, 22, 0.96);
+      }
+      .kc-boss-warning-pill.sev-warn {
+        border-color: #fda200;
+        background: rgba(62, 38, 14, 0.95);
+      }
+      .kc-boss-warning-pill.sev-info {
+        border-color: #58a8e8;
+        background: rgba(20, 42, 60, 0.94);
+      }
+      .kc-bw-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
+        border-radius: 5px;
+        font-size: 12px;
+        flex-shrink: 0;
+      }
+      .kc-boss-warning-pill.sev-block .kc-bw-icon { background: #fe5f55; color: #ffffff; }
+      .kc-boss-warning-pill.sev-warn .kc-bw-icon { background: #fda200; color: #161d20; }
+      .kc-boss-warning-pill.sev-info .kc-bw-icon { background: #009dff; color: #ffffff; }
+      .kc-bw-boss { color: #f3b958; flex-shrink: 0; }
+      .kc-bw-msg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+      /* Boss Intro Banner (non-blocking dramatic callout) */
+      .kc-boss-banner {
+        position: fixed;
+        left: 50%;
+        top: 22%;
+        transform: translateX(-50%);
+        z-index: 88;
+        pointer-events: none;
+        max-width: min(460px, calc(100vw - 24px));
+        background: rgba(20, 24, 28, 0.96);
+        border: 3px solid var(--boss-col, #fe5f55);
+        border-radius: 13px;
+        padding: 11px 20px 13px;
+        text-align: center;
+        box-shadow: 0 8px 0 #101416, 0 0 28px rgba(0, 0, 0, 0.65);
+      }
+      .kc-boss-banner.animate-in {
+        animation: kc-boss-banner-pop 2.6s ease-out forwards;
+      }
+      @keyframes kc-boss-banner-pop {
+        0% { opacity: 0; transform: translate(-50%, -16px) scale(0.92); }
+        12% { opacity: 1; transform: translate(-50%, 0) scale(1.03); }
+        20% { opacity: 1; transform: translate(-50%, 0) scale(1); }
+        82% { opacity: 1; transform: translate(-50%, 0) scale(1); }
+        100% { opacity: 0; transform: translate(-50%, -8px) scale(0.98); }
+      }
+      .kc-reduced-motion .kc-boss-banner.animate-in {
+        animation: none !important;
+        opacity: 1;
+      }
+      .kc-boss-banner-tag {
+        display: inline-block;
+        background: var(--boss-col, #fe5f55);
+        color: #ffffff;
+        font-size: 12px;
+        padding: 2px 8px;
+        border-radius: 5px;
+        letter-spacing: 0.08em;
+        margin-bottom: 4px;
+      }
+      .kc-boss-banner-name {
+        font-size: 28px;
+        color: #ffffff;
+        text-shadow: 0 3px 0 #0e1214;
+        line-height: 1.1;
+      }
+      .kc-boss-banner-desc {
+        font-size: 15px;
+        color: #f5ebd6;
+        margin-top: 4px;
+        line-height: 1.25;
+      }
+
+      /* Fast-Forward Scoring Indicator */
+      .kc-ff-badge {
+        position: fixed;
+        transform: translateX(-100%);
+        z-index: 52;
+        pointer-events: none;
+        background: rgba(20, 28, 34, 0.94);
+        border: 2px solid #f3b958;
+        border-radius: 8px;
+        padding: 3px 10px;
+        font-size: 15px;
+        color: #f3b958;
+        text-shadow: 0 2px 0 #101416;
+        box-shadow: 0 3px 0 #101416;
+      }
+
+      /* Staggered Cashout Receipt Animation */
+      .kc-cashout-panel {
+        display: flex;
+        flex-direction: column;
+      }
+      .kc-cashout-rows {
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+        touch-action: pan-y;
+        min-height: 0;
+      }
+      .kc-cash-row {
+        opacity: 0;
+        animation: kc-cash-row-in 0.24s ease-out forwards;
+        animation-delay: calc(var(--row-i, 0) * 65ms);
+      }
+      @keyframes kc-cash-row-in {
+        0% { opacity: 0; transform: translateX(-10px); }
+        100% { opacity: 1; transform: translateX(0); }
+      }
+      .kc-reduced-motion .kc-cash-row {
+        animation: none !important;
+        opacity: 1 !important;
+        transform: none !important;
+      }
+      .kc-cashout-panel.compact {
+        padding: 10px 12px 12px;
+      }
+      .kc-cashout-panel.compact .kc-cashout-header { font-size: 20px; margin-bottom: 6px; }
+      .kc-cashout-panel.compact .kc-cashout-btn { font-size: 19px; padding: 9px 12px; margin-bottom: 8px; }
+      .kc-cashout-panel.compact .kc-cashout-rows { padding: 8px 10px; gap: 6px; }
+      .kc-cashout-panel.compact .kc-cash-row { font-size: 14px; }
+      .kc-cashout-panel.compact .kc-cash-val { font-size: 16px; }
+
+      /* =================================================================== */
+      /* Mobile Landscape Left Rail (Fits strictly inside 348px-412px H)     */
+      /* =================================================================== */
+      .kc-rail.landscape {
+        padding: 4px 5px;
+        gap: 4px;
+        border-width: 2px;
+        border-radius: 9px;
+        overflow: hidden;
+      }
+      .kc-rail.landscape .kc-blind-header { border-width: 2px; border-radius: 7px; }
+      .kc-rail.landscape .kc-blind-title-bar {
+        font-size: 13px;
+        padding: 2px 4px;
+        border-bottom-width: 2px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .kc-rail.landscape .kc-blind-body { padding: 3px 5px; gap: 5px; }
+      .kc-rail.landscape .kc-blind-chip-canvas { width: 32px; height: 32px; flex: 0 0 32px; }
+      .kc-rail.landscape .kc-target-score { font-size: 15px; gap: 3px; margin: 0; }
+      .kc-rail.landscape .kc-score-chip-canvas { width: 14px; height: 14px; }
+      .kc-rail.landscape .kc-blind-reward { font-size: 11px; }
+      .kc-rail.landscape .kc-blind-desc {
+        font-size: 10px;
+        padding: 2px 4px;
+        line-height: 1.15;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .kc-rail.landscape .kc-rail-shop-marquee { padding: 4px 5px; border-width: 2px; border-radius: 7px; }
+      .kc-rail.landscape .kc-rail-shop-sign { max-width: 92px; max-height: 44px; margin-bottom: 1px; }
+      .kc-rail.landscape .kc-rail-shop-sub { font-size: 11px; }
+      .kc-rail.landscape .kc-inset-box { padding: 4px 6px; border-width: 2px; border-radius: 7px; }
+      .kc-rail.landscape .kc-round-score-box { gap: 3px; }
+      .kc-rail.landscape .kc-round-lbl { font-size: 11px; }
+      .kc-rail.landscape .kc-round-score-val { font-size: 16px; gap: 4px; }
+      .kc-rail.landscape .kc-round-progress-track { height: 4px; border-width: 1px; }
+      .kc-rail.landscape .kc-hand-box { padding: 4px 5px 5px; border-width: 2px; border-radius: 8px; }
+      .kc-rail.landscape .kc-hand-header { min-height: 16px; margin-bottom: 3px; gap: 4px; }
+      .kc-rail.landscape .kc-hand-name { font-size: 13px; }
+      .kc-rail.landscape .kc-hand-placeholder { font-size: 12px; }
+      .kc-rail.landscape .kc-lvl-badge { font-size: 10px; padding: 1px 4px; border-width: 1px; }
+      .kc-rail.landscape .kc-score-math { gap: 3px; }
+      .kc-rail.landscape .kc-math-pill {
+        font-size: 16px;
+        padding: 4px 2px;
+        border-width: 2px;
+        border-radius: 6px;
+        box-shadow: 0 2px 0 rgba(0, 0, 0, 0.45);
+      }
+      .kc-rail.landscape .kc-math-x { font-size: 14px; }
+      .kc-rail.landscape .kc-rail-mid-grid { min-height: 0; gap: 4px; grid-template-columns: 0.72fr 1.28fr; }
+      .kc-rail.landscape .kc-rail-buttons { gap: 4px; }
+      .kc-rail.landscape .kc-rail-buttons .kc-btn {
+        font-size: 11px;
+        padding: 3px 3px;
+        border-width: 2px;
+        border-radius: 6px;
+        min-height: 0;
+        box-shadow: 0 2px 0 var(--btn-shadow, #141a1c), 0 2px 0 1px var(--kc-border);
+      }
+      .kc-rail.landscape .kc-rail-stats { gap: 3px; }
+      .kc-rail.landscape .kc-stat-pair { gap: 3px; }
+      .kc-rail.landscape .kc-stat-card { padding: 2px 2px; border-width: 2px; border-radius: 6px; }
+      .kc-rail.landscape .kc-stat-lbl { font-size: 9px; margin-bottom: 0; }
+      .kc-rail.landscape .kc-stat-val { font-size: 15px; }
+      .kc-rail.landscape .kc-ante-max { font-size: 10px; }
+      .kc-rail.landscape .kc-money-bar { font-size: 16px; padding: 2px 3px; border-width: 2px; border-radius: 6px; }
+      .kc-rail.landscape .kc-rail-tags { padding: 2px 3px; gap: 3px; flex-wrap: nowrap; overflow-x: auto; }
+      .kc-rail.landscape .kc-rail-tag-canvas { width: 20px; height: 20px; }
+
+      /* =================================================================== */
+      /* Mobile Portrait Top HUD Dock (.kc-hud-portrait)                     */
+      /* =================================================================== */
+      .kc-hud-portrait {
+        position: absolute;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        gap: 4px;
+        padding: 5px 7px;
+        background: var(--kc-slate-md);
+        border: 2px solid var(--kc-border);
+        border-top: 4px solid var(--blind-col, #2e659e);
+        border-radius: 10px;
+        box-shadow:
+          0 4px 0 var(--kc-border),
+          inset 0 2px 0 rgba(255, 255, 255, 0.1);
+        pointer-events: auto;
+        overflow: hidden;
+      }
+      .kc-hud-portrait.flaming {
+        background: linear-gradient(
+          180deg,
+          var(--kc-slate-md) 0%,
+          var(--kc-slate-md) 42%,
+          rgba(28, 35, 38, 0.24) 100%
+        );
+      }
+      .kc-port-row-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        min-height: 0;
+      }
+      .kc-port-blind-block {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex: 1;
+        min-width: 0;
+      }
+      .kc-port-blind-chip { width: 32px; height: 32px; flex: 0 0 32px; }
+      .kc-port-shop-badge {
+        background: #231920;
+        border: 2px solid #fe5f55;
+        color: #f3b958;
+        border-radius: 7px;
+        padding: 4px 6px;
+        font-size: 13px;
+        flex-shrink: 0;
+      }
+      .kc-port-blind-info {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .kc-port-blind-name {
+        font-size: 13px;
+        line-height: 1.05;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-shadow: 0 1px 0 #0f1416;
+      }
+      .kc-port-score-line {
+        display: flex;
+        align-items: center;
+        gap: 3px;
+        font-size: 13px;
+        line-height: 1;
+      }
+      .kc-port-chip-ic { width: 13px; height: 13px; }
+      .kc-port-score-now { color: #ffffff; }
+      .kc-port-score-sep { color: #7c8e94; font-size: 11px; }
+      .kc-port-score-tgt { color: #fe5f55; }
+      .kc-round-progress-track.port { height: 4px; border-width: 1px; }
+      .kc-port-money {
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 7px;
+        padding: 3px 7px;
+        font-size: 16px;
+        color: #f3b958;
+        text-shadow: 0 2px 0 #0e1315;
+        flex-shrink: 0;
+      }
+      .kc-port-btns { display: flex; gap: 4px; flex-shrink: 0; }
+      .kc-port-btn {
+        font-size: 12px;
+        padding: 5px 7px;
+        min-height: 30px;
+        border-width: 2px;
+        border-radius: 7px;
+        box-shadow: 0 2px 0 var(--btn-shadow, #141a1c), 0 2px 0 1px var(--kc-border);
+      }
+      .kc-port-row-bot {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        min-height: 0;
+        flex: 1;
+      }
+      .kc-port-hand-stage {
+        flex: 1.25;
+        min-width: 0;
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 8px;
+        padding: 3px 5px;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .kc-port-hand-stage.flaming {
+        background: rgba(20, 26, 30, 0.22);
+        border-color: #fda200;
+      }
+      .kc-port-hand-meta {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 5px;
+        min-width: 0;
+      }
+      .kc-port-hand-name {
+        font-size: 12px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        color: #ffffff;
+      }
+      .kc-port-lvl { font-size: 10px; padding: 0 4px; border-width: 1px; }
+      .kc-port-math {
+        display: grid;
+        grid-template-columns: 1fr auto 1fr;
+        align-items: center;
+        gap: 4px;
+      }
+      .kc-port-pill {
+        font-size: 16px;
+        padding: 3px 3px;
+        border-width: 2px;
+        border-radius: 6px;
+        box-shadow: 0 2px 0 rgba(0, 0, 0, 0.5);
+      }
+      .kc-port-x { font-size: 15px; }
+      .kc-port-stats {
+        display: grid;
+        grid-template-columns: repeat(2, auto);
+        gap: 3px 4px;
+        align-items: center;
+        flex-shrink: 0;
+      }
+      .kc-port-stats.has-tags {
+        grid-template-columns: repeat(4, auto);
+        gap: 2px 3px;
+      }
+      .kc-port-stats.has-tags .kc-port-stat {
+        padding: 1px 4px;
+        font-size: 11px;
+        gap: 2px;
+      }
+      .kc-port-stat {
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 6px;
+        padding: 2px 6px;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 12px;
+        line-height: 1.1;
+      }
+      .kc-port-stat .lbl { color: #9db0b5; font-size: 10px; }
+      .kc-port-tags {
+        grid-column: 1 / -1;
+        display: flex;
+        gap: 3px;
+        justify-content: center;
+      }
+      .kc-port-tag-cv { width: 18px; height: 18px; }
+
+      /* =================================================================== */
+      /* Mobile Action Bars, Deck Badge, Title Screen, Blind Select & Shop   */
+      /* =================================================================== */
+      .kc-mode-mobile-portrait .kc-tray-counter,
+      .kc-mode-mobile-landscape .kc-tray-counter {
+        bottom: -16px;
+        font-size: 11px;
+      }
+      .kc-deck-badge.compact {
+        font-size: 12px;
+        padding: 2px 4px;
+        border-width: 2px;
+        border-radius: 6px;
+        box-shadow: 0 2px 0 var(--kc-border);
+      }
+      .kc-action-bar.mobile {
+        gap: 6px;
+        padding: 0;
+        align-items: stretch;
+      }
+      .kc-action-bar.mobile .kc-btn {
+        padding: 6px 8px;
+        border-width: 2px;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 40px;
+        box-shadow: 0 3px 0 var(--btn-shadow, #141a1c), 0 3px 0 1px var(--kc-border), inset 0 2px 0 rgba(255, 255, 255, 0.24);
+      }
+      .kc-action-bar.mobile.portrait .kc-btn { min-height: 44px; }
+      .kc-mob-act-primary { flex: 1.35; font-size: 17px; }
+      .kc-mob-act-sort { flex: 0.72; font-size: 13px; }
+      .kc-mob-act-clear { flex: 0.78; font-size: 13px; }
+      .kc-mob-act-sort.active {
+        box-shadow: 0 0 0 2px #ffffff, 0 3px 0 var(--btn-shadow, #141a1c) !important;
+      }
+
+      /* Mobile Title Screen Modes */
+      .kc-title-screen.landscape {
+        padding-left: 16px;
+        padding-right: 16px;
+      }
+      .kc-title-screen.landscape .kc-title-pack-pill {
+        top: max(6px, env(safe-area-inset-top, 0px));
+        right: max(8px, env(safe-area-inset-right, 0px));
+        padding: 3px 6px;
+        gap: 4px;
+        border-width: 2px;
+      }
+      .kc-title-screen.landscape .kc-pill-mini { font-size: 11px; padding: 2px 6px; }
+      .kc-title-screen.landscape .kc-logo-stage { margin-top: 2px; }
+      .kc-title-screen.landscape .kc-title-letter { font-size: clamp(32px, 5.2vw, 48px); }
+      .kc-title-screen.landscape .kc-title-dock { padding: 8px 12px 10px; border-width: 3px; }
+      .kc-title-screen.landscape .kc-title-main-btns { gap: 8px; }
+      .kc-title-screen.landscape .kc-title-btn { min-width: 108px; font-size: 16px; padding: 8px 14px; }
+
+      .kc-title-screen.portrait {
+        padding-left: 12px;
+        padding-right: 12px;
+        justify-content: space-between;
+      }
+      .kc-title-screen.portrait .kc-title-pack-pill {
+        position: static;
+        align-self: center;
+        flex-wrap: wrap;
+        justify-content: center;
+        padding: 4px 8px;
+        gap: 5px;
+        border-width: 2px;
+      }
+      .kc-title-screen.portrait .kc-pill-mini { font-size: 12px; padding: 3px 7px; }
+      .kc-title-screen.portrait .kc-logo-stage { margin-top: 4px; margin-bottom: auto; }
+      .kc-dyna-logo.stacked {
+        flex-direction: column;
+        align-items: center;
+        gap: 4px;
+      }
+      .kc-title-screen.portrait .kc-title-letter { font-size: clamp(40px, 12vw, 62px); }
+      .kc-title-screen.portrait .kc-title-dock {
+        width: min(360px, calc(100vw - 24px));
+        padding: 10px 12px 12px;
+        border-width: 3px;
+      }
+      .kc-title-main-btns.grid-2x2 {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      .kc-title-main-btns.grid-2x2 .kc-title-btn {
+        min-width: 0;
+        width: 100%;
+        font-size: 18px;
+        padding: 11px 10px;
+        min-height: 46px;
+      }
+
+      /* Blind Select Landscape & Portrait Modes */
+      .kc-blind-arena.landscape {
+        gap: 8px;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+        touch-action: pan-y;
+      }
+      .kc-blind-arena.landscape .kc-blind-col {
+        padding: 6px;
+        gap: 5px;
+        border-width: 2px;
+        border-top-width: 4px;
+        border-radius: 9px;
+      }
+      .kc-blind-arena.landscape .kc-blind-col.active { transform: none; }
+      .kc-blind-arena.landscape .kc-blind-col-top .kc-btn { font-size: 14px; padding: 5px 6px; }
+      .kc-blind-arena.landscape .kc-blind-status-pill { font-size: 12px; padding: 4px 5px; }
+      .kc-blind-arena.landscape .kc-blind-col-banner { font-size: 14px; padding: 3px 5px; border-width: 2px; }
+      .kc-blind-arena.landscape .kc-blind-col-body { padding: 5px; border-width: 2px; }
+      .kc-blind-arena.landscape .kc-blind-col-chip { width: 42px; height: 42px; margin-bottom: 2px; }
+      .kc-blind-arena.landscape .kc-target-score.lg { font-size: 18px; margin: 2px 0; }
+      .kc-blind-arena.landscape .kc-blind-reward { font-size: 12px; }
+      .kc-blind-arena.landscape .kc-blind-col-desc { font-size: 10px; padding: 3px 4px; margin-top: 3px; }
+      .kc-blind-arena.landscape .kc-skip-box { padding: 5px; gap: 4px; border-width: 2px; }
+      .kc-blind-arena.landscape .kc-tag-canvas { width: 26px; height: 26px; }
+      .kc-blind-arena.landscape .kc-skip-tag-name { font-size: 12px; }
+      .kc-blind-arena.landscape .kc-skip-tag-desc { font-size: 10px; }
+
+      .kc-blind-arena.portrait {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+        touch-action: pan-y;
+        padding: 2px 2px 10px;
+      }
+      .kc-blind-col.portrait {
+        padding: 8px 10px;
+        gap: 7px;
+        flex-shrink: 0;
+      }
+      .kc-blind-col.portrait.active { transform: none; }
+      .kc-port-blind-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 5px 10px;
+        border-radius: 8px;
+        border: 2px solid var(--kc-border);
+        text-shadow: 0 2px 0 rgba(0, 0, 0, 0.55);
+      }
+      .kc-port-blind-title { font-size: 18px; }
+      .kc-port-blind-status {
+        font-size: 12px;
+        background: rgba(0, 0, 0, 0.34);
+        padding: 2px 7px;
+        border-radius: 5px;
+      }
+      .kc-port-blind-mid {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 8px;
+        padding: 8px 10px;
+      }
+      .kc-port-blind-mid .kc-blind-col-chip { width: 48px; height: 48px; margin: 0; flex-shrink: 0; }
+      .kc-port-blind-stats { flex: 1; min-width: 0; text-align: left; }
+      .kc-port-blind-stats .kc-target-score { font-size: 20px; }
+      .kc-port-blind-desc { font-size: 12px; color: #f5ebd6; margin-top: 3px; line-height: 1.24; }
+      .kc-port-skip-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 8px;
+        padding: 6px 8px;
+      }
+      .kc-port-skip-row .kc-tag-canvas { width: 30px; height: 30px; }
+      .kc-port-blind-actions {
+        display: flex;
+        gap: 8px;
+      }
+      .kc-port-blind-actions .kc-btn {
+        flex: 1;
+        min-height: 40px;
+        font-size: 16px;
+        padding: 8px 10px;
+      }
+
+      /* Mobile Shop Controls, Price Tags & Compact Card Buttons */
+      .kc-shop-controls.portrait {
+        flex-direction: row;
+        gap: 8px;
+        padding: 5px 6px;
+        border-width: 2px;
+        border-radius: 9px;
+      }
+      .kc-shop-controls.portrait .kc-shop-btn {
+        flex-direction: row;
+        gap: 6px;
+        font-size: 16px;
+        padding: 6px 8px;
+        min-height: 36px;
+      }
+      .kc-shop-controls.portrait .kc-reroll-cost { font-size: 16px; margin-top: 0; }
+      .kc-shop-controls.landscape {
+        padding: 5px;
+        gap: 6px;
+        border-width: 2px;
+      }
+      .kc-shop-controls.landscape .kc-shop-btn { font-size: 14px; padding: 5px 4px; }
+      .kc-shop-controls.landscape .kc-reroll-cost { font-size: 15px; }
+
+      .kc-pocket-stamp.inside {
+        bottom: 2px;
+        left: auto;
+        right: 6px;
+        font-size: 10px;
+        opacity: 0.74;
+        letter-spacing: 0.04em;
+      }
+      .kc-price-tag.compact {
+        font-size: 12px;
+        padding: 0 6px 1px;
+        border-width: 2px;
+        border-radius: 6px;
+        box-shadow: 0 2px 0 var(--kc-border);
+      }
+      .kc-card-actions.compact { gap: 3px; }
+      .kc-card-actions.compact .kc-mini-btn {
+        font-size: 11px;
+        padding: 3px 6px;
+        border-radius: 6px;
+        min-height: 24px;
+      }
+      .kc-pack-banner.compact {
+        padding: 4px 8px;
+        border-width: 2px;
+      }
+      .kc-pack-banner.compact .kc-pack-title { font-size: 14px; margin-right: 8px; }
+      .kc-pack-banner.compact .kc-pack-sub { font-size: 12px; }
+      .kc-pack-banner-text {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      /* =================================================================== */
+      /* Rich Tooltip Live Preview Callout                                   */
+      /* =================================================================== */
+      .kc-tooltip {
+        max-width: min(264px, calc(100vw - 16px));
+      }
+      .kc-tooltip.pinned {
+        box-shadow:
+          inset 0 0 0 2px #f3b958,
+          0 8px 0 rgba(0, 0, 0, 0.62);
+      }
+      .kc-tt-live {
+        margin-top: 6px;
+        padding: 5px 8px;
+        border-radius: 7px;
+        border: 2px solid var(--kc-border);
+        text-align: center;
+      }
+      .kc-tt-live.ready {
+        background: #1a332b;
+        border-color: #4bc292;
+      }
+      .kc-tt-live.blocked {
+        background: #361f22;
+        border-color: #fe5f55;
+      }
+      .kc-tt-live-head {
+        font-size: 14px;
+        color: #ffffff;
+        text-shadow: 0 1px 0 #101416;
+      }
+      .kc-tt-live-detail {
+        font-size: 12px;
+        color: #d6e4e8;
+        line-height: 1.24;
+        margin-top: 2px;
+      }
+
+      /* =================================================================== */
+      /* Tactical Modals: Run Info Header, Poker Hands, Deck Matrix,         */
+      /* Collection Search/Filters/Progress, Run History & End Modal Jokers  */
+      /* =================================================================== */
+      .kc-modal-card {
+        max-height: calc(100dvh - 16px);
+        overflow: hidden;
+      }
+      .kc-modal-head.wrap { flex-wrap: wrap; }
+      .kc-modal-scroll {
+        flex: 1;
+        min-height: 0;
+        max-height: none;
+        -webkit-overflow-scrolling: touch;
+        touch-action: pan-y;
+      }
+      .kc-ri-head-meta {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+        min-width: 0;
+        flex: 1;
+      }
+      .kc-ri-badges {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+      }
+      .kc-ri-badge {
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 6px;
+        padding: 2px 8px;
+        font-size: 13px;
+        color: #dce8eb;
+      }
+      .kc-ri-badge.stake { border-color: #fda200; color: #f3b958; }
+      .kc-ri-badge.seed b { color: #f3b958; }
+
+      /* Enhanced Poker Hands Table */
+      .kc-hand-row.previewed {
+        border-color: #f3b958;
+        background: #27363c;
+        box-shadow: inset 0 0 0 1px rgba(243, 185, 88, 0.35);
+      }
+      .kc-hr-name-col {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+      }
+      .kc-hr-name-line {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        flex-wrap: wrap;
+      }
+      .kc-hr-sel-tag {
+        font-size: 11px;
+        background: #f3b958;
+        color: #161d20;
+        padding: 1px 6px;
+        border-radius: 5px;
+      }
+      .kc-hr-sub {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        font-size: 12px;
+        color: #9fb3b8;
+      }
+      .kc-hr-upgrade { color: #72c4ff; }
+      .kc-hr-ex { color: #b9c9cd; }
+
+      /* Full 4x13 Deck Breakdown Matrix */
+      .kc-deck-kpi-strip {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 7px;
+        margin-bottom: 10px;
+        font-size: 14px;
+      }
+      .kc-deck-matrix-wrap {
+        width: 100%;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        touch-action: pan-x pan-y;
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 10px;
+        padding: 8px;
+      }
+      .kc-deck-matrix {
+        width: 100%;
+        min-width: 560px;
+        border-collapse: separate;
+        border-spacing: 3px;
+        text-align: center;
+      }
+      .kc-dm-corner {
+        font-size: 12px;
+        color: #9db0b5;
+        padding: 4px;
+      }
+      .kc-dm-th {
+        background: #171e21;
+        border: 1px solid #303e42;
+        border-radius: 5px;
+        padding: 3px 2px;
+      }
+      .kc-dm-rank { font-size: 13px; color: #ffffff; }
+      .kc-dm-rtot { font-size: 11px; color: #f3b958; }
+      .kc-dm-suit-cell {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 4px;
+        background: #171e21;
+        border: 1px solid #303e42;
+        border-radius: 6px;
+        padding: 5px 6px;
+        font-size: 13px;
+        white-space: nowrap;
+      }
+      .kc-dm-cell {
+        background: #232d31;
+        border: 1px solid #38494e;
+        border-radius: 6px;
+        padding: 4px 2px;
+        min-width: 34px;
+        vertical-align: middle;
+      }
+      .kc-dm-cell.depleted {
+        opacity: 0.42;
+        background: #192023;
+      }
+      .kc-dm-cell.empty {
+        opacity: 0.25;
+        background: #141a1d;
+      }
+      .kc-dm-cnt { font-size: 12px; color: #eaf4f7; line-height: 1.1; }
+      .kc-dm-pips {
+        display: flex;
+        justify-content: center;
+        gap: 2px;
+        margin-top: 2px;
+      }
+      .kc-dm-pip {
+        display: inline-block;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        border: 1px solid #101416;
+      }
+      .kc-dm-pip.enh { background: #4bc292; }
+      .kc-dm-pip.ed { background: #c56cf0; }
+      .kc-dm-pip.seal { background: #f3b958; }
+      .kc-dm-legend {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 12px;
+        margin-top: 8px;
+        font-size: 12px;
+        color: #b8c6c9;
+      }
+      .kc-dm-legend span { display: inline-flex; align-items: center; gap: 5px; }
+      .kc-dm-legend-note { margin-left: auto; color: #8fa3a8; }
+
+      /* Collection Search, Filters & Progress Bar */
+      .kc-coll-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+      }
+      .kc-coll-search {
+        min-width: 180px;
+        flex: 1 1 200px;
+      }
+      .kc-coll-filter-group {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+      .kc-coll-fbtn {
+        font-size: 12px;
+        padding: 4px 8px;
+      }
+      .kc-coll-progress {
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 8px;
+        padding: 6px 10px;
+      }
+      .kc-coll-prog-meta {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 13px;
+        margin-bottom: 4px;
+      }
+      .kc-coll-prog-track {
+        width: 100%;
+        height: 7px;
+        background: #12181a;
+        border: 1px solid #2b383d;
+        border-radius: 99px;
+        overflow: hidden;
+      }
+      .kc-coll-prog-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #4bc292, #f3b958);
+      }
+
+      /* Run History Tab */
+      .kc-history-kpi-strip {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+      .kc-history-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .kc-hist-card {
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-left: 5px solid #4bc292;
+        border-radius: 10px;
+        padding: 9px 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .kc-hist-card.loss { border-left-color: #fe5f55; }
+      .kc-hist-top {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        font-size: 15px;
+      }
+      .kc-hist-badge {
+        font-size: 12px;
+        padding: 2px 7px;
+        border-radius: 5px;
+        border: 1px solid var(--kc-border);
+        color: #ffffff;
+      }
+      .kc-hist-badge.win { background: #3aa87c; }
+      .kc-hist-badge.loss { background: #d6453c; }
+      .kc-hist-deck { color: #ffffff; flex: 1; min-width: 120px; }
+      .kc-hist-ante { color: #f3b958; }
+      .kc-hist-mid {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        font-size: 13px;
+        color: #c8d6d9;
+      }
+      .kc-hist-seed-group {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .kc-hist-jokers {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        padding-top: 4px;
+        border-top: 1px solid #2b363a;
+      }
+      .kc-hist-joker-cv {
+        background: #141a1d;
+        border: 1px solid #35444a;
+        border-radius: 4px;
+      }
+
+      /* End-of-Run Final Joker Strip & Seed Copy */
+      .kc-end-card {
+        max-height: calc(100dvh - 20px);
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+        touch-action: pan-y;
+      }
+      .kc-end-seed-row { align-items: center; }
+      .kc-seed-copy-group {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+      }
+      .kc-end-jokers {
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 10px;
+        padding: 8px 10px;
+      }
+      .kc-end-jokers-lbl {
+        font-size: 13px;
+        color: #b8c6c9;
+        margin-bottom: 6px;
+      }
+      .kc-end-jokers-row {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 6px;
+      }
+      .kc-end-joker-sprite {
+        background: #141a1d;
+        border: 2px solid #3a4a50;
+        border-radius: 5px;
+      }
+      .kc-end-btns { flex-wrap: wrap; }
+
+      /* =================================================================== */
+      /* Responsive Modal Stacking (Portrait & Short Landscape Viewports)    */
+      /* =================================================================== */
+      .kc-mode-mobile-portrait .kc-modal-backdrop,
+      .kc-mode-mobile-portrait .kc-end-overlay,
+      .kc-mode-mobile-landscape .kc-modal-backdrop,
+      .kc-mode-mobile-landscape .kc-end-overlay {
+        padding: 8px;
+      }
+      .kc-mode-mobile-portrait .kc-modal-card,
+      .kc-mode-mobile-landscape .kc-modal-card {
+        padding: 10px 12px;
+        gap: 8px;
+        width: calc(100vw - 16px);
+      }
+      .kc-mode-mobile-portrait .kc-modal-head h2,
+      .kc-mode-mobile-landscape .kc-modal-head h2 {
+        font-size: 19px;
+      }
+      .kc-mode-mobile-portrait .kc-newrun-grid,
+      .kc-mode-mobile-portrait .kc-options-grid,
+      .kc-mode-mobile-portrait .kc-coll-grid,
+      .kc-mode-mobile-portrait .kc-info-grid {
+        grid-template-columns: 1fr;
+      }
+      .kc-mode-mobile-portrait .kc-deck-list {
+        grid-template-columns: repeat(3, 1fr);
+        max-height: 200px;
+      }
+      .kc-mode-mobile-portrait .kc-hand-row {
+        grid-template-columns: 52px 1fr auto;
+        gap: 6px;
+        padding: 6px 8px;
+        font-size: 14px;
+      }
+      .kc-mode-mobile-portrait .kc-hr-played {
+        grid-column: 1 / -1;
+        text-align: left;
+        font-size: 12px;
+      }
+      .kc-mode-mobile-portrait .kc-tab,
+      .kc-mode-mobile-landscape .kc-tab {
+        padding: 4px 8px;
+        font-size: 13px;
+      }
+      .kc-mode-mobile-landscape .kc-newrun-grid,
+      .kc-mode-mobile-landscape .kc-options-grid {
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      .kc-mode-mobile-landscape .kc-deck-list {
+        max-height: 150px;
+      }
+      @media (max-width: 760px) {
+        .kc-newrun-grid,
+        .kc-options-grid {
+          grid-template-columns: 1fr;
+        }
+      }
     `;
     document.head.appendChild(style);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Tooltip Descriptor Builder (uses live formatJokerDesc!)
+// Tooltip Descriptor Builder (uses live formatJokerDesc, getJokerLiveMeta,
+// and getConsumablePreview!)
 // ---------------------------------------------------------------------------
+
+interface TooltipDescriptor {
+  title: string;
+  desc: string;
+  badges: Array<{ label: string; color: string }>;
+  livePreview?: { headline: string; detail: string; ok: boolean };
+}
 
 function describeVisualCard(
   vc: VisualCard,
   state: SimState
-): { title: string; desc: string; badges: Array<{ label: string; color: string }> } | null {
+): TooltipDescriptor | null {
   const badges: Array<{ label: string; color: string }> = [];
   const pushEdition = (ed: VisualCard['edition']) => {
     if (ed !== 'none') {
@@ -3777,15 +5749,38 @@ function describeVisualCard(
     const j = vc.jokerData;
     const def = JOKER_MAP[j.key];
     const rarity = def?.rarity ?? 1;
+    const meta = getJokerLiveMeta(state, j);
     badges.push({
       label: RARITY_NAMES[rarity] ?? 'Joker',
       color: PALETTE.RARITY[rarity - 1] ?? PALETTE.BLUE,
     });
     pushEdition(j.edition);
+
+    if (meta.copyingName) {
+      const hasTarget = meta.copyingName !== 'No target';
+      badges.push({
+        label: hasTarget ? `Copying: ${meta.copyingName}` : 'No target',
+        color: meta.copyingCompatible ? PALETTE.GREEN : hasTarget ? PALETTE.RED : PALETTE.GREY,
+      });
+      if (hasTarget) {
+        badges.push({
+          label: meta.copyingCompatible ? 'Compatible' : 'Incompatible',
+          color: meta.copyingCompatible ? '#2a8560' : '#b8352e',
+        });
+      }
+    } else if (meta.statusBadge) {
+      badges.push({
+        label: meta.statusBadge,
+        color: meta.statusColor || PALETTE.ORANGE,
+      });
+    }
+
     if (j.eternal) badges.push({ label: 'Eternal', color: PALETTE.ETERNAL });
     if (j.perishable) badges.push({ label: `Perishable (${j.perishableTally})`, color: PALETTE.PERISHABLE });
     if (j.rental) badges.push({ label: 'Rental (-$3)', color: PALETTE.RENTAL });
-    if (j.debuffed) badges.push({ label: 'Debuffed', color: PALETTE.RED });
+    if (j.debuffed && meta.statusBadge !== 'DEBUFFED') badges.push({ label: 'Debuffed', color: PALETTE.RED });
+    if (!j.eternal) badges.push({ label: `Sell $${j.sellValue}`, color: '#58696e' });
+
     return {
       title: def?.name ?? j.key,
       desc: formatJokerDesc(j, state) || def?.descTemplate || 'Joker effect',
@@ -3796,12 +5791,23 @@ function describeVisualCard(
   if (vc.consumableData) {
     const c = vc.consumableData;
     const def = CONSUMABLE_MAP[c.key];
+    const preview = getConsumablePreview(state, c.key, { fromInventory: true });
     badges.push({
       label: c.set,
       color: c.set === 'Planet' ? PALETTE.BLUE : c.set === 'Spectral' ? PALETTE.BOOSTER : PALETTE.PURPLE,
     });
     pushEdition(c.edition);
-    return { title: def?.name ?? c.key, desc: def?.desc ?? 'Consumable card', badges };
+    badges.push({ label: `Sell $${c.sellValue}`, color: '#58696e' });
+    return {
+      title: def?.name ?? c.key,
+      desc: def?.desc ?? 'Consumable card',
+      badges,
+      livePreview: {
+        headline: preview.headline,
+        detail: preview.detail,
+        ok: preview.canUseNow,
+      },
+    };
   }
 
   if (vc.cardData) {
@@ -3811,6 +5817,7 @@ function describeVisualCard(
     if (enhDef) badges.push({ label: enhDef.name, color: PALETTE.GREEN });
     if (sealDef) badges.push({ label: sealDef.name, color: sealDef.color });
     pushEdition(c.edition);
+    if (vc.forced) badges.push({ label: 'Forced Card', color: '#4794d4' });
     if (c.debuffed) badges.push({ label: 'Debuffed', color: PALETTE.RED });
     const title = c.enhancement === 'm_stone' ? 'Stone Card' : `${c.rank} of ${c.suit}`;
     const descParts: string[] = [];
@@ -3828,24 +5835,39 @@ function describeVisualCard(
       const d = JOKER_MAP[o.key];
       const r = d?.rarity ?? 1;
       badges.push({ label: RARITY_NAMES[r] ?? 'Joker', color: PALETTE.RARITY[r - 1] ?? PALETTE.BLUE });
+      if (o.eternal) badges.push({ label: 'Eternal', color: PALETTE.ETERNAL });
+      if (o.perishable) badges.push({ label: 'Perishable', color: PALETTE.PERISHABLE });
+      if (o.rental) badges.push({ label: 'Rental (-$3)', color: PALETTE.RENTAL });
       return { title: d?.name ?? o.key, desc: d?.descTemplate ?? 'Joker', badges };
     }
     if (o.kind === 'playing_card') {
+      const enhDef = o.enhancement && o.enhancement !== 'none' ? ENHANCEMENT_DEFS[o.enhancement] : null;
+      const sealDef = o.seal && o.seal !== 'none' ? SEAL_DEFS[o.seal] : null;
+      if (enhDef) badges.push({ label: enhDef.name, color: PALETTE.GREEN });
+      if (sealDef) badges.push({ label: sealDef.name, color: sealDef.color });
+      const descParts = [enhDef?.desc, sealDef?.desc].filter(Boolean);
       return {
-        title: `${o.rank ?? 'Ace'} of ${o.suit ?? 'Spades'}`,
-        desc:
-          o.enhancement && o.enhancement !== 'none'
-            ? (ENHANCEMENT_DEFS[o.enhancement]?.desc ?? o.enhancement)
-            : 'Add to your deck',
+        title: o.enhancement === 'm_stone' ? 'Stone Card' : `${o.rank ?? 'Ace'} of ${o.suit ?? 'Spades'}`,
+        desc: descParts.length > 0 ? descParts.join(' • ') : 'Add to your deck',
         badges,
       };
     }
     const cd = CONSUMABLE_MAP[o.key];
+    const preview = getConsumablePreview(state, o.key, { fromInventory: false });
     badges.push({
       label: cd?.set ?? o.kind,
       color: cd?.set === 'Planet' ? PALETTE.BLUE : cd?.set === 'Spectral' ? PALETTE.BOOSTER : PALETTE.PURPLE,
     });
-    return { title: cd?.name ?? o.key, desc: cd?.desc ?? '', badges };
+    return {
+      title: cd?.name ?? o.key,
+      desc: cd?.desc ?? '',
+      badges,
+      livePreview: {
+        headline: preview.headline,
+        detail: preview.detail,
+        ok: preview.canUseNow,
+      },
+    };
   }
 
   if (vc.voucherOfferData) {
@@ -3867,24 +5889,39 @@ function describeVisualCard(
       const d = JOKER_MAP[pc.key];
       const r = d?.rarity ?? 1;
       badges.push({ label: RARITY_NAMES[r] ?? 'Joker', color: PALETTE.RARITY[r - 1] ?? PALETTE.BLUE });
+      if (pc.eternal) badges.push({ label: 'Eternal', color: PALETTE.ETERNAL });
+      if (pc.perishable) badges.push({ label: 'Perishable', color: PALETTE.PERISHABLE });
+      if (pc.rental) badges.push({ label: 'Rental (-$3)', color: PALETTE.RENTAL });
       return { title: d?.name ?? pc.key, desc: d?.descTemplate ?? '', badges };
     }
     if (pc.kind === 'playing_card') {
+      const enhDef = pc.enhancement && pc.enhancement !== 'none' ? ENHANCEMENT_DEFS[pc.enhancement] : null;
+      const sealDef = pc.seal && pc.seal !== 'none' ? SEAL_DEFS[pc.seal] : null;
+      if (enhDef) badges.push({ label: enhDef.name, color: PALETTE.GREEN });
+      if (sealDef) badges.push({ label: sealDef.name, color: sealDef.color });
+      const descParts = [enhDef?.desc, sealDef?.desc].filter(Boolean);
       return {
-        title: `${pc.rank ?? 'Ace'} of ${pc.suit ?? 'Hearts'}`,
-        desc:
-          pc.enhancement && pc.enhancement !== 'none'
-            ? (ENHANCEMENT_DEFS[pc.enhancement]?.desc ?? '')
-            : 'Add this card to your deck',
+        title: pc.enhancement === 'm_stone' ? 'Stone Card' : `${pc.rank ?? 'Ace'} of ${pc.suit ?? 'Hearts'}`,
+        desc: descParts.length > 0 ? descParts.join(' • ') : 'Add this card to your deck',
         badges,
       };
     }
     const cd = CONSUMABLE_MAP[pc.key];
+    const preview = getConsumablePreview(state, pc.key, { fromInventory: false });
     badges.push({
       label: cd?.set ?? pc.kind,
       color: cd?.set === 'Planet' ? PALETTE.BLUE : cd?.set === 'Spectral' ? PALETTE.BOOSTER : PALETTE.PURPLE,
     });
-    return { title: cd?.name ?? pc.key, desc: cd?.desc ?? '', badges };
+    return {
+      title: cd?.name ?? pc.key,
+      desc: cd?.desc ?? '',
+      badges,
+      livePreview: {
+        headline: preview.headline,
+        detail: preview.detail,
+        ok: preview.canUseNow,
+      },
+    };
   }
 
   return null;

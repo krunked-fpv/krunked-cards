@@ -203,8 +203,16 @@ export class DebugDrawer {
     style.id = 'krunked-debug-styles';
     style.textContent = `
       .kc-debug-drawer {
-        position: fixed; right: 12px; top: 12px; z-index: 120;
-        width: 340px; max-height: 92vh; overflow-y: auto;
+        position: fixed;
+        right: max(8px, env(safe-area-inset-right, 0px));
+        top: max(8px, env(safe-area-inset-top, 0px));
+        z-index: 120;
+        width: 340px;
+        max-width: calc(100vw - 16px);
+        max-height: calc(100dvh - 24px);
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+        touch-action: pan-y;
         background: rgba(18, 24, 28, 0.96);
         border: 2px solid #009dff; border-radius: 12px;
         padding: 10px 12px; color: #e8f1f5;
