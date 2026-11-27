@@ -83,9 +83,61 @@ export function getCatalogSummary(): Record<string, number> {
   };
 }
 
+function resolveCopyTargetForDesc(
+  state: SimState,
+  startIndex: number
+): { target: JokerInstance | null; blockedName?: string } {
+  const visited = new Set<number>([startIndex]);
+  let currIndex = startIndex;
+  while (true) {
+    const curr = state.jokers[currIndex];
+    if (!curr || curr.debuffed) {
+      return {
+        target: null,
+        blockedName:
+          curr && currIndex !== startIndex ? (JOKER_MAP[curr.key]?.name ?? curr.key) : undefined,
+      };
+    }
+    let nextIndex = -1;
+    if (curr.key === 'j_blueprint') {
+      nextIndex = currIndex + 1;
+    } else if (curr.key === 'j_brainstorm') {
+      nextIndex = 0;
+    } else {
+      const def = JOKER_MAP[curr.key];
+      if (def && def.blueprintCompat === false) {
+        return { target: null, blockedName: def.name };
+      }
+      return { target: curr };
+    }
+    if (nextIndex < 0 || nextIndex >= state.jokers.length || visited.has(nextIndex)) {
+      return { target: null };
+    }
+    visited.add(nextIndex);
+    currIndex = nextIndex;
+  }
+}
+
 export function formatJokerDesc(joker: JokerInstance, state: SimState): string {
   const def = JOKER_MAP[joker.key];
   if (!def) return '';
+  if (joker.key === 'j_blueprint' || joker.key === 'j_brainstorm') {
+    const base =
+      joker.key === 'j_blueprint'
+        ? 'Copies ability of Joker to the right'
+        : 'Copies the ability of leftmost Joker';
+    const idx = state.jokers.findIndex((j) => j.id === joker.id);
+    if (idx < 0) return base;
+    const { target, blockedName } = resolveCopyTargetForDesc(state, idx);
+    if (target) {
+      const name = JOKER_MAP[target.key]?.name ?? target.key;
+      return `${base} (Copying ${name} — compatible)`;
+    }
+    if (blockedName) {
+      return `${base} (${blockedName} — incompatible)`;
+    }
+    return `${base} (No target)`;
+  }
   return def.formatDesc ? def.formatDesc(joker, state) : def.descTemplate;
 }
 

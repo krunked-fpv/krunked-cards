@@ -363,6 +363,9 @@ export function scorePlayedHand(
           seal: src.seal,
           permaBonus: src.permaBonus,
         });
+        if (src.debuffed && isBossActive && activeBlind.key !== 'bl_pillar') {
+          copy.debuffed = true;
+        }
         state.fullDeck.push(copy);
         state.hand.push(copy.id);
         events.push({

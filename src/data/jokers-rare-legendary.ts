@@ -244,9 +244,10 @@ export const RARE_LEGENDARY_JOKERS: JokerDef[] = [
     eternalCompat: true,
     config: { extra: 4 },
     descTemplate: 'Create a Tarot card if hand is played with $4 or less',
-    formatDesc: (inst) => {
+    formatDesc: (inst, state) => {
       const cap = getStateNum(inst.state, ['extra'], 4);
-      return `Create a Tarot card if hand is played with $${cap} or less`;
+      const active = state.dollars <= cap;
+      return `Create a Tarot card if hand is played with $${cap} or less${active ? ' (Active!)' : ''}`;
     },
   },
   {
@@ -279,10 +280,23 @@ export const RARE_LEGENDARY_JOKERS: JokerDef[] = [
     config: { extra: 0.2, Xmult: 1 },
     descTemplate:
       'This Joker gains X0.2 Mult per consecutive hand played without playing your most played poker hand (Currently X1 Mult)',
-    formatDesc: (inst) => {
+    formatDesc: (inst, state) => {
       const step = getStateNum(inst.state, ['extra'], 0.2);
       const xMult = getStateNum(inst.state, ['xMult', 'Xmult', 'x_mult'], 1);
-      return `This Joker gains X${formatNum(step)} Mult per consecutive hand played without playing your most played poker hand (Currently X${formatNum(xMult)} Mult)`;
+      const levels = Object.values(state.handLevels ?? {});
+      let maxPlayed = 0;
+      for (let i = 0; i < levels.length; i++) {
+        const hl = levels[i];
+        if (hl && hl.visible && hl.played > maxPlayed) maxPlayed = hl.played;
+      }
+      const avoid =
+        maxPlayed > 0
+          ? levels
+              .filter((hl) => hl && hl.visible && hl.played === maxPlayed)
+              .map((hl) => hl.id)
+          : [];
+      const avoidSuffix = avoid.length > 0 ? `; avoid ${avoid.join('/')}` : '';
+      return `This Joker gains X${formatNum(step)} Mult per consecutive hand played without playing your most played poker hand (Currently X${formatNum(xMult)} Mult${avoidSuffix})`;
     },
   },
   {
@@ -297,9 +311,15 @@ export const RARE_LEGENDARY_JOKERS: JokerDef[] = [
     eternalCompat: true,
     config: { extra: 1.5 },
     descTemplate: 'Uncommon Jokers each give X1.5 Mult',
-    formatDesc: (inst) => {
+    formatDesc: (inst, state) => {
       const xMult = getStateNum(inst.state, ['extra'], 1.5);
-      return `Uncommon Jokers each give X${formatNum(xMult)} Mult`;
+      let uncommonCount = 0;
+      for (let i = 0; i < state.jokers.length; i++) {
+        if (!state.jokers[i].debuffed && UNCOMMON_JOKER_KEYS.has(state.jokers[i].key)) {
+          uncommonCount++;
+        }
+      }
+      return `Uncommon Jokers each give X${formatNum(xMult)} Mult (Currently ${uncommonCount} Uncommon)`;
     },
   },
   {
@@ -515,7 +535,7 @@ export const RARE_LEGENDARY_JOKERS: JokerDef[] = [
     formatDesc: (inst) => {
       const target = getStateNum(inst.state, ['extra'], 2);
       const cur = Math.min(target, getStateNum(inst.state, ['invis_rounds'], 0));
-      return `After ${target} rounds, sell this card to Duplicate a random Joker (Currently ${cur}/${target})`;
+      return `After ${target} rounds, sell this card to Duplicate a random Joker (Currently ${cur}/${target}${cur >= target ? ' — Ready!' : ''})`;
     },
   },
   {
@@ -557,7 +577,7 @@ export const RARE_LEGENDARY_JOKERS: JokerDef[] = [
       for (let i = 0; i < state.fullDeck.length; i++) {
         if (state.fullDeck[i].enhancement !== 'none') enhancedCount++;
       }
-      return `X${formatNum(xMult)} Mult if you have at least 16 Enhanced cards in your full deck (Currently ${enhancedCount})`;
+      return `X${formatNum(xMult)} Mult if you have at least 16 Enhanced cards in your full deck (Currently ${enhancedCount}/16${enhancedCount >= 16 ? ' — Active!' : ''})`;
     },
   },
   {

@@ -141,6 +141,13 @@ export function canUseConsumable(
       }
       return { ok: true };
     }
+    case 'c_emperor':
+    case 'c_high_priestess': {
+      if (freeConsSlots <= 0) {
+        return { ok: false, reason: 'No free consumable slot' };
+      }
+      return { ok: true };
+    }
     case 'c_wheel_of_fortune': {
       if (!state.jokers.some((j) => j.edition === 'none')) {
         return { ok: false, reason: 'No editionless Joker available' };

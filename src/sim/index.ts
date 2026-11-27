@@ -56,3 +56,11 @@ export {
   dispatchSim,
   stepSimTick,
 } from './engine.ts';
+
+export {
+  getForcedCardId,
+  getBossHandWarning,
+  getConsumablePreview,
+  getJokerLiveMeta,
+  getDeckBreakdown,
+} from './tactics.ts';
