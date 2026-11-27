@@ -15,6 +15,7 @@ import {
   type EditionId,
   type EnhancementId,
   type JokerInstance,
+  type LayoutMode,
   type PackCardOffer,
   type Rank,
   type SealId,
@@ -318,6 +319,8 @@ export interface VisualCard {
   seal?: SealId;
   debuffed: boolean;
   faceDown: boolean;
+  forced?: boolean;
+  scoringPreview?: boolean;
   cost?: number;
   sold?: boolean;
 
@@ -338,9 +341,22 @@ export interface RectPx {
   h: number;
 }
 
+export interface SafeInsets {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
 export interface TableGeometry {
   viewportW: number;
   viewportH: number;
+  mode: LayoutMode;
+  safeInsets: SafeInsets;
+  hudDock: RectPx;
+  actionBar: RectPx;
+  shopControls: RectPx;
+  compact: boolean;
   leftRail: RectPx;
   table: RectPx;
   jokerTray: RectPx;
@@ -474,98 +490,492 @@ function getConsumableSpecialFields(
 }
 
 // ---------------------------------------------------------------------------
-// Responsive Table Layout Calculator (1280x720 through 1920x1080+)
+// Safe-Area Inset Helpers & 3-Mode Responsive Table Layout Calculator
+// Modes:
+//   - 'desktop':          viewportW >= 960 && viewportH >= 540
+//   - 'mobile-landscape': viewportW > viewportH && (viewportW < 960 || viewportH < 540)
+//   - 'mobile-portrait':  viewportH >= viewportW && viewportW < 960
 // ---------------------------------------------------------------------------
 
-export function computeTableGeometry(viewportW: number, viewportH: number): TableGeometry {
-  const w = Math.max(960, viewportW);
-  const h = Math.max(540, viewportH);
+function sanitizeSafeInsets(insets?: Partial<SafeInsets> | null): SafeInsets {
+  if (!insets) return { top: 0, right: 0, bottom: 0, left: 0 };
+  const clean = (v: number | undefined): number =>
+    typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.round(v) : 0;
+  return {
+    top: clean(insets.top),
+    right: clean(insets.right),
+    bottom: clean(insets.bottom),
+    left: clean(insets.left),
+  };
+}
 
-  const railW = Math.round(Math.min(315, Math.max(246, w * 0.225)));
-  const leftRail: RectPx = { x: 12, y: 12, w: railW, h: h - 24 };
+/**
+ * Reads live CSS safe-area-inset-* pixel dimensions in a browser environment.
+ * Returns zeros in headless/Node environments without DOM side effects.
+ */
+export function readSafeAreaInsets(): SafeInsets {
+  if (typeof document === 'undefined' || !document.body || typeof getComputedStyle !== 'function') {
+    return { top: 0, right: 0, bottom: 0, left: 0 };
+  }
+  try {
+    const probe = document.createElement('div');
+    probe.style.cssText =
+      'position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;' +
+      'padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) ' +
+      'env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px);';
+    document.body.appendChild(probe);
+    const cs = getComputedStyle(probe);
+    const insets = sanitizeSafeInsets({
+      top: parseFloat(cs.paddingTop),
+      right: parseFloat(cs.paddingRight),
+      bottom: parseFloat(cs.paddingBottom),
+      left: parseFloat(cs.paddingLeft),
+    });
+    probe.remove();
+    return insets;
+  } catch {
+    return { top: 0, right: 0, bottom: 0, left: 0 };
+  }
+}
 
-  const tableX = leftRail.x + leftRail.w + 18;
-  const tableW = w - tableX - 18;
-  const table: RectPx = { x: tableX, y: 12, w: tableW, h: h - 24 };
-
-  // Card sizing respects exact 71:95 aspect ratio from LAYOUT
+export function computeTableGeometry(
+  viewportW: number,
+  viewportH: number,
+  safeInsets?: Partial<SafeInsets>
+): TableGeometry {
+  const w = Math.max(280, Math.round(Number.isFinite(viewportW) ? viewportW : 1280));
+  const h = Math.max(280, Math.round(Number.isFinite(viewportH) ? viewportH : 720));
+  const safe = sanitizeSafeInsets(safeInsets);
   const aspect = LAYOUT.CARD_W / LAYOUT.CARD_H; // ~0.7447
-  const cardH = Math.round(Math.min(168, Math.max(118, h * 0.205)));
+
+  let mode: LayoutMode;
+  if (w >= 960 && h >= 540) {
+    mode = 'desktop';
+  } else if (w > h) {
+    mode = 'mobile-landscape';
+  } else {
+    mode = 'mobile-portrait';
+  }
+
+  // =========================================================================
+  // MODE 1: DESKTOP (960x540 through 1280x720, 1920x1080+)
+  // Preserves verified 1280x720 and 1920x1080 proportions verbatim!
+  // =========================================================================
+  if (mode === 'desktop') {
+    const usableW = Math.max(640, w - safe.left - safe.right);
+    const usableH = Math.max(480, h - safe.top - safe.bottom);
+
+    const railW = Math.round(Math.min(315, Math.max(246, usableW * 0.225)));
+    const leftRail: RectPx = {
+      x: 12 + safe.left,
+      y: 12 + safe.top,
+      w: railW,
+      h: usableH - 24,
+    };
+    const hudDock: RectPx = { ...leftRail };
+
+    const tableX = leftRail.x + leftRail.w + 18;
+    const tableW = w - safe.right - tableX - 18;
+    const table: RectPx = {
+      x: tableX,
+      y: 12 + safe.top,
+      w: tableW,
+      h: usableH - 24,
+    };
+
+    const cardH = Math.round(Math.min(168, Math.max(118, usableH * 0.205)));
+    const cardW = Math.round(cardH * aspect);
+    const highlightLift = Math.round(cardH * 0.2);
+
+    // Top row: Jokers (left ~67%) & Consumables (right ~33%)
+    const topRowH = Math.round(cardH + 22);
+    const gap = 14;
+    const jokerW = Math.round((tableW - gap) * 0.67);
+    const consW = tableW - gap - jokerW;
+
+    const jokerTray: RectPx = { x: tableX, y: 14 + safe.top, w: jokerW, h: topRowH };
+    const consumableTray: RectPx = { x: tableX + jokerW + gap, y: 14 + safe.top, w: consW, h: topRowH };
+
+    // Bottom row: Hand tray + Deck stack on right, leaving 62px at very bottom for action bar
+    const actionBarAreaH = 62;
+    const handTrayH = Math.round(cardH + highlightLift + 16);
+    const deckW = Math.round(cardW + 22);
+    const handTrayY = h - safe.bottom - actionBarAreaH - handTrayH - 8;
+
+    const handTray: RectPx = {
+      x: tableX,
+      y: handTrayY,
+      w: tableW - deckW - 14,
+      h: handTrayH,
+    };
+    const deckPile: RectPx = {
+      x: tableX + tableW - deckW,
+      y: handTrayY + Math.round((handTrayH - cardH) * 0.5),
+      w: deckW,
+      h: cardH,
+    };
+    const actionBar: RectPx = {
+      x: handTray.x,
+      y: h - safe.bottom - actionBarAreaH,
+      w: handTray.w,
+      h: 54,
+    };
+
+    // Middle arena: Play Area (between top row and hand tray)
+    const midY = jokerTray.y + jokerTray.h + 12;
+    const midH = Math.max(cardH + 16, handTray.y - midY - 10);
+    const playArea: RectPx = { x: tableX, y: midY, w: tableW, h: midH };
+
+    // Shop trays (below top row with clear counter headroom)
+    const shopTopY = jokerTray.y + jokerTray.h + 28;
+    const shopControlsW = Math.round(Math.min(200, Math.max(152, tableW * 0.22)));
+    const shopRightX = tableX + shopControlsW + 16;
+    const shopRightW = tableW - shopControlsW - 16;
+    const maxShopRowH = Math.floor((h - safe.bottom - 12 - shopTopY - 14) / 2);
+    const shopCardRowH = Math.min(Math.round(cardH + 52), Math.max(cardH + 40, maxShopRowH));
+
+    const shopControls: RectPx = {
+      x: tableX + 6,
+      y: shopTopY,
+      w: shopControlsW - 10,
+      h: shopCardRowH,
+    };
+    const shopOfferTray: RectPx = {
+      x: shopRightX,
+      y: shopTopY,
+      w: shopRightW,
+      h: shopCardRowH,
+    };
+    const shopBottomY = shopOfferTray.y + shopOfferTray.h + 14;
+    const shopVoucherW = Math.round(shopRightW * 0.34);
+    const shopVoucherTray: RectPx = {
+      x: shopRightX,
+      y: shopBottomY,
+      w: shopVoucherW,
+      h: shopCardRowH,
+    };
+    const shopBoosterTray: RectPx = {
+      x: shopRightX + shopVoucherW + 16,
+      y: shopBottomY,
+      w: shopRightW - shopVoucherW - 16,
+      h: shopCardRowH,
+    };
+
+    // Pack open tray centered in middle arena
+    const packTopPad = usableH < 640 ? 4 : 18;
+    const packMaxH = Math.max(80, handTray.y - (midY + packTopPad) - 6);
+    const packTray: RectPx = {
+      x: tableX + 20,
+      y: midY + packTopPad,
+      w: tableW - 40,
+      h: usableH < 640 ? packMaxH : Math.max(cardH + 40, midH - 24),
+    };
+
+    return {
+      viewportW: w,
+      viewportH: h,
+      mode,
+      safeInsets: safe,
+      hudDock,
+      actionBar,
+      shopControls,
+      compact: usableH < 680 || usableW < 1040,
+      leftRail,
+      table,
+      jokerTray,
+      consumableTray,
+      playArea,
+      handTray,
+      deckPile,
+      shopOfferTray,
+      shopVoucherTray,
+      shopBoosterTray,
+      packTray,
+      cardW,
+      cardH,
+      highlightLift,
+      pixelScale: h / LAYOUT.TILE_H,
+    };
+  }
+
+  // =========================================================================
+  // MODE 2: MOBILE LANDSCAPE (e.g., 844x390, 667x375, 915x412, 740x360, 812x375)
+  // Slim left HUD rail + full-height compact felt table with zero clipping
+  // =========================================================================
+  if (mode === 'mobile-landscape') {
+    const marginX = 6;
+    const marginY = 6;
+    const innerL = safe.left + marginX;
+    const innerR = w - safe.right - marginX;
+    const innerT = safe.top + marginY;
+    const innerB = h - safe.bottom - marginY;
+    const usableW = Math.max(260, innerR - innerL);
+    const usableH = Math.max(260, innerB - innerT);
+
+    const railW = Math.round(Math.min(212, Math.max(168, usableW * 0.245)));
+    const leftRail: RectPx = { x: innerL, y: innerT, w: railW, h: usableH };
+    const hudDock: RectPx = { ...leftRail };
+
+    const railGap = 8;
+    const tableX = leftRail.x + leftRail.w + railGap;
+    const tableW = Math.max(200, innerR - tableX);
+    const table: RectPx = { x: tableX, y: innerT, w: tableW, h: usableH };
+
+    const actionBarH = Math.round(Math.min(50, Math.max(44, usableH * 0.125)));
+
+    // Dynamic cardH fitting Joker row + Play Area + Hand + Action Bar AND 2-row Shop
+    const cardHFromPlay = Math.floor((usableH - actionBarH - 48) / 3.18);
+    const cardHFromShop = Math.floor((usableH - 126) / 2.8);
+    const cardHFromWidth = Math.floor((tableW * 0.145) / aspect);
+    const cardH = Math.round(
+      Math.min(116, Math.max(74, Math.min(cardHFromPlay, cardHFromShop, cardHFromWidth)))
+    );
+    const cardW = Math.round(cardH * aspect);
+    const highlightLift = Math.round(cardH * 0.18);
+
+    // Top felt row: Jokers (66%) + Consumables (34%)
+    const topRowH = cardH + 12;
+    const trayGap = 8;
+    const jokerW = Math.round((tableW - trayGap) * 0.66);
+    const consW = tableW - trayGap - jokerW;
+    const jokerTray: RectPx = { x: tableX, y: innerT, w: jokerW, h: topRowH };
+    const consumableTray: RectPx = { x: tableX + jokerW + trayGap, y: innerT, w: consW, h: topRowH };
+
+    // Bottom action bar, hand tray, and deck pile
+    const actionBarY = innerB - actionBarH;
+    const handTrayH = cardH + highlightLift + 10;
+    const handTrayY = actionBarY - 4 - handTrayH;
+    const deckW = Math.round(Math.min(cardW + 14, Math.max(54, tableW * 0.165)));
+    const handDeckGap = 8;
+    const handTray: RectPx = {
+      x: tableX,
+      y: handTrayY,
+      w: Math.max(120, tableW - deckW - handDeckGap),
+      h: handTrayH,
+    };
+    const deckCardH = Math.min(cardH, Math.max(50, handTrayH - 30));
+    const deckPile: RectPx = {
+      x: tableX + tableW - deckW,
+      y: handTrayY + Math.max(0, Math.round((handTrayH - deckCardH - 26) * 0.5)),
+      w: deckW,
+      h: deckCardH,
+    };
+    const actionBar: RectPx = {
+      x: tableX,
+      y: actionBarY,
+      w: tableW,
+      h: actionBarH,
+    };
+
+    // Middle Play Area cleanly between top row and hand tray
+    const midY = jokerTray.y + jokerTray.h + 6;
+    const midH = Math.max(cardH + 6, handTray.y - midY - 6);
+    const playArea: RectPx = { x: tableX, y: midY, w: tableW, h: midH };
+
+    // Shop: compact left shopControls + 2 crisp rows strictly inside viewport bounds
+    const shopTopY = jokerTray.y + jokerTray.h + 18;
+    const shopRowGap = 8;
+    const availShopH = Math.max(160, innerB - shopTopY);
+    const shopRowH = Math.floor((availShopH - shopRowGap) / 2);
+    const shopControlsW = Math.round(Math.min(138, Math.max(96, tableW * 0.21)));
+    const shopColGap = 8;
+    const shopRightX = tableX + shopControlsW + shopColGap;
+    const shopRightW = Math.max(160, tableW - shopControlsW - shopColGap);
+
+    const shopControls: RectPx = {
+      x: tableX,
+      y: shopTopY,
+      w: shopControlsW,
+      h: shopRowH * 2 + shopRowGap,
+    };
+    const shopOfferTray: RectPx = {
+      x: shopRightX,
+      y: shopTopY,
+      w: shopRightW,
+      h: shopRowH,
+    };
+    const shopBottomY = shopOfferTray.y + shopOfferTray.h + shopRowGap;
+    const shopSubGap = 8;
+    const shopVoucherW = Math.round((shopRightW - shopSubGap) * 0.36);
+    const shopVoucherTray: RectPx = {
+      x: shopRightX,
+      y: shopBottomY,
+      w: shopVoucherW,
+      h: shopRowH,
+    };
+    const shopBoosterTray: RectPx = {
+      x: shopRightX + shopVoucherW + shopSubGap,
+      y: shopBottomY,
+      w: shopRightW - shopVoucherW - shopSubGap,
+      h: shopRowH,
+    };
+
+    // Pack tray sits cleanly above handTray
+    const packTray: RectPx = {
+      x: tableX + 4,
+      y: midY,
+      w: tableW - 8,
+      h: Math.max(84, handTray.y - midY - 4),
+    };
+
+    return {
+      viewportW: w,
+      viewportH: h,
+      mode,
+      safeInsets: safe,
+      hudDock,
+      actionBar,
+      shopControls,
+      compact: true,
+      leftRail,
+      table,
+      jokerTray,
+      consumableTray,
+      playArea,
+      handTray,
+      deckPile,
+      shopOfferTray,
+      shopVoucherTray,
+      shopBoosterTray,
+      packTray,
+      cardW,
+      cardH,
+      highlightLift,
+      pixelScale: Math.max(24, h / LAYOUT.TILE_H),
+    };
+  }
+
+  // =========================================================================
+  // MODE 3: MOBILE PORTRAIT (e.g., 390x844, 375x667, 412x915, 360x780, 768x1024)
+  // Full-width top HUD dock + full-width table, top Joker/Consumable row,
+  // spacious play arena, bottom hand (~82% width) + deck pile, 54px action bar
+  // =========================================================================
+  const isTablet = w >= 600;
+  const marginX = isTablet ? 12 : 8;
+  const marginY = isTablet ? 10 : 6;
+  const innerL = safe.left + marginX;
+  const innerR = w - safe.right - marginX;
+  const innerT = safe.top + marginY;
+  const innerB = h - safe.bottom - marginY;
+  const usableW = Math.max(260, innerR - innerL);
+  const usableH = Math.max(400, innerB - innerT);
+
+  const hudH = Math.round(Math.min(132, Math.max(108, usableH * 0.148)));
+  const hudDock: RectPx = { x: innerL, y: innerT, w: usableW, h: hudH };
+  const leftRail: RectPx = { ...hudDock };
+
+  const tableGap = isTablet ? 10 : 8;
+  const tableY = hudDock.y + hudDock.h + tableGap;
+  const tableH = Math.max(300, innerB - tableY);
+  const table: RectPx = { x: innerL, y: tableY, w: usableW, h: tableH };
+
+  const actionBarH = 54;
+  const actionBar: RectPx = {
+    x: innerL,
+    y: innerB - actionBarH,
+    w: usableW,
+    h: actionBarH,
+  };
+
+  const shopControlsH = h >= 760 ? 52 : 48;
+
+  // Dynamic cardH honoring width readability, Playing stack, and Portrait Shop stack
+  const maxCardWFromW = Math.round(usableW * (isTablet ? 0.165 : 0.212));
+  const cardHFromWidth = Math.floor(maxCardWFromW / aspect);
+  const cardHFromPlay = Math.floor((tableH - actionBarH - 68) / 3.2);
+  const cardHFromShop = Math.floor((tableH - shopControlsH - 156) / 2.88);
+  const cardH = Math.round(
+    Math.min(150, Math.max(76, Math.min(cardHFromWidth, cardHFromPlay, cardHFromShop)))
+  );
   const cardW = Math.round(cardH * aspect);
   const highlightLift = Math.round(cardH * 0.2);
 
-  // Top row: Jokers (left ~67%) & Consumables (right ~33%)
-  const topRowH = Math.round(cardH + 22);
-  const gap = 14;
-  const jokerW = Math.round((tableW - gap) * 0.67);
-  const consW = tableW - gap - jokerW;
+  // Top felt row right below hudDock: Jokers (~65%) + Consumables (~35%)
+  const topRowH = cardH + 14;
+  const trayGap = 8;
+  const jokerW = Math.round((usableW - trayGap) * 0.65);
+  const consW = usableW - trayGap - jokerW;
+  const jokerTray: RectPx = { x: innerL, y: tableY, w: jokerW, h: topRowH };
+  const consumableTray: RectPx = { x: innerL + jokerW + trayGap, y: tableY, w: consW, h: topRowH };
 
-  const jokerTray: RectPx = { x: tableX, y: 14, w: jokerW, h: topRowH };
-  const consumableTray: RectPx = { x: tableX + jokerW + gap, y: 14, w: consW, h: topRowH };
-
-  // Bottom row: Hand tray + Deck stack on right, leaving 62px at very bottom for action bar
-  const actionBarH = 62;
-  const handTrayH = Math.round(cardH + highlightLift + 16);
-  const deckW = Math.round(cardW + 22);
-  const handTrayY = h - actionBarH - handTrayH - 8;
-
+  // Bottom handTray (~80-82% width) + compact deckPile on right, above actionBar
+  const handTrayH = cardH + highlightLift + 14;
+  const handTrayY = actionBar.y - 8 - handTrayH;
+  const deckGap = isTablet ? 10 : 8;
+  const deckW = Math.round(Math.min(cardW + 14, Math.max(56, usableW * 0.18)));
   const handTray: RectPx = {
-    x: tableX,
+    x: innerL,
     y: handTrayY,
-    w: tableW - deckW - 14,
+    w: Math.max(160, usableW - deckW - deckGap),
     h: handTrayH,
   };
+  const deckMaxCardW = Math.max(42, deckW - 8);
+  const deckCardH = Math.min(cardH, Math.round(deckMaxCardW / aspect), Math.max(54, handTrayH - 34));
   const deckPile: RectPx = {
-    x: tableX + tableW - deckW,
-    y: handTrayY + Math.round((handTrayH - cardH) * 0.5),
+    x: innerL + usableW - deckW,
+    y: handTrayY + Math.max(2, Math.round((handTrayH - deckCardH - 28) * 0.5)),
     w: deckW,
-    h: cardH,
+    h: deckCardH,
   };
 
-  // Middle arena: Play Area (between top row and hand tray)
-  const midY = jokerTray.y + jokerTray.h + 12;
-  const midH = Math.max(cardH + 16, handTray.y - midY - 10);
-  const playArea: RectPx = { x: tableX, y: midY, w: tableW, h: midH };
+  // Middle Play Area cleanly between top felt row and handTray
+  const midY = jokerTray.y + jokerTray.h + 10;
+  const midH = Math.max(cardH + 16, handTray.y - midY - 8);
+  const playArea: RectPx = { x: innerL, y: midY, w: usableW, h: midH };
 
-  // Shop trays (inside Shop container area below top row with clear counter headroom)
-  const shopTopY = jokerTray.y + jokerTray.h + 28;
-  const shopControlsW = Math.round(Math.min(200, Math.max(152, tableW * 0.22)));
-  const shopRightX = tableX + shopControlsW + 16;
-  const shopRightW = tableW - shopControlsW - 16;
-  const shopCardRowH = Math.round(cardH + 52);
+  // Shop in portrait: horizontal shopControls bar -> shopOfferTray -> voucher (38%) + booster (62%)
+  const shopControlsY = jokerTray.y + jokerTray.h + 20;
+  const shopControls: RectPx = {
+    x: innerL,
+    y: shopControlsY,
+    w: usableW,
+    h: shopControlsH,
+  };
+  const shopOfferY = shopControls.y + shopControls.h + 10;
+  const shopRowGap = 10;
+  const availShopH = Math.max(220, innerB - shopOfferY);
+  const maxShopRowH = Math.floor((availShopH - shopRowGap) / 2);
+  const shopRowH = Math.min(maxShopRowH, Math.max(cardH + 54, Math.round(cardH + 64)));
 
   const shopOfferTray: RectPx = {
-    x: shopRightX,
-    y: shopTopY,
-    w: shopRightW,
-    h: shopCardRowH,
+    x: innerL,
+    y: shopOfferY,
+    w: usableW,
+    h: shopRowH,
   };
-  const shopBottomY = shopOfferTray.y + shopOfferTray.h + 14;
-  const shopVoucherW = Math.round(shopRightW * 0.34);
+  const shopBottomY = shopOfferTray.y + shopOfferTray.h + shopRowGap;
+  const shopSubGap = 8;
+  const shopVoucherW = Math.round((usableW - shopSubGap) * 0.38);
   const shopVoucherTray: RectPx = {
-    x: shopRightX,
+    x: innerL,
     y: shopBottomY,
     w: shopVoucherW,
-    h: shopCardRowH,
+    h: shopRowH,
   };
   const shopBoosterTray: RectPx = {
-    x: shopRightX + shopVoucherW + 16,
+    x: innerL + shopVoucherW + shopSubGap,
     y: shopBottomY,
-    w: shopRightW - shopVoucherW - 16,
-    h: shopCardRowH,
+    w: usableW - shopVoucherW - shopSubGap,
+    h: shopRowH,
   };
 
-  // Pack open tray centered in middle arena
+  // Pack Open in portrait: sits cleanly in middle arena above handTray
   const packTray: RectPx = {
-    x: tableX + 20,
-    y: midY + 18,
-    w: tableW - 40,
-    h: Math.max(cardH + 40, midH - 24),
+    x: innerL + 4,
+    y: midY + 4,
+    w: usableW - 8,
+    h: Math.max(cardH + 36, midH - 8),
   };
 
   return {
     viewportW: w,
     viewportH: h,
+    mode,
+    safeInsets: safe,
+    hudDock,
+    actionBar,
+    shopControls,
+    compact: true,
     leftRail,
     table,
     jokerTray,
@@ -580,7 +990,7 @@ export function computeTableGeometry(viewportW: number, viewportH: number): Tabl
     cardW,
     cardH,
     highlightLift,
-    pixelScale: h / LAYOUT.TILE_H,
+    pixelScale: Math.max(26, Math.min(w, h) / 7.5),
   };
 }
 
@@ -588,16 +998,46 @@ export function computeTableGeometry(viewportW: number, viewportH: number): Tabl
 // Scene State Manager: maintains persistent Moveables across frames
 // ---------------------------------------------------------------------------
 
+interface SlotRowLayout {
+  startX: number;
+  step: number;
+  count: number;
+}
+
 export class CardSceneManager {
   private moveables = new Map<string, Moveable>();
   private visualCards: VisualCard[] = [];
   private geometry: TableGeometry = computeTableGeometry(1280, 720);
+  private safeInsetsOverride: SafeInsets | null = null;
+  private cachedSafeInsets: SafeInsets = { top: 0, right: 0, bottom: 0, left: 0 };
+  private lastMeasuredW = 0;
+  private lastMeasuredH = 0;
+
   private draggingId: string | null = null;
+  private dragKind: VisualEntityKind | null = null;
+  private dragPreviewIndex: number | null = null;
   private dragPointerX = 0;
   private dragPointerY = 0;
   private dragOffsetX = 0;
   private dragOffsetY = 0;
   private hoveredId: string | null = null;
+
+  private handSlotLayout: SlotRowLayout = { startX: 0, step: 0, count: 0 };
+  private jokerSlotLayout: SlotRowLayout = { startX: 0, step: 0, count: 0 };
+
+  setSafeInsets(insets: Partial<SafeInsets> | null): void {
+    this.safeInsetsOverride = insets ? sanitizeSafeInsets(insets) : null;
+  }
+
+  private getActiveSafeInsets(viewportW: number, viewportH: number): SafeInsets {
+    if (this.safeInsetsOverride) return this.safeInsetsOverride;
+    if (viewportW !== this.lastMeasuredW || viewportH !== this.lastMeasuredH) {
+      this.lastMeasuredW = viewportW;
+      this.lastMeasuredH = viewportH;
+      this.cachedSafeInsets = readSafeAreaInsets();
+    }
+    return this.cachedSafeInsets;
+  }
 
   getGeometry(): TableGeometry {
     return this.geometry;
@@ -621,6 +1061,14 @@ export class CardSceneManager {
     return this.visualCards.find((c) => c.id === this.draggingId) ?? null;
   }
 
+  getDragPreviewIndex(): number | null {
+    return this.dragPreviewIndex;
+  }
+
+  getDragKind(): VisualEntityKind | null {
+    return this.dragKind;
+  }
+
   getMoveable(id: string): Moveable | undefined {
     return this.moveables.get(id);
   }
@@ -635,42 +1083,74 @@ export class CardSceneManager {
     if (m) m.dissolve = dissolve;
   }
 
+  private computeDragPreviewIndex(kind: 'hand' | 'joker', dropX: number): number | null {
+    const layout = kind === 'hand' ? this.handSlotLayout : this.jokerSlotLayout;
+    if (layout.count <= 0) return null;
+    if (layout.count === 1 || layout.step <= 0.001) return 0;
+    const raw = Math.round((dropX - layout.startX) / layout.step);
+    return Math.max(0, Math.min(layout.count - 1, raw));
+  }
+
   startDrag(id: string, pointerX: number, pointerY: number): void {
     const card = this.visualCards.find((c) => c.id === id);
     if (!card || !card.draggable) return;
     this.draggingId = id;
+    this.dragKind = card.kind;
     this.dragPointerX = pointerX;
     this.dragPointerY = pointerY;
     this.dragOffsetX = card.moveable.vx - pointerX;
     this.dragOffsetY = card.moveable.vy - pointerY;
+    this.dragPreviewIndex =
+      card.kind === 'hand' || card.kind === 'joker' ? card.index : null;
     card.moveable.dragging = true;
   }
 
   updateDrag(pointerX: number, pointerY: number): void {
     this.dragPointerX = pointerX;
     this.dragPointerY = pointerY;
+    if (this.draggingId && (this.dragKind === 'hand' || this.dragKind === 'joker')) {
+      const dropX = this.dragPointerX + this.dragOffsetX;
+      this.dragPreviewIndex = this.computeDragPreviewIndex(this.dragKind, dropX);
+    }
+  }
+
+  cancelDrag(): void {
+    if (this.draggingId) {
+      const m = this.moveables.get(this.draggingId);
+      if (m) m.dragging = false;
+    }
+    this.draggingId = null;
+    this.dragKind = null;
+    this.dragPreviewIndex = null;
   }
 
   endDrag(): { kind: VisualEntityKind; fromIndex: number; toIndex: number } | null {
     if (!this.draggingId) return null;
     const card = this.visualCards.find((c) => c.id === this.draggingId);
     const prevId = this.draggingId;
+    const prevPreview = this.dragPreviewIndex;
     this.draggingId = null;
+    this.dragKind = null;
+    this.dragPreviewIndex = null;
 
     const m = this.moveables.get(prevId);
     if (m) m.dragging = false;
     if (!card) return null;
 
     if (card.kind === 'hand' || card.kind === 'joker') {
-      const siblings = this.visualCards
-        .filter((c) => c.kind === card.kind)
-        .sort((a, b) => a.index - b.index);
       const dropX = this.dragPointerX + this.dragOffsetX;
-      let targetIdx = siblings.length - 1;
-      for (let i = 0; i < siblings.length; i++) {
-        if (dropX < siblings[i]!.moveable.tx) {
-          targetIdx = i;
-          break;
+      const computed = this.computeDragPreviewIndex(card.kind, dropX);
+      let targetIdx = computed ?? prevPreview ?? card.index;
+      if (computed === null && prevPreview === null) {
+        const siblings = this.visualCards
+          .filter((c) => c.kind === card.kind)
+          .sort((a, b) => a.index - b.index);
+        targetIdx = siblings.length - 1;
+        for (let i = 0; i < siblings.length; i++) {
+          if (dropX < siblings[i]!.moveable.tx) {
+            targetIdx = i;
+            break;
+          }
         }
       }
       if (targetIdx !== card.index) {
@@ -680,23 +1160,31 @@ export class CardSceneManager {
     return null;
   }
 
-  updateHover(pointerX: number, pointerY: number): VisualCard | null {
-    let hit: VisualCard | null = null;
-    // Reverse Z-order hit test (front-most card wins)
-    for (let i = this.visualCards.length - 1; i >= 0; i--) {
-      const vc = this.visualCards[i]!;
-      const m = vc.moveable;
-      const hw = (m.vw * m.vScale) * 0.5;
-      const hh = (m.vh * m.vScale) * 0.5;
-      if (
-        pointerX >= m.vx - hw &&
-        pointerX <= m.vx + hw &&
-        pointerY >= m.vy - hh &&
-        pointerY <= m.vy + hh
-      ) {
-        hit = vc;
-        break;
+  updateHover(pointerX: number, pointerY: number, hitPadPx = 0): VisualCard | null {
+    const findHit = (pad: number): VisualCard | null => {
+      // Reverse Z-order hit test (front-most card wins)
+      for (let i = this.visualCards.length - 1; i >= 0; i--) {
+        const vc = this.visualCards[i]!;
+        const m = vc.moveable;
+        const hw = m.vw * m.vScale * 0.5 + pad;
+        const hh = m.vh * m.vScale * 0.5 + pad;
+        if (
+          pointerX >= m.vx - hw &&
+          pointerX <= m.vx + hw &&
+          pointerY >= m.vy - hh &&
+          pointerY <= m.vy + hh
+        ) {
+          return vc;
+        }
       }
+      return null;
+    };
+
+    // Pass 1: exact hit so tight overlapping hands always hit the card directly under pointer.
+    // Pass 2: forgiving touch padding only when exact hit missed.
+    let hit = findHit(0);
+    if (!hit && hitPadPx > 0) {
+      hit = findHit(hitPadPx);
     }
 
     this.hoveredId = hit ? hit.id : null;
@@ -731,12 +1219,23 @@ export class CardSceneManager {
     reducedMotion: boolean,
     dt: number,
     nowSec: number,
-    scoringCardIds?: ReadonlySet<string> | null
+    scoringCardIds?: ReadonlySet<string> | null,
+    previewScoringIds?: ReadonlySet<string> | null,
+    forcedCardId?: string | null
   ): void {
-    this.geometry = computeTableGeometry(viewportW, viewportH);
+    const safeInsets = this.getActiveSafeInsets(viewportW, viewportH);
+    this.geometry = computeTableGeometry(viewportW, viewportH, safeInsets);
     const g = this.geometry;
+    const aspect = LAYOUT.CARD_W / LAYOUT.CARD_H;
     const faceAtlas: AtlasKey = highContrast ? 'cards_2' : 'cards_1';
     const deckBack = getDeckBackPos(state.deckId);
+
+    const effectiveForcedId =
+      forcedCardId !== undefined
+        ? forcedCardId
+        : state.phase === 'PLAYING'
+          ? (state.tracking?.ceruleanBellForcedCardId ?? null)
+          : null;
 
     const cardById = new Map<string, CardInstance>();
     for (const c of state.fullDeck) cardById.set(c.id, c);
@@ -774,13 +1273,58 @@ export class CardSceneManager {
       return m;
     };
 
+    const computePartedSlotX = (
+      idx: number,
+      fromIdx: number,
+      previewIdx: number,
+      startX: number,
+      step: number
+    ): number => {
+      let visualSlot = idx;
+      if (fromIdx < previewIdx && idx > fromIdx && idx <= previewIdx) {
+        visualSlot = idx - 1;
+      } else if (fromIdx > previewIdx && idx >= previewIdx && idx < fromIdx) {
+        visualSlot = idx + 1;
+      }
+      let x = startX + visualSlot * step;
+      if (step > 0) {
+        const gapNudge = Math.min(10, step * 0.14);
+        if (visualSlot < previewIdx) {
+          x -= gapNudge;
+        } else if (visualSlot > previewIdx) {
+          x += gapNudge;
+        }
+      }
+      return x;
+    };
+
     // --- TITLE PHASE: Iconic Dramatic Single Oversized Ace of Spades in Vortex Core ---
     if (state.phase === 'TITLE') {
-      const showcaseW = Math.round(g.cardW * 1.65);
-      const showcaseH = Math.round(g.cardH * 1.65);
+      this.handSlotLayout = { startX: 0, step: 0, count: 0 };
+      this.jokerSlotLayout = { startX: 0, step: 0, count: 0 };
+
+      const targetMult =
+        g.mode === 'mobile-portrait' ? 1.72 : g.mode === 'mobile-landscape' ? 1.42 : 1.65;
+      const maxShowcaseH =
+        g.mode === 'desktop'
+          ? Math.round(g.cardH * 1.65)
+          : Math.round(
+              Math.min(
+                g.cardH * targetMult,
+                (g.viewportH - g.safeInsets.top - g.safeInsets.bottom) * 0.34,
+                ((g.viewportW - g.safeInsets.left - g.safeInsets.right) * 0.46) / aspect
+              )
+            );
+      const showcaseH = Math.max(96, maxShowcaseH);
+      const showcaseW = Math.round(showcaseH * aspect);
       const cx = g.viewportW * 0.5;
-      const cy = g.viewportH * 0.49;
-      const bob = reducedMotion ? 0 : Math.sin(nowSec * 1.55) * 6;
+      const cy =
+        g.mode === 'mobile-portrait'
+          ? g.viewportH * 0.47
+          : g.mode === 'mobile-landscape'
+            ? g.viewportH * 0.5
+            : g.viewportH * 0.49;
+      const bob = reducedMotion ? 0 : Math.sin(nowSec * 1.55) * (g.compact ? 4 : 6);
       const sway = reducedMotion ? 0 : Math.sin(nowSec * 0.92) * 0.042;
       const isNewTitleAce = !this.moveables.has('title_ace');
       const m = ensureMoveable('title_ace', cx, cy + 20, showcaseW, showcaseH, false, 0);
@@ -815,22 +1359,41 @@ export class CardSceneManager {
     } else {
       // --- 1. JOKER TRAY (Always visible during run) ---
       const jCount = state.jokers.length;
-      const jCardH = Math.round(g.cardH * 0.94);
-      const jCardW = Math.round(g.cardW * 0.94);
-      const jPad = 14;
+      const jCardScale = g.compact ? 0.92 : 0.94;
+      const jCardH = Math.round(g.cardH * jCardScale);
+      const jCardW = Math.round(g.cardW * jCardScale);
+      const jPad = g.compact ? 8 : 14;
       const jAvailW = Math.max(jCardW, g.jokerTray.w - jPad * 2 - jCardW);
-      const jStep = jCount > 1 ? Math.min(jCardW + 10, jAvailW / (jCount - 1)) : 0;
+      const jStep = jCount > 1 ? Math.min(jCardW + (g.compact ? 6 : 10), jAvailW / (jCount - 1)) : 0;
       const jSpan = jStep * Math.max(0, jCount - 1);
       const jStartX = g.jokerTray.x + g.jokerTray.w * 0.5 - jSpan * 0.5;
-      const jCenterY = g.jokerTray.y + g.jokerTray.h * 0.5 - 3;
+      const jCenterY = g.jokerTray.y + g.jokerTray.h * 0.5 - (g.compact ? 1 : 3);
+
+      this.jokerSlotLayout = { startX: jStartX, step: jStep, count: jCount };
+
+      const draggedJokerIdx =
+        this.draggingId && this.dragKind === 'joker'
+          ? state.jokers.findIndex((j) => j.id === this.draggingId)
+          : -1;
+      const jokerPreviewIdx =
+        draggedJokerIdx >= 0
+          ? this.computeDragPreviewIndex('joker', this.dragPointerX + this.dragOffsetX)
+          : null;
+      if (draggedJokerIdx >= 0) {
+        this.dragPreviewIndex = jokerPreviewIdx;
+      }
 
       state.jokers.forEach((joker, idx) => {
         const def = JOKER_MAP[joker.key];
         const shape = getJokerShapeDimensions(joker.key, jCardW, jCardH);
-        const m = ensureMoveable(joker.id, jStartX + idx * jStep, jCenterY, shape.tw, shape.th);
+        const slotX =
+          draggedJokerIdx >= 0 && jokerPreviewIdx !== null && idx !== draggedJokerIdx
+            ? computePartedSlotX(idx, draggedJokerIdx, jokerPreviewIdx, jStartX, jStep)
+            : jStartX + idx * jStep;
+        const m = ensureMoveable(joker.id, slotX, jCenterY, shape.tw, shape.th);
         m.syncFaceDown(joker.faceDown, reducedMotion);
 
-        m.tx = jStartX + idx * jStep;
+        m.tx = slotX;
         m.ty = jCenterY + (reducedMotion ? 0 : Math.sin(nowSec * 1.65 + idx * 0.95) * 1.8);
         m.tw = shape.tw;
         m.th = shape.th;
@@ -866,13 +1429,14 @@ export class CardSceneManager {
 
       // --- 2. CONSUMABLE TRAY (Always visible during run) ---
       const cCount = state.consumables.length;
-      const cCardH = Math.round(g.cardH * 0.94);
-      const cCardW = Math.round(g.cardW * 0.94);
-      const cAvailW = Math.max(cCardW, g.consumableTray.w - 28 - cCardW);
-      const cStep = cCount > 1 ? Math.min(cCardW + 10, cAvailW / (cCount - 1)) : 0;
+      const cCardH = Math.round(g.cardH * jCardScale);
+      const cCardW = Math.round(g.cardW * jCardScale);
+      const cPad = g.compact ? 12 : 28;
+      const cAvailW = Math.max(cCardW, g.consumableTray.w - cPad - cCardW);
+      const cStep = cCount > 1 ? Math.min(cCardW + (g.compact ? 6 : 10), cAvailW / (cCount - 1)) : 0;
       const cSpan = cStep * Math.max(0, cCount - 1);
       const cStartX = g.consumableTray.x + g.consumableTray.w * 0.5 - cSpan * 0.5;
-      const cCenterY = g.consumableTray.y + g.consumableTray.h * 0.5 - 3;
+      const cCenterY = g.consumableTray.y + g.consumableTray.h * 0.5 - (g.compact ? 1 : 3);
 
       state.consumables.forEach((cons, idx) => {
         const def = CONSUMABLE_MAP[cons.key];
@@ -908,7 +1472,12 @@ export class CardSceneManager {
       // --- 3. PLAY AREA (PLAYING / SCORING) ---
       if (state.phase === 'PLAYING' || state.phase === 'SCORING') {
         const pCount = state.playArea.length;
-        const pStep = pCount > 1 ? Math.min(g.cardW + 18, (g.playArea.w - g.cardW - 40) / (pCount - 1)) : 0;
+        const pPad = g.compact ? 16 : 40;
+        const pMaxGap = g.compact ? 10 : 18;
+        const pStep =
+          pCount > 1
+            ? Math.min(g.cardW + pMaxGap, Math.max(24, (g.playArea.w - g.cardW - pPad) / (pCount - 1)))
+            : 0;
         const pSpan = pStep * Math.max(0, pCount - 1);
         const pStartX = g.playArea.x + g.playArea.w * 0.5 - pSpan * 0.5;
         const pCenterY = g.playArea.y + g.playArea.h * 0.5;
@@ -940,42 +1509,92 @@ export class CardSceneManager {
               false,
               faceAtlas,
               deckBack,
-              isNonScoring
+              isNonScoring,
+              false,
+              false
             )
           );
         });
       }
 
       // --- 4. PLAYER HAND TRAY + DECK PILE (PLAYING / SCORING / PACK_OPEN with needsHand) ---
+      const isPackWithHand = state.phase === 'PACK_OPEN' && Boolean(state.pack?.needsHand);
       const showHand =
-        state.phase === 'PLAYING' ||
-        state.phase === 'SCORING' ||
-        (state.phase === 'PACK_OPEN' && Boolean(state.pack?.needsHand));
+        state.phase === 'PLAYING' || state.phase === 'SCORING' || isPackWithHand;
+
+      // In tight mobile-landscape PACK_OPEN (where the bottom action bar is hidden),
+      // shift hand & deck neatly down into the unused action bar zone so pack cards stay spacious.
+      const handPackOffsetY =
+        isPackWithHand && g.mode === 'mobile-landscape'
+          ? Math.round(g.actionBar.h * 0.78)
+          : 0;
 
       if (showHand) {
         const hCount = state.hand.length;
-        const hAvailW = Math.max(g.cardW, g.handTray.w - g.cardW - 36);
-        const hStep = hCount > 1 ? Math.min(g.cardW + 8, hAvailW / (hCount - 1)) : 0;
+        const hPad = g.compact ? 14 : 36;
+        const hAvailW = Math.max(g.cardW, g.handTray.w - g.cardW - hPad);
+        const hStep = hCount > 1 ? Math.min(g.cardW + (g.compact ? 5 : 8), hAvailW / (hCount - 1)) : 0;
         const hSpan = hStep * Math.max(0, hCount - 1);
         const hStartX = g.handTray.x + g.handTray.w * 0.5 - hSpan * 0.5;
-        const hBaseY = g.handTray.y + g.handTray.h * 0.5 + g.highlightLift * 0.4;
+        const hBaseY = g.handTray.y + handPackOffsetY + g.handTray.h * 0.5 + g.highlightLift * 0.4;
         const midIdx = (hCount - 1) * 0.5;
+
+        this.handSlotLayout = { startX: hStartX, step: hStep, count: hCount };
+
+        const draggedHandIdx =
+          this.draggingId && this.dragKind === 'hand'
+            ? state.hand.indexOf(this.draggingId)
+            : -1;
+        const handPreviewIdx =
+          draggedHandIdx >= 0
+            ? this.computeDragPreviewIndex('hand', this.dragPointerX + this.dragOffsetX)
+            : null;
+        if (draggedHandIdx >= 0) {
+          this.dragPreviewIndex = handPreviewIdx;
+        }
+
+        const arcAmp = g.mode === 'mobile-landscape' ? 8 : g.mode === 'mobile-portrait' ? 11 : 15;
+        const rotAmp = g.compact ? 0.056 : 0.072;
+
+        // Deck pile card dimensions scaled cleanly to fit inside g.deckPile across all modes
+        const deckCardH = Math.min(g.cardH, g.deckPile.h);
+        const deckCardW = Math.min(
+          g.cardW,
+          Math.max(38, Math.min(Math.round(deckCardH * aspect), g.deckPile.w - 4))
+        );
+        const deckCenterX = g.deckPile.x + g.deckPile.w * 0.5;
+        const deckCenterY = g.deckPile.y + handPackOffsetY + g.deckPile.h * 0.5;
 
         state.hand.forEach((cid, idx) => {
           const card = cardById.get(cid);
           if (!card) return;
           const isSelected = state.selectedCardIds.includes(cid);
-          const normOff = hCount > 1 ? (idx - midIdx) / Math.max(1, midIdx) : 0;
-          const arcY = normOff * normOff * 15;
-          const arcRot = normOff * 0.072;
+          const isForced = effectiveForcedId !== null && cid === effectiveForcedId;
+          const isScoringPreview =
+            state.phase === 'PLAYING' && isSelected && Boolean(previewScoringIds?.has(cid));
+
+          let visualSlot = idx;
+          if (draggedHandIdx >= 0 && handPreviewIdx !== null && idx !== draggedHandIdx) {
+            if (draggedHandIdx < handPreviewIdx && idx > draggedHandIdx && idx <= handPreviewIdx) {
+              visualSlot = idx - 1;
+            } else if (draggedHandIdx > handPreviewIdx && idx >= handPreviewIdx && idx < draggedHandIdx) {
+              visualSlot = idx + 1;
+            }
+          }
+          const slotX =
+            draggedHandIdx >= 0 && handPreviewIdx !== null && idx !== draggedHandIdx
+              ? computePartedSlotX(idx, draggedHandIdx, handPreviewIdx, hStartX, hStep)
+              : hStartX + idx * hStep;
+
+          const normOff = hCount > 1 ? (visualSlot - midIdx) / Math.max(1, midIdx) : 0;
+          const arcY = normOff * normOff * arcAmp;
+          const arcRot = normOff * rotAmp;
 
           // Newly drawn cards fly smoothly out of the Deck Pile and flip face-up!
-          const spawnX = g.deckPile.x + g.deckPile.w * 0.5;
-          const spawnY = g.deckPile.y + g.deckPile.h * 0.5;
           const m = ensureMoveable(
             card.id,
-            spawnX,
-            spawnY,
+            deckCenterX,
+            deckCenterY,
             g.cardW,
             g.cardH,
             !card.faceDown,
@@ -984,12 +1603,17 @@ export class CardSceneManager {
           m.syncFaceDown(card.faceDown, reducedMotion);
 
           const idleBreath = reducedMotion ? 0 : Math.sin(nowSec * 1.4 + idx * 0.75) * 1.2;
-          m.tx = hStartX + idx * hStep;
-          m.ty = hBaseY + arcY + idleBreath - (isSelected ? g.highlightLift : 0);
+          const forcedPulse =
+            isForced && !reducedMotion ? Math.sin(nowSec * 4.5) * 2.2 : 0;
+          const extraLift =
+            (isScoringPreview ? 3 : 0) + (isForced && !isSelected ? 6 : 0);
+
+          m.tx = slotX;
+          m.ty = hBaseY + arcY + idleBreath + forcedPulse - (isSelected ? g.highlightLift : 0) - extraLift;
           m.tw = g.cardW;
           m.th = g.cardH;
           m.tr = arcRot;
-          m.tScale = isSelected ? 1.035 : 1.0;
+          m.tScale = isScoringPreview ? 1.05 : isSelected ? 1.035 : isForced ? 1.03 : 1.0;
 
           nextVisuals.push(
             makePlayingCardVisual(
@@ -997,27 +1621,35 @@ export class CardSceneManager {
               'hand',
               idx,
               m,
-              80 + idx + (isSelected ? 12 : 0),
+              80 + idx + (isSelected ? 12 : 0) + (isForced ? 4 : 0),
               isSelected,
               state.phase === 'PLAYING' || state.phase === 'PACK_OPEN',
               faceAtlas,
               deckBack,
-              false
+              false,
+              isForced,
+              isScoringPreview
             )
           );
         });
 
-        // Deck Pile stack preview (up to 3 stacked backs)
-        const stackCount = state.drawPile.length > 0 ? Math.min(3, Math.ceil(state.drawPile.length / 18)) : 0;
+        // Deck Pile stack preview scaled smoothly with drawPile.length (1..4 cards)
+        const maxDeck = Math.max(40, state.fullDeck.length);
+        const stackCount =
+          state.drawPile.length <= 0
+            ? 0
+            : Math.min(4, Math.max(1, Math.ceil((state.drawPile.length / maxDeck) * 4)));
+        const stackStepX = g.compact ? 1.6 : 2.1;
+        const stackStepY = g.compact ? 2.0 : 2.5;
         for (let s = 0; s < stackCount; s++) {
           const id = `deck_pile_${s}`;
-          const dx = g.deckPile.x + g.deckPile.w * 0.5 - (stackCount - 1 - s) * 2.5;
-          const dy = g.deckPile.y + g.deckPile.h * 0.5 - s * 3;
-          const m = ensureMoveable(id, dx, dy, g.cardW, g.cardH);
+          const dx = deckCenterX - (stackCount - 1 - s) * stackStepX;
+          const dy = deckCenterY - s * stackStepY;
+          const m = ensureMoveable(id, dx, dy, deckCardW, deckCardH);
           m.tx = dx;
           m.ty = dy;
-          m.tw = g.cardW;
-          m.th = g.cardH;
+          m.tw = deckCardW;
+          m.th = deckCardH;
           m.tr = 0;
           m.tScale = 1;
           nextVisuals.push({
@@ -1036,18 +1668,48 @@ export class CardSceneManager {
             faceDown: true,
           });
         }
+      } else {
+        this.handSlotLayout = { startX: 0, step: 0, count: 0 };
       }
 
       // --- 5. SHOP OFFERS, VOUCHERS, AND BOOSTERS ---
       if (state.phase === 'SHOP' && state.shop) {
         const activeOffers = state.shop.offers.filter((o) => !o.sold);
         const sCount = activeOffers.length;
-        const sCardH = Math.round(g.cardH * 0.96);
-        const sCardW = Math.round(g.cardW * 0.96);
-        const sStep = sCount > 1 ? Math.min(sCardW + 30, (g.shopOfferTray.w - sCardW - 36) / (sCount - 1)) : 0;
+
+        let sCardH: number;
+        let sCardW: number;
+        let sY: number;
+        let vY: number;
+        let bY: number;
+
+        if (g.mode === 'desktop') {
+          sCardH = Math.round(g.cardH * 0.96);
+          sCardW = Math.round(g.cardW * 0.96);
+          sY = g.shopOfferTray.y + sCardH * 0.5 + 20;
+          vY = g.shopVoucherTray.y + sCardH * 0.5 + 10;
+          bY = g.shopBoosterTray.y + sCardH * 0.5 + 10;
+        } else {
+          // Reserve crisp vertical space for top price tags & bottom BUY/REDEEM/OPEN buttons
+          const reserveH = g.mode === 'mobile-landscape' ? 48 : 54;
+          const topTagRoom = g.mode === 'mobile-landscape' ? 18 : 22;
+          const scaleFactor = g.mode === 'mobile-landscape' ? 0.9 : 0.94;
+          const maxRowCardH = Math.max(50, g.shopOfferTray.h - reserveH);
+          sCardH = Math.min(Math.round(g.cardH * scaleFactor), maxRowCardH);
+          sCardW = Math.round(sCardH * aspect);
+          sY = g.shopOfferTray.y + topTagRoom + sCardH * 0.5;
+          vY = g.shopVoucherTray.y + topTagRoom + sCardH * 0.5;
+          bY = g.shopBoosterTray.y + topTagRoom + sCardH * 0.5;
+        }
+
+        const offerPad = g.compact ? 16 : 36;
+        const offerGap = g.compact ? 14 : 30;
+        const sStep =
+          sCount > 1
+            ? Math.min(sCardW + offerGap, Math.max(24, (g.shopOfferTray.w - sCardW - offerPad) / (sCount - 1)))
+            : 0;
         const sSpan = sStep * Math.max(0, sCount - 1);
         const sStartX = g.shopOfferTray.x + g.shopOfferTray.w * 0.5 - sSpan * 0.5;
-        const sY = g.shopOfferTray.y + sCardH * 0.5 + 20;
 
         activeOffers.forEach((offer, idx) => {
           const shape =
@@ -1068,16 +1730,22 @@ export class CardSceneManager {
 
         // Vouchers (with shimmering voucher.fs overlay pass!)
         const activeVouchers = state.shop.vouchers.filter((v) => !v.redeemed);
+        const vStep =
+          activeVouchers.length > 1
+            ? Math.min(
+                sCardW + (g.compact ? 8 : 14),
+                Math.max(22, (g.shopVoucherTray.w - sCardW - 12) / (activeVouchers.length - 1))
+              )
+            : 0;
         activeVouchers.forEach((vo, idx) => {
           const vDef = VOUCHER_MAP[vo.key];
           const vx =
             g.shopVoucherTray.x +
             g.shopVoucherTray.w * 0.5 +
-            (idx - (activeVouchers.length - 1) * 0.5) * (sCardW + 14);
-          const vy = g.shopVoucherTray.y + sCardH * 0.5 + 10;
-          const m = ensureMoveable(vo.id, vx, vy + 24, sCardW, sCardH);
+            (idx - (activeVouchers.length - 1) * 0.5) * vStep;
+          const m = ensureMoveable(vo.id, vx, vY + 24, sCardW, sCardH);
           m.tx = vx;
-          m.ty = vy + (reducedMotion ? 0 : Math.sin(nowSec * 1.7 + idx * 1.3) * 2.2);
+          m.ty = vY + (reducedMotion ? 0 : Math.sin(nowSec * 1.7 + idx * 1.3) * 2.2);
           m.tw = sCardW;
           m.th = sCardH;
           m.tr = reducedMotion ? 0 : Math.cos(nowSec * 1.3 + idx) * 0.022;
@@ -1104,10 +1772,17 @@ export class CardSceneManager {
 
         // Boosters (with glossy booster.fs foil sheen overlay pass!)
         const activeBoosters = state.shop.boosters.filter((b) => !b.opened);
-        const bStep = activeBoosters.length > 1 ? Math.min(sCardW + 34, (g.shopBoosterTray.w - sCardW - 36) / (activeBoosters.length - 1)) : 0;
+        const boosterPad = g.compact ? 16 : 36;
+        const boosterGap = g.compact ? 16 : 34;
+        const bStep =
+          activeBoosters.length > 1
+            ? Math.min(
+                sCardW + boosterGap,
+                Math.max(24, (g.shopBoosterTray.w - sCardW - boosterPad) / (activeBoosters.length - 1))
+              )
+            : 0;
         const bSpan = bStep * Math.max(0, activeBoosters.length - 1);
         const bStartX = g.shopBoosterTray.x + g.shopBoosterTray.w * 0.5 - bSpan * 0.5;
-        const bY = g.shopBoosterTray.y + sCardH * 0.5 + 10;
         activeBoosters.forEach((bo, idx) => {
           const bDef = BOOSTER_MAP[bo.key];
           const m = ensureMoveable(bo.id, bStartX + idx * bStep, bY + 24, sCardW, sCardH);
@@ -1142,12 +1817,71 @@ export class CardSceneManager {
       if (state.phase === 'PACK_OPEN' && state.pack) {
         const avail = state.pack.cards.filter((c) => !c.taken);
         const pCount = avail.length;
-        const pCardH = Math.round(g.cardH * 1.04);
-        const pCardW = Math.round(g.cardW * 1.04);
-        const pStep = pCount > 1 ? Math.min(pCardW + 24, (g.packTray.w - pCardW - 40) / (pCount - 1)) : 0;
+
+        let pCardH: number;
+        let pCardW: number;
+        let pY: number;
+
+        if (g.mode === 'desktop') {
+          if (state.pack.needsHand && g.viewportH < 640) {
+            const topEdge = g.packTray.y + 34;
+            const bottomEdge = g.handTray.y - 32;
+            const availH = Math.max(64, bottomEdge - topEdge);
+            pCardH = Math.min(Math.round(g.cardH * 0.96), availH);
+            pCardW = Math.round(pCardH * aspect);
+            pY = topEdge + availH * 0.5;
+          } else {
+            pCardH = Math.round(g.cardH * 1.04);
+            pCardW = Math.round(g.cardW * 1.04);
+            pY = g.packTray.y + 52 + pCardH * 0.52;
+            if (state.pack.needsHand) {
+              const maxCenterY = g.handTray.y - pCardH * 0.5 - 32;
+              pY = Math.min(pY, Math.max(g.packTray.y + 40 + pCardH * 0.5, maxCenterY));
+            }
+          }
+        } else if (g.mode === 'mobile-landscape') {
+          if (state.pack.needsHand) {
+            const topEdge = g.packTray.y + 28;
+            const bottomEdge = g.handTray.y + handPackOffsetY - 34;
+            const availH = Math.max(52, bottomEdge - topEdge);
+            pCardH = Math.min(Math.round(g.cardH * 0.96), availH);
+            pCardW = Math.round(pCardH * aspect);
+            pY = topEdge + availH * 0.5;
+          } else {
+            const topEdge = g.packTray.y + 34;
+            const bottomEdge = g.viewportH - g.safeInsets.bottom - 38;
+            const availH = Math.max(70, bottomEdge - topEdge);
+            pCardH = Math.min(Math.round(g.cardH * 1.1), availH);
+            pCardW = Math.round(pCardH * aspect);
+            pY = topEdge + availH * 0.5;
+          }
+        } else {
+          // mobile-portrait
+          if (state.pack.needsHand) {
+            const topEdge = g.packTray.y + 38;
+            const bottomEdge = g.handTray.y - 38;
+            const availH = Math.max(66, bottomEdge - topEdge);
+            pCardH = Math.min(Math.round(g.cardH * 1.0), availH);
+            pCardW = Math.round(pCardH * aspect);
+            pY = topEdge + availH * 0.5;
+          } else {
+            const topEdge = g.packTray.y + 44;
+            const bottomEdge = g.viewportH - g.safeInsets.bottom - 50;
+            const availH = Math.max(88, bottomEdge - topEdge);
+            pCardH = Math.min(Math.round(g.cardH * 1.14), 160, availH);
+            pCardW = Math.round(pCardH * aspect);
+            pY = topEdge + availH * 0.46;
+          }
+        }
+
+        const pPad = g.compact ? 16 : 40;
+        const pGap = g.compact ? 12 : 24;
+        const pStep =
+          pCount > 1
+            ? Math.min(pCardW + pGap, Math.max(24, (g.packTray.w - pCardW - pPad) / (pCount - 1)))
+            : 0;
         const pSpan = pStep * Math.max(0, pCount - 1);
         const pStartX = g.packTray.x + g.packTray.w * 0.5 - pSpan * 0.5;
-        const pY = g.packTray.y + 52 + pCardH * 0.52;
 
         avail.forEach((pc, idx) => {
           const shape =
@@ -1167,7 +1901,7 @@ export class CardSceneManager {
           m.ty = pY + (reducedMotion ? 0 : Math.sin(nowSec * 2 + idx) * 3);
           m.tw = shape.tw;
           m.th = shape.th;
-          m.tr = (idx - (pCount - 1) * 0.5) * 0.038;
+          m.tr = (idx - (pCount - 1) * 0.5) * (g.compact ? 0.028 : 0.038);
           m.tScale = 1;
           const vis = makePackCardVisual(pc, idx, m, 95 + idx, faceAtlas, deckBack, shape.cardShape);
           nextVisuals.push(vis);
@@ -1185,6 +1919,8 @@ export class CardSceneManager {
         dragged.zIndex = 200;
       } else {
         this.draggingId = null;
+        this.dragKind = null;
+        this.dragPreviewIndex = null;
       }
     }
 
@@ -1215,7 +1951,9 @@ function makePlayingCardVisual(
   draggable: boolean,
   faceAtlas: AtlasKey,
   deckBack: AtlasPos,
-  nonScoring: boolean
+  nonScoring: boolean,
+  forced = false,
+  scoringPreview = false
 ): VisualCard {
   const displayFaceDown = moveable.getDisplayFaceDown(card.faceDown);
   const isStone = card.enhancement === 'm_stone';
@@ -1238,6 +1976,8 @@ function makePlayingCardVisual(
     seal: card.seal,
     debuffed: card.debuffed,
     faceDown: displayFaceDown,
+    forced,
+    scoringPreview,
     nonScoring,
     flipScaleX: moveable.getFlipScaleX(),
     cardData: card,

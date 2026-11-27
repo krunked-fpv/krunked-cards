@@ -310,11 +310,59 @@ export class WebGL2Renderer {
   private cssW = 1280;
   private cssH = 720;
   private dpr = 1;
+  private contextLost = false;
+  private boundContextLost: (e: Event) => void;
+  private boundContextRestored: () => void;
 
   constructor(canvas: HTMLCanvasElement, packManager: PackManager) {
     this.canvas = canvas;
     this.packManager = packManager;
+    this.boundContextLost = this.handleContextLost.bind(this);
+    this.boundContextRestored = this.handleContextRestored.bind(this);
+    this.canvas.addEventListener('webglcontextlost', this.boundContextLost, false);
+    this.canvas.addEventListener('webglcontextrestored', this.boundContextRestored, false);
     this.initContext();
+  }
+
+  private clearGlResourceRefs(): void {
+    this.textures.clear();
+    this.sceneTex = null;
+    this.sceneFbo = null;
+    this.fboW = 0;
+    this.fboH = 0;
+    this.particleInstanceVbo = null;
+    this.particleVao = null;
+    this.quadVbo = null;
+    this.quadVao = null;
+    this.emptyVao = null;
+    this.splashProg = null;
+    this.bgProg = null;
+    this.spriteProg = null;
+    this.flameProg = null;
+    this.particleProg = null;
+    this.flashProg = null;
+    this.crtProg = null;
+    this.uniforms = null;
+  }
+
+  private handleContextLost(e: Event): void {
+    e.preventDefault();
+    this.contextLost = true;
+    this.clearGlResourceRefs();
+  }
+
+  private handleContextRestored(): void {
+    this.contextLost = false;
+    this.clearGlResourceRefs();
+    this.initContext();
+    if (this.gl && !this.gl.isContextLost()) {
+      const pw = Math.max(1, Math.round(this.cssW * this.dpr));
+      const ph = Math.max(1, Math.round(this.cssH * this.dpr));
+      this.canvas.width = pw;
+      this.canvas.height = ph;
+      this.rebuildSceneFbo(pw, ph);
+      this.uploadAllAtlases();
+    }
   }
 
   isWebGL2(): boolean {
@@ -490,7 +538,7 @@ export class WebGL2Renderer {
   uploadAllAtlases(): void {
     const all = this.packManager.getAllActiveAtlases();
     this.measureSpecialJokerCrops(all.Joker);
-    if (!this.gl) return;
+    if (!this.gl || this.contextLost || this.gl.isContextLost()) return;
     for (const key of ATLAS_KEYS) {
       this.uploadAtlas(key, all[key]);
     }
@@ -548,7 +596,7 @@ export class WebGL2Renderer {
 
   private uploadAtlas(key: AtlasKey, source: AtlasImageSource): void {
     const gl = this.gl;
-    if (!gl) return;
+    if (!gl || this.contextLost || gl.isContextLost()) return;
     let tex = this.textures.get(key);
     if (!tex) {
       const created = gl.createTexture();
@@ -565,34 +613,46 @@ export class WebGL2Renderer {
   }
 
   resize(cssWidth: number, cssHeight: number): void {
-    this.cssW = Math.max(320, Math.floor(cssWidth));
-    this.cssH = Math.max(240, Math.floor(cssHeight));
-    this.dpr = Math.min(2, window.devicePixelRatio || 1);
-    const pw = Math.floor(this.cssW * this.dpr);
-    const ph = Math.floor(this.cssH * this.dpr);
+    const safeCssW = Math.max(1, Math.round(Number.isFinite(cssWidth) ? cssWidth : 1));
+    const safeCssH = Math.max(1, Math.round(Number.isFinite(cssHeight) ? cssHeight : 1));
+    this.cssW = safeCssW;
+    this.cssH = safeCssH;
+    const rawDpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    this.dpr = Math.max(1, Math.min(2, Number.isFinite(rawDpr) ? rawDpr : 1));
+    const pw = Math.max(1, Math.round(this.cssW * this.dpr));
+    const ph = Math.max(1, Math.round(this.cssH * this.dpr));
 
     if (this.canvas.width !== pw || this.canvas.height !== ph) {
       this.canvas.width = pw;
       this.canvas.height = ph;
     }
 
-    if (this.gl && (this.fboW !== pw || this.fboH !== ph)) {
+    if (this.gl && !this.contextLost && !this.gl.isContextLost() && (this.fboW !== pw || this.fboH !== ph)) {
       this.rebuildSceneFbo(pw, ph);
     }
   }
 
   private rebuildSceneFbo(pw: number, ph: number): void {
     const gl = this.gl;
-    if (!gl) return;
+    if (!gl || this.contextLost || gl.isContextLost()) return;
+    const safeW = Math.max(1, Math.round(pw));
+    const safeH = Math.max(1, Math.round(ph));
+
     if (this.sceneTex) gl.deleteTexture(this.sceneTex);
     if (this.sceneFbo) gl.deleteFramebuffer(this.sceneFbo);
+    this.sceneTex = null;
+    this.sceneFbo = null;
 
     const tex = gl.createTexture();
     const fbo = gl.createFramebuffer();
-    if (!tex || !fbo) return;
+    if (!tex || !fbo) {
+      if (tex) gl.deleteTexture(tex);
+      if (fbo) gl.deleteFramebuffer(fbo);
+      return;
+    }
 
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, pw, ph, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, safeW, safeH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -600,12 +660,21 @@ export class WebGL2Renderer {
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      gl.deleteTexture(tex);
+      gl.deleteFramebuffer(fbo);
+      this.fboW = 0;
+      this.fboH = 0;
+      return;
+    }
 
     this.sceneTex = tex;
     this.sceneFbo = fbo;
-    this.fboW = pw;
-    this.fboH = ph;
+    this.fboW = safeW;
+    this.fboH = safeH;
   }
 
   render(frame: RenderFrameInput): void {
@@ -642,15 +711,23 @@ export class WebGL2Renderer {
       ? 0
       : Math.max(0, this.glitchIntensity - safeDt * 2.4);
 
+    if (this.contextLost) {
+      return;
+    }
+
     if (!this.gl || !this.uniforms) {
       this.renderCanvas2D(frame);
       return;
     }
 
     const gl = this.gl;
+    if (gl.isContextLost()) {
+      this.contextLost = true;
+      return;
+    }
     const u = this.uniforms;
-    const pw = this.canvas.width;
-    const ph = this.canvas.height;
+    const pw = Math.max(1, this.canvas.width);
+    const ph = Math.max(1, this.canvas.height);
     const useCrt = frame.settings.crtAmount > 0.5;
     const usePostFbo =
       (useCrt || vortexStrength > 0.001 || this.glitchIntensity > 0.005) &&
@@ -852,9 +929,13 @@ export class WebGL2Renderer {
             ? 18
             : m.hovered
               ? 13
-              : vc.selected
-                ? 10
-                : 5.5;
+              : vc.forced
+                ? 13
+                : vc.scoringPreview
+                  ? 12
+                  : vc.selected
+                    ? 10
+                    : 5.5;
 
         const nonScoring = Boolean(vc.nonScoring);
         const primaryMode = getPrimaryCardMode(vc.edition, vc.debuffed, nonScoring);
@@ -895,6 +976,60 @@ export class WebGL2Renderer {
           white,
           cropH
         );
+
+        // 1B. Crisp pixel rim cues for Cerulean Bell forced card & scoring preview cards
+        if (vc.forced) {
+          const pulse = frame.settings.reducedMotion
+            ? 0.88
+            : 0.78 + 0.18 * Math.sin(frame.timeSec * 5.4);
+          const rimPad = frame.settings.reducedMotion
+            ? 6
+            : 6 + 1.5 * Math.sin(frame.timeSec * 5.4);
+          drawLayer(
+            vc.baseAtlas,
+            vc.basePos.x,
+            vc.basePos.y,
+            m.vx,
+            m.vy,
+            w + rimPad,
+            h + rimPad,
+            m.vr,
+            m.tiltX,
+            m.tiltY,
+            hoverFac,
+            SHADER_MODE.BASE,
+            effectX,
+            effectY,
+            m.dissolve,
+            false,
+            [1.0, 0.78, 0.22, pulse],
+            cropH
+          );
+        } else if (vc.scoringPreview && !vc.debuffed) {
+          const previewAlpha = frame.settings.reducedMotion
+            ? 0.52
+            : 0.48 + 0.12 * Math.sin(frame.timeSec * 3.6 + seed);
+          drawLayer(
+            vc.baseAtlas,
+            vc.basePos.x,
+            vc.basePos.y,
+            m.vx,
+            m.vy,
+            w + 4.5,
+            h + 4.5,
+            m.vr,
+            m.tiltX,
+            m.tiltY,
+            hoverFac,
+            SHADER_MODE.BASE,
+            effectX,
+            effectY,
+            m.dissolve,
+            false,
+            [0.32, 0.84, 1.0, previewAlpha],
+            cropH
+          );
+        }
 
         // 2. Base card / enhancement / Joker / Tarot / Voucher / Booster
         const baseTint =
@@ -1373,6 +1508,16 @@ export class WebGL2Renderer {
       ctx.fillStyle = 'rgba(0,0,0,0.28)';
       ctx.fillRect(-w / 2 + 4, -h / 2 + 7, w, h);
 
+      if (vc.forced) {
+        ctx.strokeStyle = 'rgba(255, 198, 56, 0.92)';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(-w / 2 - 2, -h / 2 - 2, w + 4, h + 4);
+      } else if (vc.scoringPreview && !vc.debuffed) {
+        ctx.strokeStyle = 'rgba(82, 214, 255, 0.72)';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(-w / 2 - 1.5, -h / 2 - 1.5, w + 3, h + 3);
+      }
+
       this.drawAtlasCell2D(ctx, vc.baseAtlas, vc.basePos.x, vc.basePos.y, -w / 2, -h / 2, w, h, cropH);
       draws++;
       if (vc.faceAtlas && vc.facePos) {
@@ -1440,8 +1585,13 @@ export class WebGL2Renderer {
   }
 
   dispose(): void {
+    this.canvas.removeEventListener('webglcontextlost', this.boundContextLost, false);
+    this.canvas.removeEventListener('webglcontextrestored', this.boundContextRestored, false);
     const gl = this.gl;
-    if (!gl) return;
+    if (!gl || this.contextLost || gl.isContextLost()) {
+      this.clearGlResourceRefs();
+      return;
+    }
     for (const tex of this.textures.values()) gl.deleteTexture(tex);
     this.textures.clear();
     if (this.sceneTex) gl.deleteTexture(this.sceneTex);
@@ -1458,5 +1608,6 @@ export class WebGL2Renderer {
     if (this.particleProg) gl.deleteProgram(this.particleProg);
     if (this.flashProg) gl.deleteProgram(this.flashProg);
     if (this.crtProg) gl.deleteProgram(this.crtProg);
+    this.clearGlResourceRefs();
   }
 }

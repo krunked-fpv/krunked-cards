@@ -2,14 +2,32 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#141a1d" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="mobile-web-app-capable" content="yes" />
     <title>Krunked Cards</title>
     <style>
-      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+      :root {
+        --sat: env(safe-area-inset-top, 0px);
+        --sar: env(safe-area-inset-right, 0px);
+        --sab: env(safe-area-inset-bottom, 0px);
+        --sal: env(safe-area-inset-left, 0px);
+      }
+      *, *::before, *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+        -webkit-tap-highlight-color: transparent;
+      }
       html, body {
-        width: 100%;
-        height: 100%;
+        width: 100vw;
+        height: 100vh;
+        width: 100dvw;
+        height: 100dvh;
         overflow: hidden;
+        overscroll-behavior: none;
         background: #141a1d;
         color: #ffffff;
         font-family: var(--krunked-font, 'KrunkedPixelBuiltin', monospace);
@@ -19,12 +37,17 @@
         text-rendering: geometricPrecision;
         user-select: none;
         -webkit-user-select: none;
+        -webkit-touch-callout: none;
+        -webkit-tap-highlight-color: transparent;
       }
       #app {
         position: relative;
         width: 100vw;
         height: 100vh;
+        width: 100dvw;
+        height: 100dvh;
         overflow: hidden;
+        overscroll-behavior: none;
       }
       #gl-canvas {
         position: absolute;
@@ -32,6 +55,8 @@
         width: 100%;
         height: 100%;
         display: block;
+        touch-action: none;
+        -webkit-tap-highlight-color: transparent;
         image-rendering: pixelated;
         image-rendering: crisp-edges;
       }
