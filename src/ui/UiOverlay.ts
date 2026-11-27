@@ -5329,12 +5329,7 @@ export class UiOverlay {
         letter-spacing: 0.04em;
       }
       .kc-mode-mobile-landscape .kc-pocket-stamp.inside {
-        top: 2px;
-        left: 6px;
-        bottom: auto;
-        right: auto;
-        font-size: 9px;
-        opacity: 0.72;
+        display: none;
       }
       .kc-price-tag.compact {
         font-size: 12px;
