@@ -6,35 +6,41 @@
 // ============================================================================
 
 import {
+  POKER_HAND_IDS,
   SAVE_STORAGE_KEY,
   SIM_HZ,
   type ArtPackMode,
   type CardInstance,
   type DebugBridge,
   type EditionId,
+  type GameSpeed,
   type IAudioEngine,
   type MusicTrackId,
   type PerfTelemetry,
+  type PokerHandId,
   type RenderSettings,
   type SimAction,
   type SimEvent,
   type SimState,
   type SoundKey,
+  type StakeLevel,
 } from '../contracts/index.ts';
-import { getCatalogSummary } from '../data/index.ts';
+import { BLIND_MAP, getCatalogSummary } from '../data/index.ts';
 import {
   createRngState,
   createTitleState,
   dispatchSim,
   evaluatePokerHand,
   getActiveBlind,
+  getForcedCardId,
   hashSimState,
+  previewSelectedHand,
   startRun,
   stepSimTick,
 } from '../sim/index.ts';
 import { createAudioEngine } from '../audio/index.ts';
 import { PackManager } from '../assets/PackManager.ts';
-import { CardSceneManager, type VisualCard } from '../render/Moveable.ts';
+import { CardSceneManager, readSafeAreaInsets, type VisualCard } from '../render/Moveable.ts';
 import { ParticleSystem } from '../render/ParticleSystem.ts';
 import { ScoreChoreographer } from '../render/ScoreChoreographer.ts';
 import { WebGL2Renderer } from '../render/WebGL2Renderer.ts';
@@ -82,6 +88,8 @@ export class GameApp {
   private fpsWindowStart = 0;
   private measuredFps = 60;
 
+  private lastViewportW = 0;
+  private lastViewportH = 0;
   private resizeHandler: () => void;
 
   constructor(canvas: HTMLCanvasElement, uiRoot: HTMLElement) {
@@ -97,6 +105,7 @@ export class GameApp {
 
     this.state = this.createInitialTitleState();
     this.scene = new CardSceneManager();
+    this.scene.setSafeInsets(readSafeAreaInsets());
     this.particles = new ParticleSystem();
     this.choreographer = new ScoreChoreographer();
     this.renderer = new WebGL2Renderer(this.canvas, this.packManager);
@@ -116,6 +125,10 @@ export class GameApp {
       onPlayButtonSfx: () => this.audio.playSfx('button'),
       hasSavedRun: () => this.saveManager.getActiveRun() !== null,
       getProfile: () => this.saveManager.getProfile(),
+      getRunHistory: () => this.saveManager.getRunHistory(),
+      onCycleGameSpeed: () => this.cycleGameSpeed(),
+      onReplaySeed: (deckId, stake, seed, challengeId) =>
+        this.replaySeed(deckId, stake, seed, challengeId),
     });
 
     this.input = new InputManager(this.canvas, this.scene, {
@@ -133,6 +146,32 @@ export class GameApp {
       onAudioUnlock: () => {
         void this.audio.unlock();
       },
+      onLongPressCard: (card, x, y) => {
+        this.ui.inspectCard(card, x, y, this.state);
+        this.audio.playSfx('highlight2');
+      },
+      onEmptyTap: () => {
+        this.ui.dismissInspect();
+        this.ui.setSelectedOwned(null);
+      },
+      onSwipeDeselect: () => {
+        if (
+          (this.state.phase === 'PLAYING' || this.state.phase === 'PACK_OPEN') &&
+          this.state.selectedCardIds.length > 0
+        ) {
+          this.audio.playSfx('cardSlide2');
+          this.dispatch({ type: 'DESELECT_ALL' });
+        }
+      },
+      onDragSlotChange: (_kind, idx) => {
+        this.audio.playSfx('cardSlide1', {
+          pitch: Math.min(1.8, 0.96 + idx * 0.04),
+          volume: 0.45,
+        });
+      },
+      onScoringFastForward: (active) => {
+        this.choreographer.setFastForward(active);
+      },
     });
 
     const bridge = this.createDebugBridge();
@@ -140,14 +179,31 @@ export class GameApp {
     this.debugDrawer = new DebugDrawer(this.uiRoot, bridge);
 
     this.resizeHandler = () => {
-      this.renderer.resize(window.innerWidth, window.innerHeight);
-      this.ui.invalidateAll();
+      this.handleViewportResize();
     };
     window.addEventListener('resize', this.resizeHandler);
+    window.addEventListener('orientationchange', this.resizeHandler);
+    window.visualViewport?.addEventListener('resize', this.resizeHandler);
+  }
+
+  private getViewportSize(): { width: number; height: number } {
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    const width = Math.max(1, Math.round(vv?.width ?? window.innerWidth));
+    const height = Math.max(1, Math.round(vv?.height ?? window.innerHeight));
+    return { width, height };
+  }
+
+  private handleViewportResize(): void {
+    const { width, height } = this.getViewportSize();
+    this.lastViewportW = width;
+    this.lastViewportH = height;
+    this.scene.setSafeInsets(readSafeAreaInsets());
+    this.renderer.resize(width, height);
+    this.ui.invalidateAll();
   }
 
   async start(): Promise<void> {
-    this.renderer.resize(window.innerWidth, window.innerHeight);
+    this.handleViewportResize();
 
     // Smart local dev pack auto-detection when no explicit save exists yet;
     // preserves DEFAULT_SETTINGS.artPackMode = 'builtin' for clean-room & tests!
@@ -267,9 +323,38 @@ export class GameApp {
     this.choreographer.reset();
     this.scoringCardIds = null;
     this.state = saved;
+    this.ui.dismissInspect();
+    this.ui.dismissBossBanner();
     this.ui.setSelectedOwned(null);
     this.ui.invalidateAll();
     this.syncMusicForPhase();
+  }
+
+  private cycleGameSpeed(): GameSpeed {
+    const order: GameSpeed[] = [1, 2, 4, 0.5];
+    const cur = this.saveManager.getSettings().gameSpeed;
+    const idx = order.indexOf(cur);
+    const next = order[(idx + 1) % order.length]!;
+    this.updateSettings({ gameSpeed: next });
+    this.ui.showToast(`Game Speed: ${next}x`, 1200);
+    return next;
+  }
+
+  private replaySeed(
+    deckId: string,
+    stake: StakeLevel,
+    seed: string,
+    challengeId: string | null = null
+  ): void {
+    this.ui.openModal(null);
+    this.ui.dismissInspect();
+    this.dispatch({
+      type: 'START_RUN',
+      deckId,
+      stake,
+      seed: seed.trim() || undefined,
+      challengeId,
+    });
   }
 
   private computeScoringCardIds(state: SimState): Set<string> {
@@ -303,6 +388,17 @@ export class GameApp {
   dispatch(action: SimAction): SimState {
     try {
       const prevPhase = this.state.phase;
+      const prevHandsLeft = this.state.handsLeft;
+      let prevLevelSum = 0;
+      const prevHandLevels: Partial<Record<PokerHandId, number>> = {};
+      if (action.type !== 'START_RUN') {
+        for (const hid of POKER_HAND_IDS) {
+          const lv = this.state.handLevels[hid]?.level ?? 1;
+          prevHandLevels[hid] = lv;
+          prevLevelSum += lv;
+        }
+      }
+
       const result =
         action.type === 'START_RUN'
           ? startRun(action.deckId, action.stake, action.seed, action.challengeId ?? null)
@@ -315,7 +411,31 @@ export class GameApp {
         this.saveManager.recordRunStarted();
         this.choreographer.reset();
         this.scoringCardIds = null;
+        this.ui.dismissInspect();
+        this.ui.dismissBossBanner();
         this.ui.setSelectedOwned(null);
+      } else if (this.state.phase !== 'TITLE') {
+        let nextLevelSum = 0;
+        const leveledHands: Array<{ id: PokerHandId; level: number }> = [];
+        for (const hid of POKER_HAND_IDS) {
+          const nextLv = this.state.handLevels[hid]?.level ?? 1;
+          nextLevelSum += nextLv;
+          if (nextLv > (prevHandLevels[hid] ?? 1)) {
+            leveledHands.push({ id: hid, level: nextLv });
+          }
+        }
+        if (nextLevelSum > prevLevelSum && leveledHands.length > 0) {
+          const g = this.scene.getGeometry();
+          const cx = g.table.x + g.table.w * 0.5;
+          const cy = g.table.y + g.table.h * 0.44;
+          const handLabel =
+            leveledHands.length >= POKER_HAND_IDS.length
+              ? 'All Poker Hands +1!'
+              : leveledHands.length === 1
+                ? `${leveledHands[0]!.id} Lv.${leveledHands[0]!.level}`
+                : `${leveledHands.length} Hands Leveled Up!`;
+          this.choreographer.triggerLevelUpCelebration(cx, cy, handLabel, this.audio);
+        }
       }
 
       if (this.state.lastError) {
@@ -339,6 +459,7 @@ export class GameApp {
 
       // Phase transition vortex warps & celebratory effects
       if (this.state.phase !== prevPhase) {
+        this.ui.dismissInspect();
         if (this.state.phase === 'PACK_OPEN') {
           this.renderer.triggerVortexPulse(0.65, 4.8);
           const g = this.scene.getGeometry();
@@ -352,14 +473,24 @@ export class GameApp {
           prevPhase === 'BLIND_SELECT' &&
           getActiveBlind(this.state)?.slot === 'Boss'
         ) {
+          const boss = getActiveBlind(this.state)!;
+          const bossDef = BLIND_MAP[boss.key];
           this.renderer.triggerVortexPulse(0.72, 5.4);
           this.renderer.triggerGlitchPulse(0.55);
           this.choreographer.triggerImpactFlash(0.30, [0.95, 0.34, 0.28], 4.0);
+          this.ui.showBossBanner(
+            boss.name,
+            bossDef?.desc || 'Defeat the Boss Blind!',
+            boss.bossColor || '#a84024'
+          );
         } else if (this.state.phase === 'TITLE') {
+          this.ui.dismissBossBanner();
           this.renderer.triggerTitleEntryFlash();
         }
         this.syncMusicForPhase();
         this.ui.setSelectedOwned(null);
+      } else if (this.state.handsLeft !== prevHandsLeft) {
+        this.syncMusicForPhase();
       }
 
       if (this.state.phase === 'VICTORY' && prevPhase !== 'VICTORY') {
@@ -367,6 +498,11 @@ export class GameApp {
         this.audio.playSfx('win');
         const g = this.scene.getGeometry();
         this.particles.emitAccentBurst(g.viewportW * 0.55, g.viewportH * 0.45, 'celebrate');
+        this.choreographer.triggerRoundClearBurst(g.viewportW * 0.55, g.viewportH * 0.45);
+      }
+
+      if (this.state.phase === 'GAME_OVER' && prevPhase !== 'GAME_OVER') {
+        this.saveManager.recordRunFinished(this.state, false);
       }
 
       if (this.state.phase !== 'TITLE') {
@@ -393,7 +529,9 @@ export class GameApp {
         if (mapped) this.audio.playSfx(mapped);
       }
 
-      if (ev.type === 'ITEM_BOUGHT' || ev.type === 'ITEM_SOLD' || ev.type === 'CASHOUT_COMPLETE') {
+      if (ev.type === 'ROUND_WON') {
+        this.choreographer.triggerRoundClearBurst(cx, cy);
+      } else if (ev.type === 'ITEM_BOUGHT' || ev.type === 'ITEM_SOLD' || ev.type === 'CASHOUT_COMPLETE') {
         this.particles.emitMoneyBurst(cx, cy, 1.1);
       } else if (ev.type === 'VOUCHER_REDEEMED') {
         this.particles.emitMoneyBurst(
@@ -411,6 +549,7 @@ export class GameApp {
     const nowSec = performance.now() / 1000;
     if (card.kind === 'hand') {
       if (this.state.phase === 'PLAYING' || this.state.phase === 'PACK_OPEN') {
+        this.ui.dismissInspect();
         card.moveable.juiceUp(0.28, undefined, nowSec);
         this.audio.playSfx(card.selected ? 'cardSlide2' : 'cardSlide1', {
           pitch: card.selected ? 0.92 : 1.08,
@@ -421,7 +560,22 @@ export class GameApp {
       card.moveable.juiceUp(0.32, undefined, nowSec);
       this.audio.playSfx('highlight1');
       this.ui.setSelectedOwned(card.id);
+      if (this.ui.getSelectedOwnedId() === card.id) {
+        this.ui.inspectCard(card, card.moveable.vx, card.moveable.vy, this.state);
+      } else {
+        this.ui.dismissInspect();
+      }
+    } else if (
+      card.kind === 'shop_offer' ||
+      card.kind === 'shop_voucher' ||
+      card.kind === 'shop_booster' ||
+      card.kind === 'pack_card'
+    ) {
+      card.moveable.juiceUp(0.28, undefined, nowSec);
+      this.audio.playSfx('highlight1');
+      this.ui.inspectCard(card, card.moveable.vx, card.moveable.vy, this.state);
     } else if (card.kind === 'deck_pile') {
+      this.ui.dismissInspect();
       card.moveable.juiceUp(0.25, undefined, nowSec);
       this.audio.playSfx('cardFan2');
       this.ui.toggleRunInfo();
@@ -445,7 +599,10 @@ export class GameApp {
     ) {
       track = 'music5';
     }
-    this.audio.setMusicContext(track, this.choreographer.getFlameIntensity());
+    const flameNorm = Math.min(1, Math.max(0, this.choreographer.getFlameIntensity() / 6));
+    const lastHandBoost = this.state.phase === 'PLAYING' && this.state.handsLeft === 1 ? 0.25 : 0;
+    const intensity = Math.min(1, Math.max(0.45, flameNorm) + lastHandBoost);
+    this.audio.setMusicContext(track, intensity);
   }
 
   private updateSettings(partial: Partial<RenderSettings>): void {
@@ -524,8 +681,18 @@ export class GameApp {
     }
 
     // 4. Step springs & choreographer
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
+    const { width: vw, height: vh } = this.getViewportSize();
+    if (vw !== this.lastViewportW || vh !== this.lastViewportH) {
+      this.handleViewportResize();
+    }
+    let previewScoringIds: Set<string> | null = null;
+    if (this.state.phase === 'PLAYING' && this.state.selectedCardIds.length > 0) {
+      const preview = previewSelectedHand(this.state);
+      if (preview && preview.scoringCardIds.length > 0) {
+        previewScoringIds = new Set(preview.scoringCardIds);
+      }
+    }
+    const forcedCardId = getForcedCardId(this.state);
     this.scene.syncAndStep(
       this.state,
       vw,
@@ -534,7 +701,9 @@ export class GameApp {
       settings.reducedMotion,
       renderDt,
       this.elapsedSec,
-      this.scoringCardIds
+      this.scoringCardIds,
+      previewScoringIds,
+      forcedCardId
     );
     this.choreographer.update(
       renderDt,
@@ -640,6 +809,8 @@ export class GameApp {
   dispose(): void {
     cancelAnimationFrame(this.rafId);
     window.removeEventListener('resize', this.resizeHandler);
+    window.removeEventListener('orientationchange', this.resizeHandler);
+    window.visualViewport?.removeEventListener('resize', this.resizeHandler);
     this.input.dispose();
     this.renderer.dispose();
     this.audio.dispose();
