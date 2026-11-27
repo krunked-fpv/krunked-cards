@@ -1,5 +1,5 @@
 // ============================================================================
-// Krunked Cards — Beveled HUD, Phase Arenas, Modals & Dynamic Hover Tooltips
+// Krunked Cards — Chunky Pixel-Arcade HUD, Phase Arenas, Rich Tooltips & CRT
 // Crisp zero-overlap layout validated for 1280x720 and 1920x1080 viewports.
 // ============================================================================
 
@@ -19,6 +19,7 @@ import {
   type SimAction,
   type SimState,
   type StakeLevel,
+  type Suit,
   type TargetFps,
 } from '../contracts/index.ts';
 import {
@@ -47,8 +48,14 @@ import {
   VOUCHER_MAP,
   VOUCHERS,
 } from '../data/index.ts';
-import { getActiveBlind, getEffectiveConsumableSlots, getEffectiveJokerSlots, previewSelectedHand } from '../sim/index.ts';
-import type { PackManager } from '../assets/PackManager.ts';
+import {
+  getActiveBlind,
+  getEffectiveConsumableSlots,
+  getEffectiveJokerSlots,
+  previewSelectedHand,
+} from '../sim/index.ts';
+import { ensureBuiltinPixelFont } from '../assets/BitmapFont.ts';
+import type { AtlasImageSource, PackManager } from '../assets/PackManager.ts';
 import type { TableGeometry, VisualCard } from '../render/Moveable.ts';
 import type { ChoreographerDisplay } from '../render/ScoreChoreographer.ts';
 import type { FlameAnchor } from '../render/WebGL2Renderer.ts';
@@ -80,6 +87,13 @@ const RARITY_NAMES: Record<number, string> = {
   4: 'Legendary',
 };
 
+const UI_SUIT_COLS: Record<Suit, number> = {
+  Hearts: 0,
+  Diamonds: 1,
+  Clubs: 2,
+  Spades: 3,
+};
+
 function esc(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -101,6 +115,107 @@ function formatKeyCode(code: string): string {
   return code.toUpperCase();
 }
 
+function renderDynaWord(text: string, baseClass: string, startIndex = 0): string {
+  let out = '';
+  let idx = startIndex;
+  for (const ch of text) {
+    if (ch === ' ') {
+      out += `<span class="kc-dyna-space">&nbsp;</span>`;
+    } else {
+      out += `<span class="${baseClass}" style="--di:${idx};">${esc(ch)}</span>`;
+      idx++;
+    }
+  }
+  return out;
+}
+
+/**
+ * Single-pass syntax highlighter for card/joker/consumable/tag/voucher/blind
+ * descriptions on cream parchment tooltips & collection cards.
+ */
+function formatRichDesc(raw: string, highContrast = false): string {
+  if (!raw) return '';
+  const suitColors = highContrast
+    ? {
+        heart: '#e02820',
+        diamond: '#c77c00',
+        spade: '#4f31b9',
+        club: '#007acc',
+      }
+    : {
+        heart: '#e03c31',
+        diamond: '#d95b26',
+        spade: '#2d3a54',
+        club: '#1f5e4d',
+      };
+
+  const tokenRe =
+    /(X\d+(?:\.\d+)?(?:\s+Mult)?)|([+-]\d+(?:\.\d+)?\s*Mult)|([+-]\d+(?:\.\d+)?\s*(?:extra\s+)?Chips?)|([+-]?\$\d+)|(\b\d+\s+in\s+\d+\b)|\b(Hearts?|Diamonds?|Spades?|Clubs?)\b|\b(Tarots?|Planets?|Spectrals?|Foil|Holographic|Polychrome|Negative|Glass|Steel|Gold|Lucky|Stone|Wild|Bonus|Mult|Chips?|Jokers?|Boss\s+Blinds?|Blinds?|Vouchers?|Seals?|Eternal|Perishable|Rental)\b|([+-]\d+(?:\.\d+)?)/gi;
+
+  let result = '';
+  let lastIdx = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = tokenRe.exec(raw)) !== null) {
+    if (match.index > lastIdx) {
+      result += esc(raw.slice(lastIdx, match.index));
+    }
+    const full = match[0]!;
+    if (match[1]) {
+      // XN Mult or X1.5 -> iconic white text inside solid red pixel badge pill
+      result += `<span class="kc-hl-xmult">${esc(full)}</span>`;
+    } else if (match[2]) {
+      // +N Mult -> crisp red
+      result += `<span class="kc-hl-mult">${esc(full)}</span>`;
+    } else if (match[3]) {
+      // +N Chips -> crisp blue
+      result += `<span class="kc-hl-chips">${esc(full)}</span>`;
+    } else if (match[4]) {
+      // $N -> warm gold
+      result += `<span class="kc-hl-money">${esc(full)}</span>`;
+    } else if (match[5]) {
+      // 1 in N -> emerald probability green
+      result += `<span class="kc-hl-prob">${esc(full)}</span>`;
+    } else if (match[6]) {
+      const lower = match[6].toLowerCase();
+      const col = lower.startsWith('heart')
+        ? suitColors.heart
+        : lower.startsWith('diamond')
+          ? suitColors.diamond
+          : lower.startsWith('spade')
+            ? suitColors.spade
+            : suitColors.club;
+      result += `<span class="kc-hl-suit" style="color:${col};">${esc(full)}</span>`;
+    } else if (match[7]) {
+      const kw = match[7].toLowerCase();
+      let cls = 'kc-hl-kw';
+      if (kw.startsWith('tarot') || kw.startsWith('seal')) cls = 'kc-hl-tarot';
+      else if (kw.startsWith('planet') || kw === 'foil' || kw === 'bonus' || kw.startsWith('chip')) cls = 'kc-hl-chips';
+      else if (kw.startsWith('spectral') || kw === 'perishable') cls = 'kc-hl-spectral';
+      else if (kw === 'holographic' || kw === 'eternal') cls = 'kc-hl-holo';
+      else if (kw === 'polychrome' || kw === 'wild') cls = 'kc-hl-poly';
+      else if (kw === 'negative') cls = 'kc-hl-neg';
+      else if (kw === 'glass') cls = 'kc-hl-glass';
+      else if (kw === 'steel' || kw === 'stone') cls = 'kc-hl-steel';
+      else if (kw === 'gold' || kw === 'rental' || kw.startsWith('joker') || kw.startsWith('voucher') || kw.startsWith('blind')) cls = 'kc-hl-money';
+      else if (kw === 'lucky') cls = 'kc-hl-prob';
+      else if (kw === 'mult' || kw.startsWith('boss')) cls = 'kc-hl-mult';
+      result += `<span class="${cls}">${esc(full)}</span>`;
+    } else if (match[8]) {
+      const cls = full.startsWith('-') ? 'kc-hl-mult' : 'kc-hl-chips';
+      result += `<span class="${cls}">${esc(full)}</span>`;
+    } else {
+      result += esc(full);
+    }
+    lastIdx = tokenRe.lastIndex;
+  }
+
+  if (lastIdx < raw.length) {
+    result += esc(raw.slice(lastIdx));
+  }
+  return result;
+}
+
 export class UiOverlay {
   private root: HTMLElement;
   private packManager: PackManager;
@@ -108,7 +223,16 @@ export class UiOverlay {
 
   private activeModal: ActiveModal = null;
   private runInfoTab: 'hands' | 'blinds' | 'vouchers' | 'deck' = 'hands';
-  private collectionTab: 'jokers' | 'tarots' | 'planets' | 'spectrals' | 'vouchers' | 'boosters' | 'blinds' | 'tags' | 'decks' = 'jokers';
+  private collectionTab:
+    | 'jokers'
+    | 'tarots'
+    | 'planets'
+    | 'spectrals'
+    | 'vouchers'
+    | 'boosters'
+    | 'blinds'
+    | 'tags'
+    | 'decks' = 'jokers';
   private newRunTab: 'standard' | 'challenges' = 'standard';
   private newRunDeckId = 'b_red';
   private newRunStake: StakeLevel = 1;
@@ -127,6 +251,7 @@ export class UiOverlay {
   private modalLayer: HTMLDivElement;
   private tooltipEl: HTMLDivElement;
   private toastEl: HTMLDivElement;
+  private crtEl: HTMLDivElement | null = null;
   private folderInput: HTMLInputElement;
   private archiveInput: HTMLInputElement;
 
@@ -134,10 +259,17 @@ export class UiOverlay {
   private lastRailKey = '';
   private lastTableKey = '';
   private lastModalKey = '';
+  private lastCrtAmount = -1;
+  private lastHighContrast = false;
   private lastHoveredCard: VisualCard | null = null;
   private lastHoverX = 0;
   private lastHoverY = 0;
+  private hoveredTagKey: string | null = null;
   private lastAnimTick = -1;
+
+  // Cache whether chips atlas cell (4,1) has non-empty pixels
+  private scoreChipAtlasRef: AtlasImageSource | null = null;
+  private scoreChipUseCell41 = false;
 
   // Animated sprite canvases inside UI (Blind chips & Shop sign)
   private animatedCanvases: Array<{
@@ -152,6 +284,8 @@ export class UiOverlay {
     this.packManager = packManager;
     this.cb = cb;
 
+    // Immediately register clean-room procedural pixel font on startup
+    void ensureBuiltinPixelFont();
     this.injectStyles();
 
     this.railLayer = document.createElement('div');
@@ -171,6 +305,15 @@ export class UiOverlay {
 
     this.toastEl = document.createElement('div');
     this.toastEl.className = 'kc-toast hidden';
+
+    // Unified Full-Screen CRT Post Overlay covering both WebGL2 canvas & HUD
+    this.crtEl = document.getElementById('crt-overlay') as HTMLDivElement | null;
+    if (!this.crtEl) {
+      this.crtEl = document.createElement('div');
+      this.crtEl.id = 'crt-overlay';
+      this.crtEl.setAttribute('aria-hidden', 'true');
+      (this.root.parentElement ?? document.body).appendChild(this.crtEl);
+    }
 
     // Hidden file pickers for Load Local Custom Pack (folder or .exe archive)
     this.folderInput = document.createElement('input');
@@ -270,6 +413,7 @@ export class UiOverlay {
     this.lastRailKey = '';
     this.lastTableKey = '';
     this.lastModalKey = '';
+    this.scoreChipAtlasRef = null;
   }
 
   invalidateModal(): void {
@@ -280,7 +424,12 @@ export class UiOverlay {
     this.lastHoveredCard = card;
     this.lastHoverX = x;
     this.lastHoverY = y;
-    this.renderTooltip(card, x, y, state);
+    if (card) {
+      this.hoveredTagKey = null;
+      this.renderTooltip(card, x, y, state);
+    } else if (!this.hoveredTagKey) {
+      this.tooltipEl.classList.add('hidden');
+    }
   }
 
   /**
@@ -295,7 +444,7 @@ export class UiOverlay {
     const cr = chipsBox.getBoundingClientRect();
     const mr = multBox.getBoundingClientRect();
     if (cr.width <= 0 || mr.width <= 0) return null;
-    const extraTop = Math.round(52 + Math.min(48, intensity * 7));
+    const extraTop = Math.round(52 + Math.min(52, intensity * 7.5));
     return {
       chipsRect: {
         x: cr.left - 14,
@@ -313,6 +462,25 @@ export class UiOverlay {
     };
   }
 
+  private syncCrtOverlay(crtAmount: number): void {
+    if (!this.crtEl) return;
+    const clamped = Math.max(0, Math.min(100, Math.round(crtAmount)));
+    if (clamped === this.lastCrtAmount) return;
+    this.lastCrtAmount = clamped;
+
+    if (clamped <= 0) {
+      this.crtEl.style.display = 'none';
+      return;
+    }
+
+    const t = clamped / 100;
+    this.crtEl.style.display = 'block';
+    this.crtEl.style.setProperty('--crt-scan-alpha', (0.05 + t * 0.2).toFixed(3));
+    this.crtEl.style.setProperty('--crt-mask-alpha', (0.014 + t * 0.048).toFixed(3));
+    this.crtEl.style.setProperty('--crt-vig-alpha', (0.1 + t * 0.36).toFixed(3));
+    this.crtEl.style.setProperty('--crt-glow-alpha', (0.025 + t * 0.075).toFixed(3));
+  }
+
   /**
    * Synchronize all UI layers with current SimState, geometry, settings, and choreographer.
    */
@@ -324,6 +492,10 @@ export class UiOverlay {
     choreo: ChoreographerDisplay,
     nowSec: number
   ): void {
+    this.lastHighContrast = settings.highContrastSuits;
+    this.root.classList.toggle('kc-reduced-motion', settings.reducedMotion);
+    this.syncCrtOverlay(settings.crtAmount);
+
     // 1. Toast visibility
     const nowMs = performance.now();
     if (this.toastMessage && nowMs < this.toastUntil) {
@@ -338,7 +510,10 @@ export class UiOverlay {
     // 2. Left Console Rail
     const preview = state.phase === 'PLAYING' ? previewSelectedHand(state) : null;
     const hideStaleHandMath =
-      state.phase === 'SHOP' || state.phase === 'BLIND_SELECT' || state.phase === 'PACK_OPEN';
+      state.phase === 'SHOP' ||
+      state.phase === 'BLIND_SELECT' ||
+      state.phase === 'PACK_OPEN' ||
+      state.phase === 'CASHOUT';
     const shownChips = choreo.active
       ? choreo.displayChips
       : hideStaleHandMath
@@ -361,9 +536,11 @@ export class UiOverlay {
           ? 'Choose Blind'
           : state.phase === 'PACK_OPEN'
             ? 'Booster Pack'
-            : preview
-              ? preview.displayName
-              : '';
+            : state.phase === 'CASHOUT'
+              ? 'Round Clear'
+              : preview
+                ? preview.displayName
+                : '';
     const shownLevel = preview
       ? preview.level
       : shownHandName && state.handLevels[shownHandName as PokerHandId]
@@ -405,11 +582,16 @@ export class UiOverlay {
         choreo.flameIntensity > 0.1
       );
     } else if (state.phase !== 'TITLE') {
-      // Lightweight pulse updates without rebuilding DOM
       const cb = this.railLayer.querySelector('#kc-chips-box') as HTMLElement | null;
       const mb = this.railLayer.querySelector('#kc-mult-box') as HTMLElement | null;
-      if (cb) cb.style.transform = choreo.chipsPulse > 0.01 ? `scale(${1 + choreo.chipsPulse * 0.12})` : '';
-      if (mb) mb.style.transform = choreo.multPulse > 0.01 ? `scale(${1 + choreo.multPulse * 0.12})` : '';
+      if (cb) {
+        cb.style.transform =
+          choreo.chipsPulse > 0.01 ? `scale(${(1 + choreo.chipsPulse * 0.13).toFixed(3)})` : '';
+      }
+      if (mb) {
+        mb.style.transform =
+          choreo.multPulse > 0.01 ? `scale(${(1 + choreo.multPulse * 0.13).toFixed(3)})` : '';
+      }
     }
 
     // 3. Table Overlays (Title Screen / Blind Select / Shop / Cashout / Pack / Playing Controls / Trays)
@@ -417,6 +599,8 @@ export class UiOverlay {
       state.phase,
       geom.viewportW,
       geom.viewportH,
+      state.ante,
+      state.sortMode,
       state.jokers.map((j) => j.id).join(','),
       state.consumables.map((c) => c.id).join(','),
       state.selectedCardIds.join(','),
@@ -435,7 +619,9 @@ export class UiOverlay {
       state.bossRerolledThisAnte,
       state.vouchers.join(','),
       state.shop ? JSON.stringify(state.shop) : '',
-      state.pack ? `${state.pack.boosterKey}:${state.pack.chooseRemaining}:${state.pack.cards.map((c) => (c.taken ? '1' : '0')).join('')}` : '',
+      state.pack
+        ? `${state.pack.boosterKey}:${state.pack.chooseRemaining}:${state.pack.cards.map((c) => (c.taken ? '1' : '0')).join('')}`
+        : '',
       state.cashout ? `${state.cashout.total}:${state.cashout.rows.length}` : '',
       this.selectedOwnedId ?? '',
       this.packManager.getMode(),
@@ -528,6 +714,107 @@ export class UiOverlay {
     ctx.drawImage(img, col * sw, row * sh, sw, sh, 0, 0, canvas.width, canvas.height);
   }
 
+  /**
+   * Draws a real crisp pixel-art chip sprite from the `chips` atlas:
+   * uses cell (4,1) (iconic smiling score chip) if populated, else falls back
+   * cleanly to cell (3,0) (crisp blue poker chip).
+   */
+  private drawScoreChipToCanvas(canvas: HTMLCanvasElement): void {
+    const img = this.packManager.getAtlas('chips');
+    if (this.scoreChipAtlasRef !== img) {
+      this.scoreChipAtlasRef = img;
+      this.scoreChipUseCell41 = this.checkAtlasCellHasPixels(img, 'chips', 4, 1);
+    }
+    if (this.scoreChipUseCell41) {
+      this.drawAtlasCellToCanvas(canvas, 'chips', 4, 1);
+    } else {
+      this.drawAtlasCellToCanvas(canvas, 'chips', 3, 0);
+    }
+  }
+
+  private checkAtlasCellHasPixels(
+    img: AtlasImageSource,
+    atlas: AtlasKey,
+    col: number,
+    row: number
+  ): boolean {
+    try {
+      const probe = document.createElement('canvas');
+      probe.width = 16;
+      probe.height = 16;
+      const ctx = probe.getContext('2d');
+      if (!ctx) return false;
+      const spec = ATLAS_SPECS[atlas];
+      const sw = img.width / spec.cols;
+      const sh = img.height / spec.rows;
+      ctx.drawImage(img, col * sw, row * sh, sw, sh, 0, 0, 16, 16);
+      const data = ctx.getImageData(0, 0, 16, 16).data;
+      for (let i = 3; i < data.length; i += 4) {
+        if (data[i]! > 20) return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  private bindTagHoverTooltip(el: HTMLElement, tagKey: string): void {
+    const td = TAG_MAP[tagKey];
+    if (!td) return;
+    el.addEventListener('mouseenter', () => {
+      this.hoveredTagKey = tagKey;
+      const rect = el.getBoundingClientRect();
+      this.showStaticTooltip(
+        td.name,
+        td.desc,
+        [{ label: 'Skip Tag', color: PALETTE.ORANGE }],
+        rect.right + 12,
+        rect.top + rect.height * 0.5
+      );
+    });
+    el.addEventListener('mouseleave', () => {
+      if (this.hoveredTagKey === tagKey) {
+        this.hoveredTagKey = null;
+        if (!this.lastHoveredCard) {
+          this.tooltipEl.classList.add('hidden');
+        }
+      }
+    });
+  }
+
+  private showStaticTooltip(
+    title: string,
+    desc: string,
+    badges: Array<{ label: string; color: string }>,
+    anchorX: number,
+    anchorY: number
+  ): void {
+    if (this.activeModal) {
+      this.tooltipEl.classList.add('hidden');
+      return;
+    }
+    const badgesHtml = badges
+      .map(
+        (b) => `<span class="kc-tt-badge" style="background:${b.color};">${esc(b.label)}</span>`
+      )
+      .join('');
+    this.tooltipEl.innerHTML = `
+      <div class="kc-tt-title">${esc(title)}</div>
+      <div class="kc-tt-desc">${formatRichDesc(desc, this.lastHighContrast)}</div>
+      ${badgesHtml ? `<div class="kc-tt-badges">${badgesHtml}</div>` : ''}
+    `;
+    this.tooltipEl.classList.remove('hidden');
+    const tw = this.tooltipEl.offsetWidth || 248;
+    const th = this.tooltipEl.offsetHeight || 110;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    let tx = anchorX;
+    if (tx + tw + 12 > vw) tx = Math.max(12, anchorX - tw - 54);
+    const ty = Math.max(12, Math.min(vh - th - 12, anchorY - th * 0.5));
+    this.tooltipEl.style.left = `${Math.round(tx)}px`;
+    this.tooltipEl.style.top = `${Math.round(ty)}px`;
+  }
+
   // =========================================================================
   // Left Console Rail
   // =========================================================================
@@ -561,44 +848,72 @@ export class UiOverlay {
         : PALETTE.WHITE;
 
     const compact = r.h < 680;
+    const isShop = state.phase === 'SHOP';
+
+    // Top Stage: Animated Neon SHOP Sign during Shop phase; Blind Banner otherwise
+    const topStageHtml = isShop
+      ? `
+        <div class="kc-rail-shop-marquee">
+          <canvas class="kc-rail-shop-sign" width="226" height="114"></canvas>
+          <div class="kc-rail-shop-sub">${renderDynaWord('Improve your run!', 'kc-dyna-char')}</div>
+        </div>
+      `
+      : `
+        <div class="kc-blind-header" style="--blind-col:${headerColor};">
+          <div class="kc-blind-title-bar">${esc(activeBlind?.name ?? 'Small Blind')}</div>
+          <div class="kc-blind-body">
+            <canvas class="kc-blind-chip-canvas" width="58" height="58" data-blind-row="${blindDef?.pos.y ?? 0}"></canvas>
+            <div class="kc-blind-meta">
+              <div class="kc-muted-sm">Score at least</div>
+              <div class="kc-target-score">
+                <canvas class="kc-score-chip-canvas" width="22" height="22"></canvas>
+                <span>${fmtNum(state.targetChips)}</span>
+              </div>
+              <div class="kc-blind-reward">Reward: <span class="kc-gold">${'$'.repeat(Math.max(1, Math.min(8, activeBlind?.dollars ?? 3)))}</span></div>
+            </div>
+          </div>
+          <div class="kc-blind-desc">
+            ${
+              blindDef?.desc
+                ? esc(activeBlind?.disabled ? '(Boss Disabled) ' + blindDef.desc : blindDef.desc)
+                : `Ante ${state.ante} • ${activeBlind?.slot ?? 'Small'} Blind`
+            }
+          </div>
+        </div>
+      `;
+
+    // Skip Tags Strip: crisp 34x34 pixel sprites from `tags` atlas with rich hover tooltips!
     const tagsHtml =
       state.tags.length > 0
         ? `<div class="kc-rail-tags">${state.tags
-            .slice(-6)
+            .slice(-7)
             .map((tk) => {
               const td = TAG_MAP[tk];
-              return `<span class="kc-tag-pill" title="${esc(td?.desc ?? tk)}">${esc(td?.name ?? tk)}</span>`;
+              return `<button type="button" class="kc-rail-tag-btn interactive" data-rail-tag="${esc(tk)}" aria-label="${esc(td?.name ?? tk)}"><canvas class="kc-rail-tag-canvas" width="34" height="34" data-tag-x="${td?.pos.x ?? 0}" data-tag-y="${td?.pos.y ?? 0}"></canvas></button>`;
             })
             .join('')}</div>`
         : '';
 
+    const displayHandLabel = handName || 'Select Cards';
+    const wavyHandHtml = handName
+      ? renderDynaWord(displayHandLabel, 'kc-dyna-char')
+      : `<span class="kc-hand-placeholder">${esc(displayHandLabel)}</span>`;
+
     this.railLayer.innerHTML = `
       <aside class="kc-rail ${compact ? 'compact' : ''} ${flaming ? 'rail-flaming' : ''}" style="left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px;">
-        <div class="kc-blind-header" style="--blind-col:${headerColor};">
-          <div class="kc-blind-title-bar">${esc(activeBlind?.name ?? 'Small Blind')}</div>
-          <div class="kc-blind-body">
-            <canvas class="kc-blind-chip-canvas" width="56" height="56" data-blind-row="${blindDef?.pos.y ?? 0}"></canvas>
-            <div class="kc-blind-meta">
-              <div class="kc-muted-sm">Score at least</div>
-              <div class="kc-target-score"><span class="kc-chip-dot"></span>${fmtNum(state.targetChips)}</div>
-              <div class="kc-blind-reward">Reward: <span class="kc-gold">${'$'.repeat(Math.max(1, Math.min(8, activeBlind?.dollars ?? 3)))}</span></div>
-            </div>
-          </div>
-          ${
-            blindDef?.desc
-              ? `<div class="kc-blind-desc">${esc(activeBlind?.disabled ? '(Boss Disabled) ' + blindDef.desc : blindDef.desc)}</div>`
-              : ''
-          }
-        </div>
+        ${topStageHtml}
 
         <div class="kc-inset-box kc-round-score-box">
-          <span class="kc-muted-sm">Round<br/>score</span>
-          <div class="kc-round-score-val"><span class="kc-chip-dot"></span>${fmtNum(state.roundChips)}</div>
+          <span class="kc-round-lbl">Round<br/>score</span>
+          <div class="kc-round-score-val">
+            <canvas class="kc-score-chip-canvas" width="24" height="24"></canvas>
+            <span>${fmtNum(state.roundChips)}</span>
+          </div>
         </div>
 
         <div class="kc-hand-box ${flaming ? 'flaming' : ''}">
           <div class="kc-hand-header">
-            <span class="kc-hand-name">${esc(handName || 'Select Cards')}</span>
+            <span class="kc-hand-name">${wavyHandHtml}</span>
             ${
               handLevel > 0
                 ? `<span class="kc-lvl-badge" style="background:${levelColor};">lvl.${handLevel}</span>`
@@ -632,7 +947,7 @@ export class UiOverlay {
             <div class="kc-stat-pair">
               <div class="kc-stat-card">
                 <div class="kc-stat-lbl">Ante</div>
-                <div class="kc-stat-val kc-amber">${state.ante}<span class="kc-muted-sm">/${state.winAnte}</span></div>
+                <div class="kc-stat-val kc-amber">${state.ante}<span class="kc-ante-max">/${state.winAnte}</span></div>
               </div>
               <div class="kc-stat-card">
                 <div class="kc-stat-lbl">Round</div>
@@ -649,6 +964,24 @@ export class UiOverlay {
     if (chipCanvas) {
       this.registerAnimatedCanvas(chipCanvas, 'BlindChips', blindDef?.pos.y ?? 0, 21);
     }
+
+    const railShopSign = this.railLayer.querySelector('.kc-rail-shop-sign') as HTMLCanvasElement | null;
+    if (railShopSign) {
+      this.registerAnimatedCanvas(railShopSign, 'shop_sign', 0, 4);
+    }
+
+    this.railLayer.querySelectorAll<HTMLCanvasElement>('.kc-score-chip-canvas').forEach((c) => {
+      this.drawScoreChipToCanvas(c);
+    });
+
+    this.railLayer.querySelectorAll<HTMLButtonElement>('[data-rail-tag]').forEach((btn) => {
+      const tk = btn.dataset.railTag!;
+      const cv = btn.querySelector<HTMLCanvasElement>('.kc-rail-tag-canvas');
+      if (cv) {
+        this.drawAtlasCellToCanvas(cv, 'tags', Number(cv.dataset.tagX ?? 0), Number(cv.dataset.tagY ?? 0));
+      }
+      this.bindTagHoverTooltip(btn, tk);
+    });
 
     this.railLayer.querySelector('[data-ui="run-info"]')?.addEventListener('click', () => {
       this.cb.onPlayButtonSfx();
@@ -677,7 +1010,7 @@ export class UiOverlay {
 
     const parts: string[] = [];
 
-    // 1. Top Joker & Consumable Felt Trays (always visible in run)
+    // 1. Top Joker & Consumable Felt Trays (always visible in run; minimal tint keeps cards crisp!)
     const maxJokers = getEffectiveJokerSlots(state);
     const maxCons = getEffectiveConsumableSlots(state);
     parts.push(`
@@ -740,7 +1073,7 @@ export class UiOverlay {
       `);
 
       // Bottom Playing Action Bar
-      const barY = geom.viewportH - 60;
+      const barY = geom.viewportH - 62;
       parts.push(`
         <div class="kc-action-bar" style="left:${geom.handTray.x}px;top:${barY}px;width:${geom.handTray.w}px;">
           <button class="kc-btn kc-btn-blue kc-action-lg interactive" ${canPlay ? '' : 'disabled'} data-act="play">
@@ -781,14 +1114,26 @@ export class UiOverlay {
     const hasCustom = this.packManager.hasCustomPackAvailable();
     const hasSave = this.cb.hasSavedRun();
 
+    const logoK = renderDynaWord('KRUNKED', 'kc-title-letter kc-tl-white', 0);
+    const logoC = renderDynaWord('CARDS', 'kc-title-letter kc-tl-red', 7);
+
     this.tableLayer.innerHTML = `
       <div class="kc-title-screen">
-        <div class="kc-logo-wrap">
-          <div class="kc-logo-badge">ROGUELIKE POKER DECKBUILDER</div>
-          <h1 class="kc-logo-text">
-            <span class="kc-logo-k">KRUNKED</span>
-            <span class="kc-logo-c">CARDS</span>
-          </h1>
+        <div class="kc-title-pack-pill interactive">
+          <span class="kc-pack-dot ${mode === 'custom' ? 'custom' : 'builtin'}"></span>
+          <button class="kc-pill-mini interactive" data-title="toggle-pack" title="${esc(this.packManager.getStatusMessage())}">
+            ${mode === 'custom' ? 'Original Pack' : hasCustom ? 'Built-In Pixel Art' : 'Built-In Pixel Art'}
+          </button>
+          <button class="kc-pill-mini kc-pill-load interactive" data-title="load-pack-folder" title="Load Local Custom Pack (Folder)">Load Folder</button>
+          <button class="kc-pill-mini kc-pill-load interactive" data-title="load-pack-archive" title="Load Local Custom Pack (.exe / .zip)">.EXE</button>
+        </div>
+
+        <div class="kc-logo-stage" aria-label="Krunked Cards">
+          <div class="kc-dyna-logo">
+            <span class="kc-logo-word">${logoK}</span>
+            <span class="kc-logo-gap"></span>
+            <span class="kc-logo-word">${logoC}</span>
+          </div>
         </div>
 
         <div class="kc-title-dock">
@@ -796,24 +1141,11 @@ export class UiOverlay {
             <button class="kc-btn kc-btn-blue kc-title-btn interactive" data-title="play">PLAY</button>
             ${
               hasSave
-                ? `<button class="kc-btn kc-btn-green kc-title-btn interactive" data-title="continue">CONTINUE RUN</button>`
+                ? `<button class="kc-btn kc-btn-teal kc-title-btn interactive" data-title="continue">CONTINUE</button>`
                 : ''
             }
-            <button class="kc-btn kc-btn-purple kc-title-btn interactive" data-title="collection">COLLECTION</button>
             <button class="kc-btn kc-btn-amber kc-title-btn interactive" data-title="options">OPTIONS</button>
-          </div>
-
-          <div class="kc-pack-bar">
-            <button class="kc-btn kc-btn-sm ${mode === 'custom' ? 'kc-btn-green' : 'kc-btn-slate'} interactive" data-title="toggle-pack">
-              ${mode === 'custom' ? 'USE BUILT-IN ART' : hasCustom ? 'USE CUSTOM PACK' : 'ART: BUILT-IN'}
-            </button>
-            <button class="kc-btn kc-btn-sm kc-btn-teal interactive" data-title="load-pack-folder">
-              LOAD CUSTOM PACK (FOLDER)
-            </button>
-            <button class="kc-btn kc-btn-sm kc-btn-teal interactive" data-title="load-pack-archive">
-              LOAD CUSTOM PACK (.EXE / .ZIP)
-            </button>
-            <span class="kc-pack-status">${esc(this.packManager.getStatusMessage())}</span>
+            <button class="kc-btn kc-btn-green kc-title-btn interactive" data-title="collection">COLLECTION</button>
           </div>
         </div>
       </div>
@@ -851,8 +1183,8 @@ export class UiOverlay {
   }
 
   private buildBlindSelectHtml(state: SimState, geom: TableGeometry): string {
-    const topY = geom.jokerTray.y + geom.jokerTray.h + 18;
-    const h = geom.viewportH - topY - 18;
+    const topY = geom.jokerTray.y + geom.jokerTray.h + 24;
+    const h = geom.viewportH - topY - 12;
     const slots: BlindSlot[] = ['Small', 'Big', 'Boss'];
     const canRerollBoss =
       (state.vouchers.includes('v_directors_cut') || state.vouchers.includes('v_retcon')) &&
@@ -880,10 +1212,10 @@ export class UiOverlay {
         const skipBlock =
           slot !== 'Boss' && tag
             ? `
-            <div class="kc-skip-box ${isCurrent ? '' : 'upcoming-skip'}">
+            <div class="kc-skip-box ${isCurrent ? '' : 'upcoming-skip'}" data-skip-tag="${esc(tag.key)}">
               <div class="kc-skip-tag-row">
-                <canvas class="kc-tag-canvas" width="34" height="34" data-tag-x="${tag.pos.x}" data-tag-y="${tag.pos.y}"></canvas>
-                <div>
+                <canvas class="kc-tag-canvas" width="38" height="38" data-tag-x="${tag.pos.x}" data-tag-y="${tag.pos.y}"></canvas>
+                <div class="kc-skip-tag-meta">
                   <div class="kc-skip-tag-name">${esc(tag.name)}</div>
                   <div class="kc-skip-tag-desc">${esc(tag.desc)}</div>
                 </div>
@@ -891,22 +1223,25 @@ export class UiOverlay {
               ${
                 isCurrent
                   ? `<button class="kc-btn kc-btn-red kc-btn-sm interactive" data-act="skip-blind">Skip Blind</button>`
-                  : `<div class="kc-muted-sm" style="text-align:center;">Skip Reward Preview</div>`
+                  : `<div class="kc-skip-preview-lbl">Skip Reward</div>`
               }
             </div>
           `
             : slot === 'Boss' && canRerollBoss
-              ? `<button class="kc-btn kc-btn-red kc-btn-sm interactive" data-act="reroll-boss">Reroll Boss ($10)</button>`
-              : '';
+              ? `<div class="kc-skip-box"><button class="kc-btn kc-btn-red kc-btn-sm interactive" data-act="reroll-boss">Reroll Boss ($10)</button></div>`
+              : `<div class="kc-boss-ante-foot">Ante ${state.ante} Boss</div>`;
 
         return `
-          <div class="kc-blind-col ${isCurrent ? 'active' : 'dimmed'}">
+          <div class="kc-blind-col ${isCurrent ? 'active' : 'dimmed'}" style="--col-accent:${colBg};">
             <div class="kc-blind-col-top">${statusBtn}</div>
             <div class="kc-blind-col-banner" style="background:${colBg};">${esc(b.name)}</div>
             <div class="kc-blind-col-body">
-              <canvas class="kc-blind-col-chip" width="68" height="68" data-blind-row="${def?.pos.y ?? 0}"></canvas>
+              <canvas class="kc-blind-col-chip" width="72" height="72" data-blind-row="${def?.pos.y ?? 0}"></canvas>
               <div class="kc-muted-sm">Score at least</div>
-              <div class="kc-target-score lg"><span class="kc-chip-dot"></span>${fmtNum(b.targetChips)}</div>
+              <div class="kc-target-score lg">
+                <canvas class="kc-score-chip-canvas" width="24" height="24"></canvas>
+                <span>${fmtNum(b.targetChips)}</span>
+              </div>
               <div class="kc-blind-reward">Reward: <span class="kc-gold">${'$'.repeat(Math.max(1, Math.min(8, b.dollars)))}</span></div>
               ${def?.desc ? `<div class="kc-blind-col-desc">${esc(def.desc)}</div>` : ''}
             </div>
@@ -928,9 +1263,10 @@ export class UiOverlay {
     geom: TableGeometry,
     cards: readonly VisualCard[]
   ): string {
-    const shop = state.shop!;
-    const topY = geom.jokerTray.y + geom.jokerTray.h + 14;
-    const controlsW = geom.shopOfferTray.x - geom.table.x - 16;
+    // Frame sits cleanly below jokerTray/consumableTray X/Y counters (zero overlap!)
+    const boardTop = Math.max(geom.jokerTray.y + geom.jokerTray.h + 22, geom.shopOfferTray.y - 4);
+    const boardH = geom.viewportH - boardTop + 8;
+    const controlsW = Math.max(132, geom.shopOfferTray.x - geom.table.x - 14);
     const canAfford = (cost: number) => state.dollars - state.bankruptAt >= cost;
     const rerollPrice = state.freeRerolls > 0 ? 0 : state.rerollCost;
     const canReroll = canAfford(rerollPrice);
@@ -941,13 +1277,13 @@ export class UiOverlay {
         continue;
       }
       const cx = Math.round(vc.moveable.tx);
-      const topTagY = Math.round(vc.moveable.ty - vc.moveable.th * 0.5 - 24);
+      const topTagY = Math.round(vc.moveable.ty - vc.moveable.th * 0.5 - 22);
       const btnY = Math.round(vc.moveable.ty + vc.moveable.th * 0.5 + 8);
       const cost = vc.cost ?? 0;
       const affordable = canAfford(cost);
 
       cardButtons.push(
-        `<div class="kc-price-tag" style="left:${cx}px;top:${topTagY}px;">$${cost}</div>`
+        `<div class="kc-price-tag ${affordable ? '' : 'unaffordable'}" style="left:${cx}px;top:${topTagY}px;">$${cost}</div>`
       );
 
       if (vc.kind === 'shop_offer' && vc.shopOfferData) {
@@ -958,7 +1294,7 @@ export class UiOverlay {
             <button class="kc-mini-btn kc-btn-amber interactive" ${affordable ? '' : 'disabled'} data-buy-offer="${esc(o.id)}">BUY</button>
             ${
               canImmediateUse
-                ? `<button class="kc-mini-btn kc-btn-red interactive" ${affordable ? '' : 'disabled'} data-buy-use-offer="${esc(o.id)}">BUY & USE</button>`
+                ? `<button class="kc-mini-btn kc-btn-red interactive" ${affordable ? '' : 'disabled'} data-buy-use-offer="${esc(o.id)}">BUY &amp; USE</button>`
                 : ''
             }
           </div>
@@ -979,20 +1315,23 @@ export class UiOverlay {
     }
 
     return `
-      <div class="kc-shop-controls" style="left:${geom.table.x}px;top:${topY}px;width:${controlsW}px;">
-        <canvas class="kc-shop-sign-canvas" width="226" height="114"></canvas>
-        <button class="kc-btn kc-btn-red kc-shop-btn interactive" data-act="shop-next">Next Round</button>
+      <div class="kc-shop-board" style="left:${geom.table.x - 4}px;top:${boardTop}px;width:${geom.table.w + 8}px;height:${boardH}px;"></div>
+
+      <div class="kc-shop-controls" style="left:${geom.table.x + 6}px;top:${geom.shopOfferTray.y}px;width:${controlsW - 10}px;height:${geom.shopOfferTray.h}px;">
+        <button class="kc-btn kc-btn-red kc-shop-btn interactive" data-act="shop-next">
+          Next<br/>Round
+        </button>
         <button class="kc-btn kc-btn-green kc-shop-btn interactive" ${canReroll ? '' : 'disabled'} data-act="shop-reroll">
-          Reroll<br/><span>${rerollPrice === 0 ? 'FREE' : '$' + rerollPrice}</span>
+          Reroll<br/><span class="kc-reroll-cost">${rerollPrice === 0 ? 'FREE' : '$' + rerollPrice}</span>
         </button>
       </div>
 
-      <div class="kc-felt-tray kc-shop-shelf" style="left:${geom.shopOfferTray.x}px;top:${geom.shopOfferTray.y - 26}px;width:${geom.shopOfferTray.w}px;height:${geom.shopOfferTray.h + 26}px;"></div>
-      <div class="kc-felt-tray kc-shop-shelf" style="left:${geom.shopVoucherTray.x}px;top:${geom.shopVoucherTray.y - 26}px;width:${geom.shopVoucherTray.w}px;height:${geom.shopVoucherTray.h + 26}px;">
-        <span class="kc-tray-counter left">ANTE VOUCHER</span>
+      <div class="kc-shop-pocket" style="left:${geom.shopOfferTray.x}px;top:${geom.shopOfferTray.y}px;width:${geom.shopOfferTray.w}px;height:${geom.shopOfferTray.h}px;"></div>
+      <div class="kc-shop-pocket kc-shop-voucher-pocket" style="left:${geom.shopVoucherTray.x}px;top:${geom.shopVoucherTray.y}px;width:${geom.shopVoucherTray.w}px;height:${geom.shopVoucherTray.h}px;">
+        <span class="kc-pocket-stamp">ANTE ${state.ante} VOUCHER</span>
       </div>
-      <div class="kc-felt-tray kc-shop-shelf" style="left:${geom.shopBoosterTray.x}px;top:${geom.shopBoosterTray.y - 26}px;width:${geom.shopBoosterTray.w}px;height:${geom.shopBoosterTray.h + 26}px;">
-        <span class="kc-tray-counter left">BOOSTER PACKS</span>
+      <div class="kc-shop-pocket kc-shop-booster-pocket" style="left:${geom.shopBoosterTray.x}px;top:${geom.shopBoosterTray.y}px;width:${geom.shopBoosterTray.w}px;height:${geom.shopBoosterTray.h}px;">
+        <span class="kc-pocket-stamp">BOOSTER PACKS</span>
       </div>
       ${cardButtons.join('')}
     `;
@@ -1001,29 +1340,42 @@ export class UiOverlay {
   private buildCashoutHtml(state: SimState, geom: TableGeometry): string {
     const co = state.cashout!;
     const topY = geom.jokerTray.y + geom.jokerTray.h + 24;
+    const panelW = Math.min(580, geom.table.w - 32);
+    const panelX = Math.round(geom.table.x + (geom.table.w - panelW) * 0.5);
+
     const rowsHtml = co.rows
-      .map(
-        (r) => `
-      <div class="kc-cash-row">
-        <div>
-          <span class="kc-cash-label">${esc(r.label)}</span>
-          ${r.detail ? `<span class="kc-cash-detail">${esc(r.detail)}</span>` : ''}
-        </div>
-        <span class="kc-cash-val" style="color:${r.color || PALETTE.MONEY};">
-          ${r.dollars >= 0 ? '$' + r.dollars : '-$' + Math.abs(r.dollars)}
-        </span>
-      </div>
-    `
-      )
+      .map((r) => {
+        const absD = Math.abs(r.dollars);
+        const dollarPips =
+          r.dollars === 0
+            ? '$0'
+            : r.dollars < 0
+              ? `-$${absD}`
+              : absD <= 7
+                ? '$'.repeat(absD)
+                : `${'$'.repeat(6)} ($${absD})`;
+        return `
+          <div class="kc-cash-row">
+            <div class="kc-cash-left">
+              <span class="kc-cash-label">${esc(r.label)}</span>
+              ${r.detail ? `<span class="kc-cash-detail">${esc(r.detail)}</span>` : ''}
+            </div>
+            <span class="kc-cash-dots"></span>
+            <span class="kc-cash-val" style="color:${r.color || PALETTE.MONEY};">${esc(dollarPips)}</span>
+          </div>
+        `;
+      })
       .join('');
 
     return `
-      <div class="kc-cashout-panel" style="left:${geom.table.x + 24}px;top:${topY}px;width:${geom.table.w - 48}px;">
+      <div class="kc-cashout-panel" style="left:${panelX}px;top:${topY}px;width:${panelW}px;">
         <div class="kc-cashout-header">BLIND DEFEATED!</div>
-        <div class="kc-cashout-rows">${rowsHtml}</div>
         <button class="kc-btn kc-btn-amber kc-cashout-btn interactive" data-act="finish-cashout">
           Cash Out: $${co.total}
         </button>
+        <div class="kc-receipt-perf"></div>
+        <div class="kc-cashout-rows">${rowsHtml}</div>
+        <div class="kc-receipt-perf bottom"></div>
       </div>
     `;
   }
@@ -1080,13 +1432,13 @@ export class UiOverlay {
         <div class="kc-modal-card kc-end-card">
           <div class="kc-end-title ${victory ? 'win' : 'lose'}">${victory ? 'YOU WIN!' : 'GAME OVER'}</div>
           <div class="kc-end-stats">
-            <div><span>Best Hand</span><strong>${fmtNum(state.stats.bestHand)}</strong></div>
-            <div><span>Ante Reached</span><strong>${state.ante} / ${state.winAnte}</strong></div>
-            <div><span>Rounds Won</span><strong>${state.round}</strong></div>
-            <div><span>Seed</span><strong>${esc(state.rng.seed)}</strong></div>
+            <div><span>Best Hand</span><strong class="kc-blue">${fmtNum(state.stats.bestHand)}</strong></div>
+            <div><span>Ante Reached</span><strong class="kc-amber">${state.ante} / ${state.winAnte}</strong></div>
+            <div><span>Rounds Won</span><strong class="kc-amber">${state.round}</strong></div>
+            <div><span>Seed</span><strong class="kc-gold">${esc(state.rng.seed)}</strong></div>
             ${
               !victory && state.stats.defeatedBy
-                ? `<div><span>Defeated By</span><strong>${esc(state.stats.defeatedBy)}</strong></div>`
+                ? `<div><span>Defeated By</span><strong class="kc-red">${esc(state.stats.defeatedBy)}</strong></div>`
                 : ''
             }
           </div>
@@ -1104,18 +1456,21 @@ export class UiOverlay {
   }
 
   private bindTableEvents(state: SimState): void {
-    // Register animated BlindChip canvases and Shop Sign canvas
+    // Register animated BlindChip canvases, score chip sprites, and tag sprites
     this.tableLayer.querySelectorAll<HTMLCanvasElement>('.kc-blind-col-chip').forEach((c) => {
       const row = Number(c.dataset.blindRow ?? 0);
       this.registerAnimatedCanvas(c, 'BlindChips', row, 21);
     });
+    this.tableLayer.querySelectorAll<HTMLCanvasElement>('.kc-score-chip-canvas').forEach((c) => {
+      this.drawScoreChipToCanvas(c);
+    });
     this.tableLayer.querySelectorAll<HTMLCanvasElement>('.kc-tag-canvas').forEach((c) => {
       this.drawAtlasCellToCanvas(c, 'tags', Number(c.dataset.tagX ?? 0), Number(c.dataset.tagY ?? 0));
     });
-    const shopSign = this.tableLayer.querySelector<HTMLCanvasElement>('.kc-shop-sign-canvas');
-    if (shopSign) {
-      this.registerAnimatedCanvas(shopSign, 'shop_sign', 0, 4);
-    }
+    this.tableLayer.querySelectorAll<HTMLElement>('[data-skip-tag]').forEach((box) => {
+      const tk = box.dataset.skipTag;
+      if (tk) this.bindTagHoverTooltip(box, tk);
+    });
 
     const bind = (sel: string, fn: (el: HTMLElement) => void) => {
       this.tableLayer.querySelectorAll<HTMLElement>(sel).forEach((el) => {
@@ -1163,16 +1518,30 @@ export class UiOverlay {
       });
     });
     bind('[data-buy-offer]', (el) => {
-      this.cb.onDispatch({ type: 'SHOP_BUY_OFFER', offerId: el.dataset.buyOffer!, useImmediately: false });
+      this.cb.onDispatch({
+        type: 'SHOP_BUY_OFFER',
+        offerId: el.dataset.buyOffer!,
+        useImmediately: false,
+      });
     });
     bind('[data-buy-use-offer]', (el) => {
-      this.cb.onDispatch({ type: 'SHOP_BUY_OFFER', offerId: el.dataset.buyUseOffer!, useImmediately: true });
+      this.cb.onDispatch({
+        type: 'SHOP_BUY_OFFER',
+        offerId: el.dataset.buyUseOffer!,
+        useImmediately: true,
+      });
     });
     bind('[data-buy-voucher]', (el) => {
-      this.cb.onDispatch({ type: 'SHOP_BUY_VOUCHER', voucherOfferId: el.dataset.buyVoucher! });
+      this.cb.onDispatch({
+        type: 'SHOP_BUY_VOUCHER',
+        voucherOfferId: el.dataset.buyVoucher!,
+      });
     });
     bind('[data-buy-booster]', (el) => {
-      this.cb.onDispatch({ type: 'SHOP_BUY_BOOSTER', boosterOfferId: el.dataset.buyBooster! });
+      this.cb.onDispatch({
+        type: 'SHOP_BUY_BOOSTER',
+        boosterOfferId: el.dataset.buyBooster!,
+      });
     });
     bind('[data-pack-pick]', (el) => {
       this.cb.onDispatch({
@@ -1184,7 +1553,7 @@ export class UiOverlay {
   }
 
   // =========================================================================
-  // Floating Score Popups
+  // Elastic Wavy DynaText Score Popups
   // =========================================================================
 
   private renderPopups(choreo: ChoreographerDisplay): void {
@@ -1195,11 +1564,23 @@ export class UiOverlay {
     this.popupLayer.innerHTML = choreo.popups
       .map((p) => {
         const progress = p.age / Math.max(0.01, p.lifetime);
-        const alpha = progress > 0.72 ? Math.max(0, 1 - (progress - 0.72) / 0.28) : 1;
-        const popScale = progress < 0.14 ? 0.65 + (progress / 0.14) * 0.5 : 1.15 - Math.min(0.15, progress * 0.25);
+        const alpha = progress > 0.74 ? Math.max(0, 1 - (progress - 0.74) / 0.26) : 1;
+        // Elastic pop overshoot: 0.45 -> 1.28 -> settle to 1.0 -> gentle shrink on exit
+        let popScale: number;
+        if (progress < 0.14) {
+          const u = progress / 0.14;
+          popScale = 0.45 + 0.83 * Math.sin(u * Math.PI * 0.5);
+        } else if (progress < 0.34) {
+          const u = (progress - 0.14) / 0.2;
+          popScale = 1.28 - 0.28 * u;
+        } else {
+          popScale = 1.0 - Math.max(0, (progress - 0.74) * 0.45);
+        }
+        const isXMult = /^X\d/i.test(p.text);
+        const extraClass = isXMult ? 'kc-popup-xmult' : '';
         return `
-          <div class="kc-popup-pill" style="left:${Math.round(p.x)}px;top:${Math.round(p.y)}px;background:${p.bgColor};color:${p.textColor};opacity:${alpha.toFixed(2)};transform:translate(-50%,-50%) scale(${popScale.toFixed(2)}) rotate(${(p.rotation * 57.3).toFixed(1)}deg);">
-            ${esc(p.text)}
+          <div class="kc-popup-pill ${extraClass}" style="left:${Math.round(p.x)}px;top:${Math.round(p.y)}px;background:${p.bgColor};color:${p.textColor};opacity:${alpha.toFixed(2)};transform:translate(-50%,-50%) scale(${popScale.toFixed(3)}) rotate(${(p.rotation * 57.3).toFixed(1)}deg);">
+            ${renderDynaWord(p.text, 'kc-pop-char')}
           </div>
         `;
       })
@@ -1218,7 +1599,7 @@ export class UiOverlay {
 
     let inner = '';
     if (this.activeModal === 'NEW_RUN') inner = this.buildNewRunModalHtml();
-    else if (this.activeModal === 'RUN_INFO') inner = this.buildRunInfoModalHtml(state);
+    else if (this.activeModal === 'RUN_INFO') inner = this.buildRunInfoModalHtml(state, settings);
     else if (this.activeModal === 'COLLECTION') inner = this.buildCollectionModalHtml();
     else if (this.activeModal === 'OPTIONS') inner = this.buildOptionsModalHtml(settings);
     else if (this.activeModal === 'PAUSE') inner = this.buildPauseModalHtml();
@@ -1228,8 +1609,14 @@ export class UiOverlay {
   }
 
   private buildNewRunModalHtml(): string {
-    const decks = DECKS.length > 0 ? DECKS : [{ key: 'b_red', name: 'Red Deck', order: 1, pos: { x: 0, y: 0 }, desc: '+1 discard every round', config: {} }];
-    const stakes = STAKES.length > 0 ? STAKES : [{ level: 1 as StakeLevel, key: 'stake_white', name: 'White Stake', pos: { x: 0, y: 0 }, color: '#efefef', scaling: 1 as const, desc: 'Base Difficulty' }];
+    const decks =
+      DECKS.length > 0
+        ? DECKS
+        : [{ key: 'b_red', name: 'Red Deck', order: 1, pos: { x: 0, y: 0 }, desc: '+1 discard every round', config: {} }];
+    const stakes =
+      STAKES.length > 0
+        ? STAKES
+        : [{ level: 1 as StakeLevel, key: 'stake_white', name: 'White Stake', pos: { x: 0, y: 0 }, color: '#efefef', scaling: 1 as const, desc: 'Base Difficulty' }];
     const selectedDeck = decks.find((d) => d.key === this.newRunDeckId) ?? decks[0]!;
     const selectedStake = stakes.find((s) => s.level === this.newRunStake) ?? stakes[0]!;
     const profile = this.cb.getProfile();
@@ -1246,7 +1633,7 @@ export class UiOverlay {
                   const maxSt = profile.deckMaxStake[d.key];
                   return `
                   <button class="kc-deck-chip interactive ${d.key === selectedDeck.key ? 'active' : ''}" data-pick-deck="${esc(d.key)}">
-                    <canvas class="kc-mini-sprite" width="35" height="47" data-atlas="centers" data-ax="${d.pos.x}" data-ay="${d.pos.y}"></canvas>
+                    <canvas class="kc-mini-sprite" width="36" height="48" data-atlas="centers" data-ax="${d.pos.x}" data-ay="${d.pos.y}"></canvas>
                     <span>${esc(d.name)}</span>
                     ${maxSt ? `<small class="kc-gold">S${maxSt}</small>` : ''}
                   </button>
@@ -1255,7 +1642,8 @@ export class UiOverlay {
                 .join('')}
             </div>
             <div class="kc-desc-banner">
-              <strong>${esc(selectedDeck.name)}</strong>: ${esc(selectedDeck.desc)}
+              <div class="kc-desc-banner-title">${esc(selectedDeck.name)}</div>
+              <div class="kc-parchment-inline">${formatRichDesc(selectedDeck.desc, this.lastHighContrast)}</div>
             </div>
           </div>
 
@@ -1274,7 +1662,8 @@ export class UiOverlay {
                 .join('')}
             </div>
             <div class="kc-desc-banner">
-              <strong>${esc(selectedStake.name)}</strong>: ${esc(selectedStake.desc)}
+              <div class="kc-desc-banner-title">${esc(selectedStake.name)}</div>
+              <div class="kc-parchment-inline">${formatRichDesc(selectedStake.desc, this.lastHighContrast)}</div>
             </div>
 
             <div class="kc-seed-row">
@@ -1324,7 +1713,7 @@ export class UiOverlay {
     `;
   }
 
-  private buildRunInfoModalHtml(state: SimState): string {
+  private buildRunInfoModalHtml(state: SimState, settings: RenderSettings): string {
     let body = '';
     if (this.runInfoTab === 'hands') {
       body = `
@@ -1339,7 +1728,9 @@ export class UiOverlay {
                 <span class="kc-lvl-badge" style="background:${lvlCol};">lvl.${st.level}</span>
                 <span class="kc-hr-name">${esc(hid)}</span>
                 <span class="kc-hr-math">
-                  <b class="kc-blue">${fmtNum(st.chips)}</b> X <b class="kc-red">${st.mult}</b>
+                  <span class="kc-hr-pill chips">${fmtNum(st.chips)}</span>
+                  <span class="kc-hr-x">X</span>
+                  <span class="kc-hr-pill mult">${st.mult}</span>
                 </span>
                 <span class="kc-hr-played">#${st.played}</span>
               </div>
@@ -1356,8 +1747,13 @@ export class UiOverlay {
               const d = BLIND_MAP[b.key];
               return `
               <div class="kc-info-card">
-                <div class="kc-info-title">${esc(b.name)} (${b.status})</div>
-                <div class="kc-gold">Target: ${fmtNum(b.targetChips)} | Reward: $${b.dollars}</div>
+                <div class="kc-info-head-row">
+                  <canvas class="kc-mini-sprite" width="34" height="34" data-atlas="BlindChips" data-ax="0" data-ay="${d?.pos.y ?? 0}"></canvas>
+                  <div>
+                    <div class="kc-info-title">${esc(b.name)} (${b.status})</div>
+                    <div class="kc-gold">Target: ${fmtNum(b.targetChips)} • $${b.dollars}</div>
+                  </div>
+                </div>
                 <div class="kc-muted-sm">${esc(d?.desc || 'Standard Blind')}</div>
               </div>
             `;
@@ -1372,20 +1768,41 @@ export class UiOverlay {
           : `<div class="kc-info-grid">${state.vouchers
               .map((vk) => {
                 const v = VOUCHER_MAP[vk];
-                return `<div class="kc-info-card"><div class="kc-info-title">${esc(v?.name ?? vk)}</div><div class="kc-muted-sm">${esc(v?.desc ?? '')}</div></div>`;
+                return `
+                  <div class="kc-info-card">
+                    <div class="kc-info-head-row">
+                      <canvas class="kc-mini-sprite" width="36" height="48" data-atlas="Voucher" data-ax="${v?.pos.x ?? 0}" data-ay="${v?.pos.y ?? 0}"></canvas>
+                      <div>
+                        <div class="kc-info-title">${esc(v?.name ?? vk)}</div>
+                        <div class="kc-muted-sm">${esc(v?.desc ?? '')}</div>
+                      </div>
+                    </div>
+                  </div>
+                `;
               })
               .join('')}</div>`;
     } else {
-      const suitCounts: Record<string, number> = { Hearts: 0, Diamonds: 0, Spades: 0, Clubs: 0 };
+      const suitCounts: Record<Suit, number> = { Hearts: 0, Diamonds: 0, Spades: 0, Clubs: 0 };
       for (const c of state.fullDeck) suitCounts[c.suit] = (suitCounts[c.suit] ?? 0) + 1;
+      const uiAtlas: AtlasKey = settings.highContrastSuits ? 'ui_2' : 'ui_1';
+      const suitOrder: Suit[] = ['Hearts', 'Diamonds', 'Spades', 'Clubs'];
+      const suitColors = settings.highContrastSuits
+        ? PALETTE.SUITS_HIGH_CONTRAST
+        : { Hearts: '#fe5f55', Diamonds: '#f06a40', Spades: '#b7c7e8', Clubs: '#6ec4a7' };
       body = `
         <div class="kc-deck-summary">
           <div class="kc-suit-pills">
-            <span>♥ Hearts: <b>${suitCounts.Hearts}</b></span>
-            <span>♦ Diamonds: <b>${suitCounts.Diamonds}</b></span>
-            <span>♠ Spades: <b>${suitCounts.Spades}</b></span>
-            <span>♣ Clubs: <b>${suitCounts.Clubs}</b></span>
-            <span>Draw Pile: <b>${state.drawPile.length}/${state.fullDeck.length}</b></span>
+            ${suitOrder
+              .map(
+                (su) => `
+              <span class="kc-suit-count-pill">
+                <canvas class="kc-mini-sprite" width="18" height="18" data-atlas="${uiAtlas}" data-ax="${UI_SUIT_COLS[su]}" data-ay="1"></canvas>
+                <span>${su}: <b style="color:${suitColors[su]};">${suitCounts[su]}</b></span>
+              </span>
+            `
+              )
+              .join('')}
+            <span class="kc-suit-count-pill">Draw Pile: <b class="kc-gold">${state.drawPile.length}/${state.fullDeck.length}</b></span>
           </div>
           <div class="kc-deck-cards-grid">
             ${state.fullDeck
@@ -1393,7 +1810,7 @@ export class UiOverlay {
               .map((c) => {
                 const sym =
                   c.suit === 'Hearts' ? '♥' : c.suit === 'Diamonds' ? '♦' : c.suit === 'Spades' ? '♠' : '♣';
-                const col = c.suit === 'Hearts' || c.suit === 'Diamonds' ? '#fe5f55' : '#cfd8e3';
+                const col = suitColors[c.suit];
                 const inDraw = state.drawPile.includes(c.id);
                 return `<span class="kc-deck-mini-card ${inDraw ? '' : 'used'}" style="color:${col};">${c.rank === '10' ? '10' : c.rank[0]}${sym}</span>`;
               })
@@ -1435,7 +1852,19 @@ export class UiOverlay {
     ];
 
     const renderCards = (
-      items: Array<{ key: string; name: string; desc: string; atlas: AtlasKey; x: number; y: number; w: number; h: number; discovered: boolean }>
+      items: Array<{
+        key: string;
+        name: string;
+        desc: string;
+        atlas: AtlasKey;
+        x: number;
+        y: number;
+        w: number;
+        h: number;
+        discovered: boolean;
+        badgeLabel?: string;
+        badgeColor?: string;
+      }>
     ) =>
       items
         .map(
@@ -1443,8 +1872,11 @@ export class UiOverlay {
         <div class="kc-coll-item ${it.discovered ? 'seen' : ''}">
           <canvas class="kc-mini-sprite" width="${it.w}" height="${it.h}" data-atlas="${it.atlas}" data-ax="${it.x}" data-ay="${it.y}"></canvas>
           <div class="kc-coll-meta">
-            <div class="kc-coll-name">${esc(it.name)} ${it.discovered ? '<span class="kc-seen-dot">★</span>' : ''}</div>
-            <div class="kc-coll-desc">${esc(it.desc)}</div>
+            <div class="kc-coll-head">
+              <span class="kc-coll-name">${esc(it.name)} ${it.discovered ? '<span class="kc-seen-dot">★</span>' : ''}</span>
+              ${it.badgeLabel ? `<span class="kc-coll-pill" style="background:${it.badgeColor};">${esc(it.badgeLabel)}</span>` : ''}
+            </div>
+            <div class="kc-coll-desc">${formatRichDesc(it.desc, this.lastHighContrast)}</div>
           </div>
         </div>
       `
@@ -1461,14 +1893,24 @@ export class UiOverlay {
           atlas: 'Joker',
           x: j.pos.x,
           y: j.pos.y,
-          w: 42,
-          h: 56,
+          w: 44,
+          h: 59,
           discovered: profile.discoveredJokers.includes(j.key),
+          badgeLabel: RARITY_NAMES[j.rarity],
+          badgeColor: PALETTE.RARITY[j.rarity - 1] ?? PALETTE.BLUE,
         }))
       );
-    } else if (this.collectionTab === 'tarots' || this.collectionTab === 'planets' || this.collectionTab === 'spectrals') {
+    } else if (
+      this.collectionTab === 'tarots' ||
+      this.collectionTab === 'planets' ||
+      this.collectionTab === 'spectrals'
+    ) {
       const src: ConsumableDef[] =
-        this.collectionTab === 'tarots' ? TAROTS : this.collectionTab === 'planets' ? PLANETS : SPECTRALS;
+        this.collectionTab === 'tarots'
+          ? TAROTS
+          : this.collectionTab === 'planets'
+            ? PLANETS
+            : SPECTRALS;
       itemsHtml = renderCards(
         src.map((c) => ({
           key: c.key,
@@ -1477,8 +1919,8 @@ export class UiOverlay {
           atlas: 'Tarot',
           x: c.pos.x,
           y: c.pos.y,
-          w: 42,
-          h: 56,
+          w: 44,
+          h: 59,
           discovered: profile.discoveredConsumables.includes(c.key),
         }))
       );
@@ -1491,8 +1933,8 @@ export class UiOverlay {
           atlas: 'Voucher',
           x: v.pos.x,
           y: v.pos.y,
-          w: 42,
-          h: 56,
+          w: 44,
+          h: 59,
           discovered: profile.discoveredVouchers.includes(v.key),
         }))
       );
@@ -1505,8 +1947,8 @@ export class UiOverlay {
           atlas: 'Booster',
           x: b.pos.x,
           y: b.pos.y,
-          w: 42,
-          h: 56,
+          w: 44,
+          h: 59,
           discovered: true,
         }))
       );
@@ -1515,12 +1957,12 @@ export class UiOverlay {
         BLINDS.map((b) => ({
           key: b.key,
           name: b.name,
-          desc: b.desc || `${b.mult}x Base | $${b.dollars}`,
+          desc: b.desc || `${b.mult}x Base • $${b.dollars}`,
           atlas: 'BlindChips',
           x: 0,
           y: b.pos.y,
-          w: 34,
-          h: 34,
+          w: 36,
+          h: 36,
           discovered: profile.discoveredBlinds.includes(b.key),
         }))
       );
@@ -1533,8 +1975,8 @@ export class UiOverlay {
           atlas: 'tags',
           x: t.pos.x,
           y: t.pos.y,
-          w: 34,
-          h: 34,
+          w: 36,
+          h: 36,
           discovered: profile.discoveredTags.includes(t.key),
         }))
       );
@@ -1547,8 +1989,8 @@ export class UiOverlay {
           atlas: 'centers',
           x: d.pos.x,
           y: d.pos.y,
-          w: 42,
-          h: 56,
+          w: 44,
+          h: 59,
           discovered: Boolean(profile.deckMaxStake[d.key]),
         }))
       );
@@ -1593,7 +2035,7 @@ export class UiOverlay {
         </div>
         <div class="kc-modal-scroll kc-options-grid">
           <div class="kc-opt-section">
-            <div class="kc-section-hdr">Video & Pace</div>
+            <div class="kc-section-hdr">Video &amp; Pace</div>
             <div class="kc-opt-row">
               <span>Target FPS</span>
               <div class="kc-pill-group">
@@ -1645,7 +2087,7 @@ export class UiOverlay {
           </div>
 
           <div class="kc-opt-section">
-            <div class="kc-section-hdr">Art & Audio Pack</div>
+            <div class="kc-section-hdr">Art &amp; Audio Pack</div>
             <div class="kc-opt-row">
               <span>Active Pack</span>
               <div class="kc-pill-group">
@@ -1689,7 +2131,7 @@ export class UiOverlay {
         <div class="kc-pause-stack">
           <button class="kc-btn kc-btn-blue interactive" data-modal="close">Resume Run</button>
           <button class="kc-btn kc-btn-amber interactive" data-pause="options">Options</button>
-          <button class="kc-btn kc-btn-purple interactive" data-pause="newrun">New Run</button>
+          <button class="kc-btn kc-btn-green interactive" data-pause="newrun">New Run</button>
           <button class="kc-btn kc-btn-red interactive" data-pause="title">Main Menu</button>
         </div>
       </div>
@@ -1697,7 +2139,7 @@ export class UiOverlay {
   }
 
   private bindModalEvents(_state: SimState, _settings: RenderSettings): void {
-    // Draw any mini sprite canvases inside New Run or Collection
+    // Draw any mini sprite canvases inside New Run, Run Info, or Collection
     this.modalLayer.querySelectorAll<HTMLCanvasElement>('.kc-mini-sprite').forEach((c) => {
       const atlas = c.dataset.atlas as AtlasKey;
       this.drawAtlasCellToCanvas(c, atlas, Number(c.dataset.ax ?? 0), Number(c.dataset.ay ?? 0));
@@ -1843,18 +2285,18 @@ export class UiOverlay {
   }
 
   // =========================================================================
-  // Dynamic Viewport-Clamped Hover Tooltip
+  // Iconic Rich Viewport-Clamped Card Tooltip
   // =========================================================================
 
   private renderTooltip(card: VisualCard | null, x: number, y: number, state: SimState): void {
     if (!card || this.activeModal || card.kind === 'title_showcase' || card.kind === 'deck_pile') {
-      this.tooltipEl.classList.add('hidden');
+      if (!this.hoveredTagKey) this.tooltipEl.classList.add('hidden');
       return;
     }
 
     const info = describeVisualCard(card, state);
     if (!info) {
-      this.tooltipEl.classList.add('hidden');
+      if (!this.hoveredTagKey) this.tooltipEl.classList.add('hidden');
       return;
     }
 
@@ -1866,25 +2308,22 @@ export class UiOverlay {
 
     this.tooltipEl.innerHTML = `
       <div class="kc-tt-title">${esc(info.title)}</div>
-      <div class="kc-tt-desc">${esc(info.desc)}</div>
+      <div class="kc-tt-desc">${formatRichDesc(info.desc, this.lastHighContrast)}</div>
       ${badgesHtml ? `<div class="kc-tt-badges">${badgesHtml}</div>` : ''}
     `;
     this.tooltipEl.classList.remove('hidden');
 
-    // Clamp strictly inside viewport without overlapping sibling hand/joker cards
-    const tw = this.tooltipEl.offsetWidth || 236;
-    const th = this.tooltipEl.offsetHeight || 110;
+    const tw = this.tooltipEl.offsetWidth || 248;
+    const th = this.tooltipEl.offsetHeight || 116;
     const vw = window.innerWidth;
     const vh = window.innerHeight;
 
     let tx = card.moveable.vx - tw * 0.5;
     let ty: number;
     if (card.kind === 'hand' || card.kind === 'play' || card.kind === 'pack_card') {
-      // Anchor cleanly ABOVE the card so neighboring cards stay 100% unobstructed
       ty = card.moveable.vy - card.moveable.vh * 0.54 - th - 12;
       if (ty < 12) ty = card.moveable.vy + card.moveable.vh * 0.54 + 12;
     } else if (card.kind === 'joker' || card.kind === 'consumable') {
-      // Anchor cleanly BELOW top-row jokers/consumables
       ty = card.moveable.vy + card.moveable.vh * 0.54 + 14;
     } else {
       tx = card.moveable.vx + card.moveable.vw * 0.56;
@@ -1903,7 +2342,7 @@ export class UiOverlay {
   }
 
   // =========================================================================
-  // Beveled Stylesheet Injection
+  // Chunky Flat-Shaded Pixel-Arcade Stylesheet & Unified CRT Overlay
   // =========================================================================
 
   private injectStyles(): void {
@@ -1912,527 +2351,1393 @@ export class UiOverlay {
     style.id = 'krunked-ui-styles';
     style.textContent = `
       :root {
-        --krunked-font: 'Trebuchet MS', 'Bahnschrift', 'Segoe UI', sans-serif;
+        --krunked-font: 'KrunkedPixelBuiltin', monospace;
+        --krunked-font-scale: 1;
         --kc-dark: #252d30;
+        --kc-well: #1c2326;
         --kc-slate: #374244;
+        --kc-slate-md: #2c3538;
         --kc-slate-lt: #4f6367;
+        --kc-rim: #7c8e94;
         --kc-border: #1b2224;
       }
-      #ui-root {
+
+      /* Global razor-sharp pixel typography — ZERO browser faux-bold smearing! */
+      #ui-root,
+      #ui-root *,
+      #ui-root button,
+      #ui-root input,
+      #ui-root h1,
+      #ui-root h2,
+      #ui-root strong,
+      #ui-root b {
         font-family: var(--krunked-font);
-        color: #fff;
+        font-weight: 400;
+        font-synthesis: none;
+        -webkit-font-smoothing: none;
+        -moz-osx-font-smoothing: grayscale;
+        font-smooth: never;
+        text-rendering: geometricPrecision;
+      }
+
+      #ui-root {
+        color: #ffffff;
         letter-spacing: 0.02em;
       }
+      #ui-root canvas {
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+      }
+
       .kc-layer { position: absolute; inset: 0; pointer-events: none; }
       .kc-popups { z-index: 45; }
       .kc-modal-layer { z-index: 60; }
       .hidden { display: none !important; }
 
-      /* Left Console Rail */
+      /* Wavy DynaText Character Motion */
+      .kc-dyna-char {
+        display: inline-block;
+        animation: kc-dyna-wave 1.9s ease-in-out infinite;
+        animation-delay: calc(var(--di, 0) * 0.085s);
+      }
+      .kc-dyna-space { display: inline-block; width: 0.34em; }
+      @keyframes kc-dyna-wave {
+        0%, 100% { transform: translateY(0px); }
+        50% { transform: translateY(-2px); }
+      }
+      .kc-reduced-motion .kc-dyna-char,
+      .kc-reduced-motion .kc-title-letter,
+      .kc-reduced-motion .kc-pop-char {
+        animation: none !important;
+      }
+
+      /* =================================================================== */
+      /* Full-Screen Unified CRT Monitor Overlay (#crt-overlay)              */
+      /* =================================================================== */
+      #crt-overlay::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background-image:
+          repeating-linear-gradient(
+            to bottom,
+            transparent 0px,
+            transparent 2px,
+            rgba(0, 0, 0, var(--crt-scan-alpha, 0.12)) 2px,
+            rgba(0, 0, 0, var(--crt-scan-alpha, 0.12)) 4px
+          ),
+          repeating-linear-gradient(
+            to right,
+            rgba(255, 50, 50, var(--crt-mask-alpha, 0.03)) 0px,
+            rgba(255, 50, 50, var(--crt-mask-alpha, 0.03)) 1px,
+            rgba(50, 255, 90, var(--crt-mask-alpha, 0.03)) 1px,
+            rgba(50, 255, 90, var(--crt-mask-alpha, 0.03)) 2px,
+            rgba(50, 130, 255, var(--crt-mask-alpha, 0.03)) 2px,
+            rgba(50, 130, 255, var(--crt-mask-alpha, 0.03)) 3px
+          );
+        pointer-events: none;
+      }
+      #crt-overlay::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background:
+          radial-gradient(
+            ellipse 74% 72% at 50% 50%,
+            rgba(255, 255, 255, var(--crt-glow-alpha, 0.04)) 0%,
+            transparent 58%,
+            rgba(6, 10, 12, var(--crt-vig-alpha, 0.24)) 100%
+          );
+        box-shadow:
+          inset 0 0 28px rgba(0, 0, 0, var(--crt-vig-alpha, 0.28)),
+          inset 0 0 4px rgba(0, 0, 0, 0.55);
+        border-radius: 18px;
+        pointer-events: none;
+      }
+
+      /* =================================================================== */
+      /* Left Console Rail (Chunky Flat-Shaded Slate, Zero Dead Void)        */
+      /* =================================================================== */
       .kc-rail {
         position: absolute;
         display: flex;
         flex-direction: column;
-        gap: 8px;
-        background: linear-gradient(180deg, rgba(45,55,58,0.92), rgba(33,40,43,0.92));
+        gap: 9px;
+        background: var(--kc-slate-md);
         border: 3px solid var(--kc-border);
-        border-radius: 14px;
-        padding: 9px;
-        box-shadow: 0 8px 0 rgba(0,0,0,0.42), inset 0 2px 0 rgba(255,255,255,0.1);
+        border-radius: 12px;
+        padding: 10px;
+        box-shadow:
+          0 6px 0 var(--kc-border),
+          inset 0 3px 0 rgba(255, 255, 255, 0.1),
+          inset 0 -3px 0 rgba(0, 0, 0, 0.28);
         pointer-events: auto;
-        transition: background 0.25s ease;
       }
       .kc-rail.rail-flaming {
         background: linear-gradient(
           180deg,
-          rgba(45,55,58,0.92) 0%,
-          rgba(45,55,58,0.88) 33%,
-          rgba(22,28,31,0.12) 42%,
-          rgba(22,28,31,0.12) 60%,
-          rgba(33,40,43,0.92) 69%,
-          rgba(33,40,43,0.94) 100%
+          var(--kc-slate-md) 0%,
+          var(--kc-slate-md) 30%,
+          rgba(28, 35, 38, 0.06) 39%,
+          rgba(28, 35, 38, 0.06) 62%,
+          var(--kc-slate-md) 70%,
+          var(--kc-slate-md) 100%
         );
       }
+
+      /* Rail Shop Marquee (replaces Blind Header cleanly during SHOP phase) */
+      .kc-rail-shop-marquee {
+        background: #231920;
+        border: 3px solid #fe5f55;
+        border-radius: 10px;
+        padding: 8px 8px 9px;
+        text-align: center;
+        box-shadow:
+          0 4px 0 var(--kc-border),
+          inset 0 2px 0 rgba(255, 255, 255, 0.16);
+      }
+      .kc-rail-shop-sign {
+        display: block;
+        width: 100%;
+        max-width: 230px;
+        height: auto;
+        aspect-ratio: 113 / 57;
+        margin: 0 auto 4px;
+      }
+      .kc-rail-shop-sub {
+        font-size: 16px;
+        color: #f3b958;
+        text-shadow: 0 2px 0 #141a1c;
+        letter-spacing: 0.04em;
+      }
+
+      /* Blind Banner */
       .kc-blind-header {
-        background: #232b2e;
-        border: 2px solid var(--kc-border);
+        background: var(--kc-well);
+        border: 3px solid var(--kc-border);
         border-radius: 10px;
         overflow: hidden;
+        box-shadow: 0 4px 0 #13181a;
       }
       .kc-blind-title-bar {
         background: var(--blind-col, #2e659e);
         text-align: center;
-        font-weight: 900;
-        font-size: 18px;
-        padding: 5px 8px;
-        text-shadow: 0 2px 0 rgba(0,0,0,0.45);
-        border-bottom: 2px solid rgba(0,0,0,0.28);
+        font-size: 21px;
+        padding: 6px 8px;
+        color: #ffffff;
+        text-shadow: 0 2px 0 rgba(0, 0, 0, 0.6);
+        border-bottom: 3px solid var(--kc-border);
+        box-shadow: inset 0 2px 0 rgba(255, 255, 255, 0.24);
       }
       .kc-blind-body {
         display: flex;
         align-items: center;
         gap: 10px;
-        padding: 8px 10px;
+        padding: 9px 10px;
       }
       .kc-blind-chip-canvas {
-        width: 50px; height: 50px; flex: 0 0 50px;
-        image-rendering: pixelated;
+        width: 58px;
+        height: 58px;
+        flex: 0 0 58px;
       }
       .kc-blind-meta { flex: 1; min-width: 0; }
-      .kc-muted-sm { font-size: 12px; color: #b8c6c9; line-height: 1.2; }
+      .kc-muted-sm {
+        font-size: 13px;
+        color: #b8c6c9;
+        line-height: 1.25;
+      }
       .kc-target-score {
-        display: flex; align-items: center; gap: 6px;
-        font-size: 22px; font-weight: 900; color: #fe5f55;
-        text-shadow: 0 2px 0 rgba(0,0,0,0.5);
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 26px;
+        color: #fe5f55;
+        text-shadow: 0 2px 0 #0f1416;
+        line-height: 1.1;
+        margin: 2px 0;
       }
-      .kc-target-score.lg { justify-content: center; font-size: 26px; margin: 4px 0; }
-      .kc-chip-dot {
-        display: inline-block; width: 13px; height: 13px; border-radius: 50%;
-        background: radial-gradient(circle at 35% 35%, #8ce0ff, #009dff 65%, #005599);
-        border: 2px solid #fff; box-shadow: 0 1px 0 #1b2224; flex-shrink: 0;
+      .kc-target-score.lg {
+        justify-content: center;
+        font-size: 30px;
+        margin: 5px 0;
       }
-      .kc-blind-reward { font-size: 13px; font-weight: 700; margin-top: 2px; }
+      .kc-score-chip-canvas {
+        width: 22px;
+        height: 22px;
+        flex-shrink: 0;
+      }
+      .kc-blind-reward {
+        font-size: 15px;
+        color: #e2ecee;
+        text-shadow: 0 2px 0 #0f1416;
+      }
       .kc-blind-desc {
-        font-size: 12px; color: #f0e6d2; text-align: center;
-        background: rgba(0,0,0,0.28); padding: 5px 8px; line-height: 1.25;
-      }
-      .kc-inset-box {
-        background: #1f2729;
-        border: 2px solid #141a1c;
-        border-radius: 10px;
-        padding: 7px 10px;
-        box-shadow: inset 0 2px 4px rgba(0,0,0,0.4);
-      }
-      .kc-round-score-box { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-      .kc-round-score-val {
-        display: flex; align-items: center; gap: 6px;
-        font-size: 23px; font-weight: 900; color: #fff;
-        text-shadow: 0 2px 0 rgba(0,0,0,0.5);
+        font-size: 13px;
+        color: #f3ead6;
+        text-align: center;
+        background: #141a1d;
+        border-top: 2px solid #263034;
+        padding: 6px 8px;
+        line-height: 1.28;
       }
 
-      /* Hand Score Box (transparent glass so WebGL2 roaring flames shine through!) */
+      /* Round Score Well */
+      .kc-inset-box {
+        background: var(--kc-well);
+        border: 3px solid var(--kc-border);
+        border-radius: 10px;
+        padding: 9px 11px;
+        box-shadow: inset 0 3px 0 rgba(0, 0, 0, 0.42);
+      }
+      .kc-round-score-box {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .kc-round-lbl {
+        font-size: 15px;
+        color: #c8d6d9;
+        line-height: 1.15;
+        text-shadow: 0 2px 0 #0e1315;
+      }
+      .kc-round-score-val {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-size: 28px;
+        color: #ffffff;
+        text-shadow: 0 2px 0 #0e1315;
+      }
+
+      /* Hand Score Stage (transparent backing behind roaring WebGL2 flames!) */
       .kc-hand-box {
-        background: rgba(24, 31, 34, 0.72);
-        border: 2px solid #141a1c;
+        background: var(--kc-well);
+        border: 3px solid var(--kc-border);
         border-radius: 11px;
-        padding: 8px 8px 10px;
-        transition: border-color 0.2s;
+        padding: 12px 9px 14px;
+        box-shadow: inset 0 3px 0 rgba(0, 0, 0, 0.42);
+        transition: border-color 0.16s, background 0.16s;
       }
       .kc-hand-box.flaming {
-        background: rgba(24, 31, 34, 0.36);
+        background: rgba(20, 26, 30, 0.16);
         border-color: #fda200;
-        box-shadow: 0 0 18px rgba(254, 95, 85, 0.45);
+        box-shadow: inset 0 0 0 2px rgba(254, 95, 85, 0.35);
       }
       .kc-hand-header {
-        display: flex; align-items: center; justify-content: center; gap: 7px;
-        min-height: 24px; margin-bottom: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        min-height: 28px;
+        margin-bottom: 10px;
       }
       .kc-hand-name {
-        font-size: 17px; font-weight: 900; color: #fff;
-        text-shadow: 0 2px 0 rgba(0,0,0,0.55); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        font-size: 22px;
+        color: #ffffff;
+        text-shadow: 0 2px 0 #0e1315;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
+      .kc-hand-placeholder { color: #8c9fa4; font-size: 18px; }
       .kc-lvl-badge {
-        color: #1f2729; font-weight: 900; font-size: 12px;
-        padding: 1px 6px; border-radius: 6px; flex-shrink: 0;
+        color: #161d20;
+        font-size: 14px;
+        padding: 2px 7px;
+        border-radius: 6px;
+        border: 2px solid var(--kc-border);
+        box-shadow: 0 2px 0 var(--kc-border);
+        flex-shrink: 0;
       }
       .kc-score-math {
-        display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 6px;
+        display: grid;
+        grid-template-columns: 1fr auto 1fr;
+        align-items: center;
+        gap: 6px;
       }
       .kc-math-pill {
-        border-radius: 8px; padding: 8px 6px; text-align: center;
-        font-size: 24px; font-weight: 900; color: #fff;
-        border: 2px solid rgba(0,0,0,0.35);
-        text-shadow: 0 2px 0 rgba(0,0,0,0.45);
-        box-shadow: 0 4px 0 rgba(0,0,0,0.35);
+        border-radius: 9px;
+        padding: 10px 6px;
+        text-align: center;
+        font-size: 28px;
+        color: #ffffff;
+        border: 3px solid var(--kc-border);
+        text-shadow: 0 2px 0 rgba(0, 0, 0, 0.55);
         transition: transform 0.08s ease-out;
-        overflow: hidden; text-overflow: ellipsis;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        line-height: 1.05;
       }
-      .kc-chips-pill { background: #009dff; }
-      .kc-mult-pill { background: #fe5f55; }
-      .kc-math-x { font-size: 22px; font-weight: 900; color: #fe5f55; text-shadow: 0 2px 0 #1b2224; }
+      .kc-chips-pill {
+        background: #009dff;
+        box-shadow:
+          0 5px 0 #005b99,
+          inset 0 2px 0 rgba(255, 255, 255, 0.32);
+      }
+      .kc-mult-pill {
+        background: #fe5f55;
+        box-shadow:
+          0 5px 0 #a82b24,
+          inset 0 2px 0 rgba(255, 255, 255, 0.32);
+      }
+      .kc-math-x {
+        font-size: 26px;
+        color: #fe5f55;
+        text-shadow: 0 3px 0 #141a1c;
+      }
 
+      /* Lower 2-Column Console Grid (fills lower rail cleanly with zero void!) */
       .kc-rail-mid-grid {
-        display: grid; grid-template-columns: 0.85fr 1.15fr; gap: 7px; margin-top: auto;
+        flex: 1;
+        display: grid;
+        grid-template-columns: 0.84fr 1.16fr;
+        gap: 8px;
+        min-height: 196px;
       }
-      .kc-rail-buttons { display: flex; flex-direction: column; gap: 7px; }
-      .kc-rail-buttons .kc-btn { flex: 1; font-size: 14px; padding: 8px 4px; }
-      .kc-rail-stats { display: flex; flex-direction: column; gap: 6px; }
-      .kc-stat-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+      .kc-rail-buttons {
+        display: flex;
+        flex-direction: column;
+        gap: 9px;
+      }
+      .kc-rail-buttons .kc-btn {
+        flex: 1;
+        font-size: 18px;
+        padding: 10px 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .kc-rail-stats {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .kc-stat-pair {
+        flex: 1;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 7px;
+      }
       .kc-stat-card {
-        background: #1f2729; border: 2px solid #141a1c; border-radius: 8px;
-        text-align: center; padding: 4px 3px;
+        background: var(--kc-well);
+        border: 3px solid var(--kc-border);
+        border-radius: 9px;
+        text-align: center;
+        padding: 6px 4px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        box-shadow: inset 0 3px 0 rgba(0, 0, 0, 0.42);
       }
-      .kc-stat-lbl { font-size: 11px; color: #b8c6c9; font-weight: 700; }
-      .kc-stat-val { font-size: 20px; font-weight: 900; line-height: 1.1; }
+      .kc-stat-lbl {
+        font-size: 13px;
+        color: #b8c6c9;
+        margin-bottom: 2px;
+      }
+      .kc-stat-val {
+        font-size: 26px;
+        line-height: 1.05;
+        text-shadow: 0 2px 0 #0e1315;
+      }
+      .kc-ante-max {
+        font-size: 15px;
+        color: #9cb0b5;
+      }
       .kc-money-bar {
-        background: #1f2729; border: 2px solid #141a1c; border-radius: 8px;
-        text-align: center; padding: 6px 4px;
-        font-size: 24px; font-weight: 900; color: #f3b958;
-        text-shadow: 0 2px 0 rgba(0,0,0,0.5);
-      }
-      .kc-rail-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
-      .kc-tag-pill {
-        background: #4f6367; border: 1px solid #1b2224; border-radius: 6px;
-        padding: 2px 6px; font-size: 11px; font-weight: 700; color: #fff;
+        background: var(--kc-well);
+        border: 3px solid var(--kc-border);
+        border-radius: 9px;
+        text-align: center;
+        padding: 9px 6px;
+        font-size: 30px;
+        color: #f3b958;
+        text-shadow: 0 3px 0 #0e1315;
+        box-shadow: inset 0 3px 0 rgba(0, 0, 0, 0.45);
+        line-height: 1.05;
       }
 
-      /* Colors */
+      /* Skip Tags Pixel Sprite Strip */
+      .kc-rail-tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        padding: 5px 6px;
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 8px;
+        box-shadow: inset 0 2px 0 rgba(0, 0, 0, 0.4);
+      }
+      .kc-rail-tag-btn {
+        background: transparent;
+        border: none;
+        padding: 0;
+        cursor: pointer;
+        line-height: 0;
+        transition: transform 0.08s;
+      }
+      .kc-rail-tag-btn:hover { transform: scale(1.14) translateY(-2px); }
+      .kc-rail-tag-canvas { width: 32px; height: 32px; display: block; }
+
+      /* Compact rail fallback for short screens */
+      .kc-rail.compact { gap: 6px; padding: 7px; }
+      .kc-rail.compact .kc-blind-body { padding: 6px 8px; }
+      .kc-rail.compact .kc-hand-box { padding: 8px 7px 10px; }
+      .kc-rail.compact .kc-math-pill { font-size: 23px; padding: 7px 4px; }
+      .kc-rail.compact .kc-stat-val { font-size: 22px; }
+      .kc-rail.compact .kc-money-bar { font-size: 24px; padding: 6px 4px; }
+
+      /* Signature Colors */
       .kc-blue { color: #009dff; }
       .kc-red { color: #fe5f55; }
       .kc-amber { color: #fda200; }
       .kc-gold { color: #f3b958; }
 
-      /* Tactile Beveled Buttons */
+      /* =================================================================== */
+      /* Chunky Tactile 3D-Extruded Arcade Buttons                           */
+      /* =================================================================== */
       .kc-btn {
-        font-family: var(--krunked-font);
-        font-weight: 900;
-        color: #fff;
-        border: 2px solid #1a2124;
+        color: #ffffff;
+        border: 3px solid var(--kc-border);
         border-radius: 10px;
         padding: 10px 14px;
         cursor: pointer;
-        text-shadow: 0 2px 0 rgba(0,0,0,0.38);
-        box-shadow: 0 4px 0 rgba(0,0,0,0.42), inset 0 2px 0 rgba(255,255,255,0.22);
-        transition: transform 0.06s, filter 0.1s;
-        line-height: 1.15;
+        text-shadow: 0 2px 0 rgba(0, 0, 0, 0.55);
+        box-shadow:
+          0 5px 0 var(--btn-shadow, #141a1c),
+          0 5px 0 2px var(--kc-border),
+          inset 0 3px 0 rgba(255, 255, 255, 0.26);
+        transition: transform 0.06s, filter 0.08s;
+        line-height: 1.12;
       }
-      .kc-btn:hover:not(:disabled) { filter: brightness(1.08); transform: translateY(-1px); }
-      .kc-btn:active:not(:disabled) { transform: translateY(2px); box-shadow: 0 1px 0 rgba(0,0,0,0.42); }
-      .kc-btn:disabled { opacity: 0.42; cursor: not-allowed; filter: grayscale(0.5); }
-      .kc-btn-sm { padding: 6px 10px; font-size: 13px; border-radius: 8px; }
-      .kc-btn-blue { background: #009dff; }
-      .kc-btn-red { background: #fe5f55; }
-      .kc-btn-amber { background: #fda200; }
-      .kc-btn-green { background: #4bc292; }
-      .kc-btn-purple { background: #8867a5; }
-      .kc-btn-teal { background: #3b8d99; }
-      .kc-btn-slate { background: #4f6367; }
+      .kc-btn:hover:not(:disabled) {
+        filter: brightness(1.08);
+        transform: translateY(-1px);
+      }
+      .kc-btn:active:not(:disabled) {
+        transform: translateY(3px);
+        box-shadow:
+          0 2px 0 var(--btn-shadow, #141a1c),
+          0 2px 0 2px var(--kc-border),
+          inset 0 2px 0 rgba(255, 255, 255, 0.16);
+      }
+      .kc-btn:disabled {
+        opacity: 0.44;
+        cursor: not-allowed;
+        filter: grayscale(0.45);
+      }
+      .kc-btn-sm {
+        padding: 6px 11px;
+        font-size: 15px;
+        border-radius: 8px;
+        box-shadow:
+          0 3px 0 var(--btn-shadow, #141a1c),
+          0 3px 0 2px var(--kc-border),
+          inset 0 2px 0 rgba(255, 255, 255, 0.24);
+      }
+      .kc-btn-blue { background: #009dff; --btn-shadow: #005b99; }
+      .kc-btn-red { background: #fe5f55; --btn-shadow: #a82b24; }
+      .kc-btn-amber { background: #fda200; --btn-shadow: #a66500; }
+      .kc-btn-green { background: #4bc292; --btn-shadow: #267857; }
+      .kc-btn-purple { background: #8867a5; --btn-shadow: #523969; }
+      .kc-btn-teal { background: #3b8d99; --btn-shadow: #205760; }
+      .kc-btn-slate { background: #4f6367; --btn-shadow: #2a373a; }
 
-      /* Felt Trays */
+      /* =================================================================== */
+      /* Felt Card Trays (Minimal veil so WebGL2 cards & shaders pop 100%!)  */
+      /* =================================================================== */
       .kc-felt-tray {
         position: absolute;
-        background: rgba(18, 25, 28, 0.34);
-        border: 2px solid rgba(255, 255, 255, 0.08);
+        background: rgba(12, 18, 21, 0.14);
+        border: 2px solid rgba(18, 26, 29, 0.72);
         border-radius: 12px;
+        box-shadow:
+          inset 0 3px 0 rgba(0, 0, 0, 0.24),
+          0 1px 0 rgba(255, 255, 255, 0.08);
         pointer-events: none;
       }
       .kc-tray-counter {
-        position: absolute; bottom: -18px;
-        font-size: 12px; font-weight: 800; color: #dce7ea;
-        text-shadow: 0 1px 2px #000;
+        position: absolute;
+        bottom: -20px;
+        font-size: 14px;
+        color: #e2edf0;
+        text-shadow: 0 2px 0 #101618;
       }
       .kc-tray-counter.left { left: 6px; }
       .kc-tray-counter.right { right: 6px; }
 
-      /* Deck Badge & Action Bar */
+      /* Deck Badge & Bottom Playing Action Bar */
       .kc-deck-badge {
         position: absolute;
-        background: rgba(25, 32, 36, 0.85);
-        border: 2px solid #1b2224;
+        background: var(--kc-slate-md);
+        border: 3px solid var(--kc-border);
         border-radius: 8px;
-        color: #fff; font-weight: 900; font-size: 14px;
-        padding: 4px 6px; cursor: pointer;
+        color: #ffffff;
+        font-size: 16px;
+        padding: 4px 6px;
+        cursor: pointer;
         text-align: center;
+        text-shadow: 0 2px 0 #101618;
+        box-shadow: 0 4px 0 var(--kc-border), inset 0 2px 0 rgba(255, 255, 255, 0.14);
       }
+      .kc-deck-badge:hover { filter: brightness(1.1); }
       .kc-action-bar {
         position: absolute;
-        display: flex; align-items: center; justify-content: center; gap: 14px;
-        height: 52px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        height: 54px;
       }
-      .kc-action-lg { min-width: 148px; height: 48px; font-size: 18px; }
+      .kc-action-lg {
+        min-width: 156px;
+        height: 50px;
+        font-size: 21px;
+      }
       .kc-sort-box {
-        background: rgba(31, 39, 41, 0.9);
-        border: 2px solid #1b2224; border-radius: 10px;
-        padding: 4px 8px; text-align: center;
+        background: var(--kc-slate-md);
+        border: 3px solid var(--kc-border);
+        border-radius: 10px;
+        padding: 4px 9px 6px;
+        text-align: center;
+        box-shadow: 0 4px 0 var(--kc-border), inset 0 2px 0 rgba(255, 255, 255, 0.12);
       }
-      .kc-sort-title { font-size: 11px; color: #b8c6c9; font-weight: 800; margin-bottom: 3px; }
+      .kc-sort-title {
+        font-size: 12px;
+        color: #c2d1d4;
+        margin-bottom: 3px;
+        text-shadow: 0 1px 0 #101618;
+      }
       .kc-sort-btns { display: flex; gap: 6px; }
-      .kc-sort-btns .kc-btn.active { outline: 2px solid #fff; }
+      .kc-sort-btns .kc-btn.active {
+        box-shadow:
+          0 0 0 2px #ffffff,
+          0 3px 0 var(--btn-shadow, #141a1c),
+          inset 0 2px 0 rgba(255, 255, 255, 0.35);
+      }
 
-      /* Card contextual buttons & prices */
+      /* Card Contextual Buttons & Shop Prices */
       .kc-card-actions {
-        position: absolute; transform: translateX(-50%);
-        display: flex; gap: 5px; z-index: 30;
+        position: absolute;
+        transform: translateX(-50%);
+        display: flex;
+        gap: 5px;
+        z-index: 30;
       }
       .kc-mini-btn {
-        font-family: var(--krunked-font); font-weight: 900; font-size: 12px;
-        color: #fff; border: 2px solid #1a2124; border-radius: 7px;
-        padding: 4px 8px; cursor: pointer; white-space: nowrap;
-        box-shadow: 0 3px 0 rgba(0,0,0,0.45);
-        text-shadow: 0 1px 0 rgba(0,0,0,0.4);
+        font-size: 14px;
+        color: #ffffff;
+        border: 2px solid var(--kc-border);
+        border-radius: 7px;
+        padding: 4px 9px;
+        cursor: pointer;
+        white-space: nowrap;
+        box-shadow:
+          0 3px 0 var(--kc-border),
+          inset 0 2px 0 rgba(255, 255, 255, 0.25);
+        text-shadow: 0 2px 0 rgba(0, 0, 0, 0.5);
+        transition: transform 0.06s;
       }
-      .kc-mini-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+      .kc-mini-btn:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.08); }
+      .kc-mini-btn:active:not(:disabled) { transform: translateY(2px); }
+      .kc-mini-btn:disabled { opacity: 0.45; cursor: not-allowed; filter: grayscale(0.45); }
+
       .kc-price-tag {
-        position: absolute; transform: translateX(-50%);
-        background: #232b2e; border: 2px solid #f3b958; border-radius: 7px;
-        color: #f3b958; font-weight: 900; font-size: 15px;
-        padding: 1px 9px; box-shadow: 0 3px 0 rgba(0,0,0,0.4);
+        position: absolute;
+        transform: translateX(-50%);
+        background: #232b2e;
+        border: 3px solid #f3b958;
+        border-radius: 8px;
+        color: #f3b958;
+        font-size: 17px;
+        padding: 1px 10px 2px;
+        box-shadow: 0 4px 0 var(--kc-border);
+        text-shadow: 0 2px 0 #101618;
+        z-index: 28;
+      }
+      .kc-price-tag.unaffordable {
+        border-color: #fe5f55;
+        color: #fe5f55;
       }
 
-      /* Title Screen */
+      /* =================================================================== */
+      /* Iconic Title Screen (Wavy Multi-Color DynaText Logo + Clean Dock)   */
+      /* =================================================================== */
       .kc-title-screen {
-        position: absolute; inset: 0;
-        display: flex; flex-direction: column; justify-content: space-between; align-items: center;
-        padding: 26px 24px 28px;
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        align-items: center;
+        padding: 28px 24px 30px;
       }
-      .kc-logo-wrap { text-align: center; animation: kc-bob 3.2s ease-in-out infinite; }
-      @keyframes kc-bob { 0%,100% { transform: translateY(0px); } 50% { transform: translateY(-7px); } }
-      .kc-logo-badge {
-        display: inline-block; background: rgba(24,31,34,0.85);
-        border: 2px solid #f3b958; border-radius: 999px;
-        padding: 4px 16px; font-size: 12px; font-weight: 900; letter-spacing: 0.16em; color: #f3b958;
-        margin-bottom: 6px;
+      .kc-title-pack-pill {
+        position: absolute;
+        top: 14px;
+        right: 16px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        background: var(--kc-slate-md);
+        border: 3px solid var(--kc-border);
+        border-radius: 10px;
+        padding: 5px 8px;
+        box-shadow: 0 4px 0 var(--kc-border), inset 0 2px 0 rgba(255, 255, 255, 0.12);
       }
-      .kc-logo-text {
-        font-size: clamp(46px, 6.2vw, 84px); font-weight: 900; letter-spacing: 0.05em;
-        line-height: 0.98;
-        text-shadow: 0 6px 0 #1b2224, 0 10px 22px rgba(0,0,0,0.55);
+      .kc-pack-dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 2px;
+        border: 1px solid var(--kc-border);
+        flex-shrink: 0;
       }
-      .kc-logo-k { color: #ffffff; }
-      .kc-logo-c { color: #fe5f55; margin-left: 12px; }
+      .kc-pack-dot.custom { background: #4bc292; }
+      .kc-pack-dot.builtin { background: #009dff; }
+      .kc-pill-mini {
+        background: var(--kc-well);
+        color: #e6f0f2;
+        border: 2px solid var(--kc-border);
+        border-radius: 6px;
+        padding: 3px 8px;
+        font-size: 13px;
+        cursor: pointer;
+        text-shadow: 0 1px 0 #0f1416;
+      }
+      .kc-pill-mini:hover { background: var(--kc-slate); color: #ffffff; }
+      .kc-pill-load { background: #3b6f78; color: #ffffff; }
+      .kc-pill-load:hover { background: #4a8a94; }
+
+      .kc-logo-stage {
+        margin-top: 8px;
+        text-align: center;
+        pointer-events: none;
+      }
+      .kc-dyna-logo {
+        display: inline-flex;
+        align-items: baseline;
+        justify-content: center;
+        flex-wrap: wrap;
+        line-height: 1;
+      }
+      .kc-logo-word { display: inline-flex; align-items: baseline; }
+      .kc-logo-gap { display: inline-block; width: clamp(18px, 2.4vw, 34px); }
+      .kc-title-letter {
+        display: inline-block;
+        font-size: clamp(54px, 6.8vw, 88px);
+        letter-spacing: 0.03em;
+        padding: 0 2px;
+        text-shadow:
+          -3px -3px 0 #1b2224,
+           3px -3px 0 #1b2224,
+          -3px  3px 0 #1b2224,
+           3px  3px 0 #1b2224,
+           0px -3px 0 #1b2224,
+           0px  3px 0 #1b2224,
+          -3px  0px 0 #1b2224,
+           3px  0px 0 #1b2224,
+           0px  7px 0 #141a1c,
+          -3px  7px 0 #141a1c,
+           3px  7px 0 #141a1c,
+           0px 11px 0 rgba(0, 0, 0, 0.45);
+        animation: kc-logo-bob 2.4s ease-in-out infinite;
+        animation-delay: calc(var(--di, 0) * 0.11s);
+      }
+      .kc-tl-white { color: #ffffff; }
+      .kc-tl-red { color: #fe5f55; }
+      .kc-title-letter:nth-child(odd) { --rot: -2.2deg; }
+      .kc-title-letter:nth-child(even) { --rot: 2.2deg; }
+      @keyframes kc-logo-bob {
+        0%, 100% { transform: translateY(0px) rotate(var(--rot, 0deg)); }
+        50% { transform: translateY(-9px) rotate(calc(var(--rot, 0deg) * -0.6)); }
+      }
+
       .kc-title-dock {
-        background: rgba(34, 42, 46, 0.94);
-        border: 3px solid #181f22; border-radius: 16px;
-        padding: 14px 18px;
-        box-shadow: 0 8px 0 rgba(0,0,0,0.45);
-        display: flex; flex-direction: column; align-items: center; gap: 10px;
+        background: var(--kc-slate-md);
+        border: 4px solid var(--kc-border);
+        border-radius: 14px;
+        padding: 14px 20px 18px;
+        box-shadow:
+          0 8px 0 #121719,
+          inset 0 3px 0 rgba(255, 255, 255, 0.15),
+          inset 0 -4px 0 rgba(0, 0, 0, 0.3);
         pointer-events: auto;
       }
-      .kc-title-main-btns { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
-      .kc-title-btn { min-width: 142px; font-size: 20px; padding: 12px 22px; }
-      .kc-pack-bar {
-        display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: center;
-        border-top: 2px solid rgba(255,255,255,0.08); padding-top: 8px;
+      .kc-title-main-btns {
+        display: flex;
+        gap: 14px;
+        flex-wrap: wrap;
+        justify-content: center;
       }
-      .kc-pack-status { font-size: 12px; color: #b8c6c9; font-weight: 700; margin-left: 4px; }
+      .kc-title-btn {
+        min-width: 152px;
+        font-size: 24px;
+        padding: 13px 24px;
+        letter-spacing: 0.04em;
+      }
 
-      /* Blind Select Arena */
+      /* =================================================================== */
+      /* Blind Select Curtains (Stepped Bevel Vertical Columns)              */
+      /* =================================================================== */
       .kc-blind-arena {
-        position: absolute; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;
-        align-items: center;
+        position: absolute;
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 16px;
+        align-items: stretch;
       }
       .kc-blind-col {
-        background: rgba(36, 44, 48, 0.95);
-        border: 3px solid #1b2224; border-radius: 14px;
-        padding: 12px; display: flex; flex-direction: column; gap: 10px;
-        min-height: 360px; max-height: 460px; height: 100%;
-        box-shadow: 0 6px 0 rgba(0,0,0,0.4);
+        background: var(--kc-slate-md);
+        border: 3px solid var(--kc-border);
+        border-top: 5px solid var(--col-accent, #4f6367);
+        border-radius: 12px;
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        box-shadow:
+          0 7px 0 #13181a,
+          inset 0 2px 0 rgba(255, 255, 255, 0.12);
         pointer-events: auto;
+        transition: transform 0.14s ease-out;
       }
-      .kc-blind-col.active { border-color: #f3b958; transform: translateY(-4px); }
-      .kc-blind-col.dimmed { opacity: 0.72; }
+      .kc-blind-col.active {
+        border-color: #f3b958;
+        border-top-color: #f3b958;
+        transform: translateY(-6px);
+        box-shadow:
+          0 10px 0 #13181a,
+          inset 0 0 0 2px rgba(243, 185, 88, 0.35);
+      }
+      .kc-blind-col.dimmed { opacity: 0.76; }
       .kc-blind-col-top { display: flex; justify-content: center; }
-      .kc-blind-col-top .kc-btn { width: 100%; font-size: 18px; }
+      .kc-blind-col-top .kc-btn { width: 100%; font-size: 21px; padding: 10px 12px; }
       .kc-blind-status-pill {
-        width: 100%; text-align: center; padding: 8px; border-radius: 8px;
-        background: #232b2e; color: #9db0b5; font-weight: 900; font-size: 15px;
+        width: 100%;
+        text-align: center;
+        padding: 9px 8px;
+        border-radius: 8px;
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        color: #9db0b5;
+        font-size: 17px;
+        box-shadow: inset 0 2px 0 rgba(0, 0, 0, 0.4);
       }
       .kc-blind-col-banner {
-        text-align: center; font-weight: 900; font-size: 20px;
-        padding: 7px; border-radius: 9px; border: 2px solid rgba(0,0,0,0.3);
-        text-shadow: 0 2px 0 rgba(0,0,0,0.4);
+        text-align: center;
+        font-size: 22px;
+        padding: 7px 8px;
+        border-radius: 9px;
+        border: 3px solid var(--kc-border);
+        text-shadow: 0 2px 0 rgba(0, 0, 0, 0.55);
+        box-shadow: 0 3px 0 var(--kc-border), inset 0 2px 0 rgba(255, 255, 255, 0.25);
       }
       .kc-blind-col-body {
-        flex: 1; background: #1f2729; border-radius: 10px; padding: 12px;
-        display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center;
+        flex: 1;
+        background: var(--kc-well);
+        border: 3px solid var(--kc-border);
+        border-radius: 10px;
+        padding: 12px 10px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        box-shadow: inset 0 3px 0 rgba(0, 0, 0, 0.45);
       }
-      .kc-blind-col-chip { width: 64px; height: 64px; image-rendering: pixelated; margin-bottom: 6px; }
-      .kc-blind-col-desc { font-size: 13px; color: #f5ebd6; margin-top: 6px; line-height: 1.3; }
+      .kc-blind-col-chip { width: 70px; height: 70px; margin-bottom: 6px; }
+      .kc-blind-col-desc {
+        font-size: 14px;
+        color: #f5ebd6;
+        margin-top: 8px;
+        line-height: 1.3;
+        background: #141a1d;
+        border: 2px solid #283236;
+        border-radius: 7px;
+        padding: 5px 8px;
+        width: 100%;
+      }
       .kc-skip-box {
-        background: #1f2729; border: 2px solid #2f3b3f; border-radius: 10px;
-        padding: 8px; display: flex; flex-direction: column; gap: 7px;
+        background: var(--kc-well);
+        border: 3px solid var(--kc-border);
+        border-radius: 10px;
+        padding: 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+        box-shadow: 0 3px 0 #13181a;
       }
-      .kc-skip-tag-row { display: flex; align-items: center; gap: 8px; }
-      .kc-tag-canvas { width: 34px; height: 34px; image-rendering: pixelated; flex-shrink: 0; }
-      .kc-skip-tag-name { font-size: 13px; font-weight: 900; color: #fff; }
-      .kc-skip-tag-desc { font-size: 11px; color: #b8c6c9; line-height: 1.2; }
+      .kc-skip-tag-row { display: flex; align-items: center; gap: 9px; }
+      .kc-tag-canvas { width: 38px; height: 38px; flex-shrink: 0; }
+      .kc-skip-tag-meta { min-width: 0; flex: 1; }
+      .kc-skip-tag-name { font-size: 15px; color: #ffffff; text-shadow: 0 2px 0 #0e1315; }
+      .kc-skip-tag-desc { font-size: 12px; color: #b8c6c9; line-height: 1.24; }
+      .kc-skip-preview-lbl,
+      .kc-boss-ante-foot {
+        text-align: center;
+        font-size: 13px;
+        color: #9bb0b5;
+        padding: 4px 6px;
+        background: #141a1d;
+        border-radius: 6px;
+        border: 2px solid var(--kc-border);
+      }
 
-      /* Shop Controls */
+      /* =================================================================== */
+      /* Authentic Bottom-Anchored Shop Tray (Coral Rim + Recessed Pockets)  */
+      /* =================================================================== */
+      .kc-shop-board {
+        position: absolute;
+        background: rgba(20, 26, 30, 0.16);
+        border: 4px solid #fe5f55;
+        border-bottom: none;
+        border-radius: 14px 14px 0 0;
+        box-shadow:
+          0 0 0 3px var(--kc-border),
+          inset 0 0 0 3px var(--kc-border);
+        pointer-events: none;
+      }
       .kc-shop-controls {
-        position: absolute; display: flex; flex-direction: column; gap: 12px; align-items: stretch;
+        position: absolute;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        background: var(--kc-slate-md);
+        border: 3px solid var(--kc-border);
+        border-radius: 11px;
+        padding: 10px;
+        box-shadow:
+          0 5px 0 var(--kc-border),
+          inset 0 2px 0 rgba(255, 255, 255, 0.12);
         pointer-events: auto;
       }
-      .kc-shop-sign-canvas {
-        width: 100%; height: auto; aspect-ratio: 113 / 57;
-        image-rendering: pixelated; border-radius: 10px;
-        box-shadow: 0 5px 0 rgba(0,0,0,0.45);
+      .kc-shop-btn {
+        flex: 1;
+        font-size: 21px;
+        padding: 10px 8px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
       }
-      .kc-shop-btn { font-size: 18px; padding: 14px 10px; }
+      .kc-reroll-cost { font-size: 22px; color: #fff6d1; margin-top: 2px; }
+      .kc-shop-pocket {
+        position: absolute;
+        background: rgba(14, 19, 22, 0.18);
+        border: 3px solid rgba(20, 27, 30, 0.85);
+        border-radius: 11px;
+        box-shadow: inset 0 3px 0 rgba(0, 0, 0, 0.3);
+        pointer-events: none;
+      }
+      .kc-pocket-stamp {
+        position: absolute;
+        bottom: -23px;
+        left: 8px;
+        font-size: 14px;
+        color: #d6e4e8;
+        letter-spacing: 0.06em;
+        text-shadow: 0 2px 0 #101618;
+      }
 
-      /* Cashout Receipt */
+      /* =================================================================== */
+      /* Perforated Cashout Receipt                                          */
+      /* =================================================================== */
       .kc-cashout-panel {
         position: absolute;
-        background: rgba(34, 42, 46, 0.96);
-        border: 3px solid #181f22; border-radius: 16px;
-        padding: 18px 24px; max-width: 600px;
-        box-shadow: 0 8px 0 rgba(0,0,0,0.45);
+        background: var(--kc-slate-md);
+        border: 4px solid var(--kc-border);
+        border-top: 6px solid #4bc292;
+        border-radius: 14px;
+        padding: 16px 20px 18px;
+        box-shadow:
+          0 8px 0 #121719,
+          inset 0 2px 0 rgba(255, 255, 255, 0.12);
         pointer-events: auto;
       }
       .kc-cashout-header {
-        font-size: 24px; font-weight: 900; text-align: center; color: #4bc292;
-        margin-bottom: 12px; text-shadow: 0 2px 0 #1b2224;
+        font-size: 26px;
+        text-align: center;
+        color: #4bc292;
+        margin-bottom: 10px;
+        text-shadow: 0 3px 0 #13181a;
       }
+      .kc-cashout-btn {
+        width: 100%;
+        font-size: 25px;
+        padding: 13px 16px;
+        margin-bottom: 14px;
+      }
+      .kc-receipt-perf {
+        height: 4px;
+        margin: 0 2px 10px;
+        background: repeating-linear-gradient(
+          to right,
+          #4f6367 0px,
+          #4f6367 8px,
+          transparent 8px,
+          transparent 14px
+        );
+      }
+      .kc-receipt-perf.bottom { margin: 10px 2px 0; }
       .kc-cashout-rows {
-        background: #1f2729; border-radius: 10px; padding: 10px 14px;
-        display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px;
+        background: var(--kc-well);
+        border: 3px solid var(--kc-border);
+        border-radius: 10px;
+        padding: 12px 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 9px;
+        box-shadow: inset 0 3px 0 rgba(0, 0, 0, 0.42);
       }
-      .kc-cash-row { display: flex; justify-content: space-between; align-items: baseline; font-size: 16px; font-weight: 800; }
-      .kc-cash-detail { font-size: 12px; color: #9db0b5; margin-left: 8px; }
-      .kc-cashout-btn { width: 100%; font-size: 22px; padding: 14px; }
+      .kc-cash-row {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        font-size: 18px;
+      }
+      .kc-cash-left { flex-shrink: 0; }
+      .kc-cash-label { color: #ffffff; text-shadow: 0 2px 0 #0f1416; }
+      .kc-cash-detail { font-size: 13px; color: #9db0b5; margin-left: 7px; }
+      .kc-cash-dots {
+        flex: 1;
+        min-width: 18px;
+        border-bottom: 3px dotted #4f6367;
+        transform: translateY(-4px);
+      }
+      .kc-cash-val {
+        flex-shrink: 0;
+        font-size: 21px;
+        letter-spacing: 0.04em;
+        text-shadow: 0 2px 0 #0f1416;
+      }
 
       /* Pack Open Banner */
       .kc-pack-banner {
-        position: absolute; display: flex; align-items: center; justify-content: space-between;
-        background: rgba(30, 36, 52, 0.92); border: 2px solid #646eb7; border-radius: 10px;
-        padding: 6px 14px; pointer-events: auto;
+        position: absolute;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: #282e46;
+        border: 3px solid #646eb7;
+        border-radius: 10px;
+        padding: 7px 14px;
+        box-shadow: 0 5px 0 var(--kc-border), inset 0 2px 0 rgba(255, 255, 255, 0.16);
+        pointer-events: auto;
       }
-      .kc-pack-title { font-size: 18px; font-weight: 900; margin-right: 12px; }
-      .kc-pack-sub { font-size: 13px; color: #f3b958; font-weight: 800; }
+      .kc-pack-title { font-size: 20px; margin-right: 14px; text-shadow: 0 2px 0 #101420; }
+      .kc-pack-sub { font-size: 15px; color: #f3b958; text-shadow: 0 2px 0 #101420; }
 
-      /* Floating Popups */
+      /* =================================================================== */
+      /* Elastic Wavy Score Popups                                           */
+      /* =================================================================== */
       .kc-popup-pill {
-        position: absolute; padding: 4px 11px; border-radius: 8px;
-        border: 2px solid #1b2224; font-weight: 900; font-size: 18px;
-        white-space: nowrap; box-shadow: 0 4px 0 rgba(0,0,0,0.45);
-        text-shadow: 0 2px 0 rgba(0,0,0,0.45);
+        position: absolute;
+        padding: 5px 12px;
+        border-radius: 8px;
+        border: 3px solid var(--kc-border);
+        font-size: 21px;
+        white-space: nowrap;
+        box-shadow:
+          0 5px 0 #13181a,
+          inset 0 2px 0 rgba(255, 255, 255, 0.3);
+        text-shadow: 0 2px 0 rgba(0, 0, 0, 0.6);
+      }
+      .kc-popup-pill.kc-popup-xmult {
+        border-color: #f3b958;
+        box-shadow:
+          0 0 0 2px var(--kc-border),
+          0 5px 0 #13181a,
+          inset 0 2px 0 rgba(255, 255, 255, 0.35);
+      }
+      .kc-pop-char {
+        display: inline-block;
+        animation: kc-dyna-wave 0.7s ease-in-out infinite;
+        animation-delay: calc(var(--di, 0) * 0.045s);
       }
 
-      /* Modals */
+      /* =================================================================== */
+      /* Chunky Pixel-Bevel Modals                                           */
+      /* =================================================================== */
       .kc-modal-backdrop, .kc-end-overlay {
-        position: absolute; inset: 0; background: rgba(12, 16, 18, 0.72);
-        display: flex; align-items: center; justify-content: center; padding: 20px;
+        position: absolute;
+        inset: 0;
+        background: rgba(10, 14, 16, 0.76);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
         pointer-events: auto;
       }
       .kc-modal-card {
-        background: #2f3a3d; border: 3px solid #161c1e; border-radius: 16px;
-        padding: 16px 20px; max-height: 90vh; display: flex; flex-direction: column; gap: 12px;
-        box-shadow: 0 10px 0 rgba(0,0,0,0.5);
+        background: var(--kc-slate-md);
+        border: 4px solid var(--kc-border);
+        border-radius: 14px;
+        padding: 16px 20px;
+        max-height: 90vh;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        box-shadow:
+          0 9px 0 #121719,
+          inset 0 0 0 2px #586c72,
+          inset 0 4px 0 rgba(255, 255, 255, 0.12);
       }
-      .kc-modal-card.wide { width: min(940px, 94vw); }
-      .kc-modal-card.narrow { width: min(360px, 90vw); }
+      .kc-modal-card.wide { width: min(960px, 94vw); }
+      .kc-modal-card.narrow { width: min(370px, 90vw); }
       .kc-modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-      .kc-modal-head h2 { font-size: 20px; font-weight: 900; }
-      .kc-modal-scroll { overflow-y: auto; max-height: 76vh; padding-right: 4px; padding-bottom: 6px; }
+      .kc-modal-head h2 { font-size: 24px; text-shadow: 0 2px 0 #121719; }
+      .kc-modal-scroll { overflow-y: auto; max-height: 75vh; padding-right: 6px; padding-bottom: 6px; }
 
       .kc-tab-row { display: flex; gap: 6px; }
       .kc-tab-row.wrap { flex-wrap: wrap; }
       .kc-tab {
-        background: #232b2e; color: #c9d6d9; border: 2px solid #181f22; border-radius: 8px;
-        padding: 6px 12px; font-weight: 800; font-size: 13px; cursor: pointer;
+        background: var(--kc-well);
+        color: #c9d6d9;
+        border: 2px solid var(--kc-border);
+        border-radius: 8px;
+        padding: 6px 12px;
+        font-size: 15px;
+        cursor: pointer;
+        box-shadow: 0 3px 0 var(--kc-border);
       }
-      .kc-tab.active { background: #fe5f55; color: #fff; }
+      .kc-tab:hover { background: var(--kc-slate); color: #ffffff; }
+      .kc-tab.active {
+        background: #fe5f55;
+        color: #ffffff;
+        box-shadow: 0 3px 0 #99261f, inset 0 2px 0 rgba(255, 255, 255, 0.25);
+      }
 
       .kc-newrun-grid { display: grid; grid-template-columns: 1.25fr 1fr; gap: 16px; }
-      .kc-section-hdr { font-size: 13px; font-weight: 900; text-transform: uppercase; color: #f3b958; margin-bottom: 6px; }
-      .kc-deck-list { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; max-height: 310px; overflow-y: auto; }
+      .kc-section-hdr {
+        font-size: 15px;
+        text-transform: uppercase;
+        color: #f3b958;
+        margin-bottom: 6px;
+        text-shadow: 0 2px 0 #121719;
+      }
+      .kc-deck-list {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 7px;
+        max-height: 310px;
+        overflow-y: auto;
+        padding-right: 4px;
+      }
       .kc-deck-chip {
-        background: #222a2d; border: 2px solid #181f22; border-radius: 9px;
-        color: #fff; padding: 6px; display: flex; flex-direction: column; align-items: center; gap: 3px;
-        font-size: 11px; font-weight: 800; cursor: pointer;
+        background: var(--kc-well);
+        border: 3px solid var(--kc-border);
+        border-radius: 9px;
+        color: #ffffff;
+        padding: 7px 5px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 4px;
+        font-size: 13px;
+        cursor: pointer;
+        box-shadow: 0 3px 0 #13181a;
       }
       .kc-deck-chip.active { border-color: #f3b958; background: #36454a; }
-      .kc-mini-sprite { image-rendering: pixelated; flex-shrink: 0; }
+      .kc-mini-sprite { flex-shrink: 0; }
       .kc-desc-banner {
-        margin-top: 8px; background: #1e2629; border-radius: 8px; padding: 8px 10px;
-        font-size: 13px; color: #e2ecee; line-height: 1.3;
+        margin-top: 8px;
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 9px;
+        padding: 8px 10px;
       }
-      .kc-stake-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+      .kc-desc-banner-title { font-size: 16px; color: #ffffff; margin-bottom: 5px; text-shadow: 0 2px 0 #101618; }
+      .kc-parchment-inline {
+        background: #faf6ee;
+        color: #2d3538;
+        border: 2px solid var(--kc-border);
+        border-radius: 6px;
+        padding: 6px 8px;
+        font-size: 14px;
+        line-height: 1.35;
+      }
+      .kc-stake-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; }
       .kc-stake-btn {
-        background: #222a2d; border: 2px solid #181f22; border-radius: 9px;
-        color: #fff; padding: 6px; display: flex; align-items: center; justify-content: center; gap: 5px;
-        font-weight: 900; cursor: pointer;
+        background: var(--kc-well);
+        border: 3px solid var(--kc-border);
+        border-radius: 9px;
+        color: #ffffff;
+        padding: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 5px;
+        font-size: 17px;
+        cursor: pointer;
+        box-shadow: 0 3px 0 #13181a;
       }
-      .kc-stake-btn.active { border-color: var(--st-col, #fff); background: #37464a; }
+      .kc-stake-btn.active { border-color: var(--st-col, #ffffff); background: #37464a; }
       .kc-seed-row { display: flex; align-items: center; gap: 10px; margin: 12px 0; }
-      .kc-check-label { display: flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 800; cursor: pointer; }
+      .kc-check-label { display: flex; align-items: center; gap: 6px; font-size: 15px; cursor: pointer; }
       .kc-input {
-        flex: 1; background: #1b2224; color: #fff; border: 2px solid #4f6367; border-radius: 8px;
-        padding: 6px 10px; font-family: var(--krunked-font); font-weight: 800;
+        flex: 1;
+        background: #161c1f;
+        color: #ffffff;
+        border: 2px solid #4f6367;
+        border-radius: 8px;
+        padding: 6px 10px;
+        font-size: 15px;
       }
-      .kc-start-btn { width: 100%; font-size: 20px; padding: 13px; }
+      .kc-start-btn { width: 100%; font-size: 23px; padding: 13px; }
       .kc-challenge-list { display: flex; flex-direction: column; gap: 8px; max-height: 380px; overflow-y: auto; }
       .kc-challenge-row {
-        display: flex; justify-content: space-between; align-items: center; gap: 12px;
-        background: #222a2d; border-radius: 10px; padding: 10px 12px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 10px;
+        padding: 10px 12px;
       }
-      .kc-challenge-name { font-weight: 900; font-size: 15px; }
+      .kc-challenge-name { font-size: 17px; }
 
       /* Run Info Tables */
-      .kc-hands-table { display: flex; flex-direction: column; gap: 5px; }
+      .kc-hands-table { display: flex; flex-direction: column; gap: 6px; }
       .kc-hand-row {
-        display: grid; grid-template-columns: 58px 1fr auto 52px; align-items: center; gap: 10px;
-        background: #222a2d; border-radius: 8px; padding: 7px 12px; font-size: 15px; font-weight: 800;
+        display: grid;
+        grid-template-columns: 66px 1fr auto 56px;
+        align-items: center;
+        gap: 10px;
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 9px;
+        padding: 7px 12px;
+        font-size: 17px;
       }
+      .kc-hr-math { display: inline-flex; align-items: center; gap: 6px; }
+      .kc-hr-pill {
+        display: inline-block;
+        min-width: 48px;
+        text-align: center;
+        padding: 2px 8px;
+        border-radius: 6px;
+        border: 2px solid var(--kc-border);
+        color: #ffffff;
+        text-shadow: 0 2px 0 rgba(0, 0, 0, 0.45);
+      }
+      .kc-hr-pill.chips { background: #009dff; }
+      .kc-hr-pill.mult { background: #fe5f55; }
+      .kc-hr-x { color: #fe5f55; }
       .kc-hr-played { text-align: right; color: #9db0b5; }
-      .kc-info-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
-      .kc-info-card { background: #222a2d; border-radius: 10px; padding: 10px 12px; }
-      .kc-info-title { font-weight: 900; font-size: 15px; margin-bottom: 4px; }
-      .kc-suit-pills { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; font-size: 14px; }
+      .kc-info-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+      .kc-info-card {
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 10px;
+        padding: 10px 12px;
+      }
+      .kc-info-head-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+      .kc-info-title { font-size: 17px; margin-bottom: 2px; }
+      .kc-empty-note { padding: 18px; text-align: center; color: #b8c6c9; font-size: 16px; }
+      .kc-suit-pills { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; font-size: 15px; }
+      .kc-suit-count-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: var(--kc-well);
+        border: 2px solid var(--kc-border);
+        border-radius: 8px;
+        padding: 4px 10px;
+      }
       .kc-deck-cards-grid { display: flex; flex-wrap: wrap; gap: 5px; }
       .kc-deck-mini-card {
-        background: #1f2729; border: 1px solid #4f6367; border-radius: 6px;
-        padding: 4px 7px; font-weight: 900; font-size: 13px;
+        background: var(--kc-well);
+        border: 2px solid #3d4e54;
+        border-radius: 6px;
+        padding: 4px 8px;
+        font-size: 15px;
       }
-      .kc-deck-mini-card.used { opacity: 0.38; }
+      .kc-deck-mini-card.used { opacity: 0.36; }
 
       /* Collection Grid */
-      .kc-coll-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px; }
+      .kc-coll-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 9px; }
       .kc-coll-item {
-        display: flex; align-items: center; gap: 10px;
-        background: #222a2d; border: 2px solid #1b2224; border-radius: 10px; padding: 8px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        background: var(--kc-well);
+        border: 3px solid var(--kc-border);
+        border-radius: 10px;
+        padding: 8px 10px;
+        box-shadow: 0 3px 0 #13181a;
       }
-      .kc-coll-item.seen { border-color: #4f6367; }
-      .kc-coll-name { font-weight: 900; font-size: 14px; }
+      .kc-coll-item.seen { border-color: #5b7177; }
+      .kc-coll-meta { flex: 1; min-width: 0; }
+      .kc-coll-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 4px; }
+      .kc-coll-name { font-size: 16px; color: #ffffff; }
+      .kc-coll-pill {
+        font-size: 11px;
+        color: #ffffff;
+        padding: 1px 6px;
+        border-radius: 5px;
+        border: 1px solid var(--kc-border);
+        flex-shrink: 0;
+      }
       .kc-seen-dot { color: #f3b958; }
-      .kc-coll-desc { font-size: 11px; color: #c4d1d4; line-height: 1.25; }
+      .kc-coll-desc {
+        background: #faf6ee;
+        color: #2d3538;
+        border: 2px solid var(--kc-border);
+        border-radius: 6px;
+        padding: 4px 7px;
+        font-size: 13px;
+        line-height: 1.28;
+      }
 
       /* Options Grid */
-      .kc-options-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
-      .kc-opt-section { background: #222a2d; border-radius: 12px; padding: 10px 14px; }
-      .kc-opt-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 3px 0; font-size: 13px; font-weight: 800; }
+      .kc-options-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+      .kc-opt-section {
+        background: var(--kc-well);
+        border: 3px solid var(--kc-border);
+        border-radius: 11px;
+        padding: 11px 14px;
+      }
+      .kc-opt-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 4px 0;
+        font-size: 15px;
+      }
       .kc-pill-group { display: flex; gap: 5px; }
       .kc-pill-btn {
-        background: #374244; color: #fff; border: 2px solid #181f22; border-radius: 7px;
-        padding: 4px 10px; font-weight: 800; font-size: 13px; cursor: pointer;
+        background: #374244;
+        color: #ffffff;
+        border: 2px solid var(--kc-border);
+        border-radius: 7px;
+        padding: 4px 10px;
+        font-size: 14px;
+        cursor: pointer;
+        box-shadow: 0 2px 0 var(--kc-border);
       }
-      .kc-pill-btn.active { background: #009dff; border-color: #fff; }
-      .kc-slider { width: 135px; accent-color: #fe5f55; cursor: pointer; }
-      .kc-pack-actions { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+      .kc-pill-btn.active { background: #009dff; border-color: #ffffff; }
+      .kc-slider { width: 136px; accent-color: #fe5f55; cursor: pointer; }
+      .kc-pack-actions { display: flex; flex-direction: column; gap: 7px; margin-top: 6px; }
       .kc-pause-stack { display: flex; flex-direction: column; gap: 10px; }
 
       /* Victory / Game Over */
-      .kc-end-card { width: min(440px, 92vw); text-align: center; }
-      .kc-end-title { font-size: 40px; font-weight: 900; text-shadow: 0 4px 0 #1b2224; }
+      .kc-end-card { width: min(460px, 92vw); text-align: center; }
+      .kc-end-title { font-size: 46px; text-shadow: 0 5px 0 #13181a; }
       .kc-end-title.win { color: #f3b958; }
       .kc-end-title.lose { color: #fe5f55; }
-      .kc-end-stats { background: #1f2729; border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 6px; }
-      .kc-end-stats > div { display: flex; justify-content: space-between; font-size: 15px; }
-      .kc-end-btns { display: flex; gap: 10px; justify-content: center; }
+      .kc-end-stats {
+        background: var(--kc-well);
+        border: 3px solid var(--kc-border);
+        border-radius: 10px;
+        padding: 12px 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+      }
+      .kc-end-stats > div { display: flex; justify-content: space-between; font-size: 18px; }
+      .kc-end-btns { display: flex; gap: 12px; justify-content: center; }
 
-      /* Hover Tooltip */
+      /* =================================================================== */
+      /* Iconic Rich Double-Framed Cream-Parchment Card Tooltip              */
+      /* =================================================================== */
       .kc-tooltip {
-        position: fixed; z-index: 80; pointer-events: none;
-        width: 240px; background: rgba(28, 35, 39, 0.97);
-        border: 3px solid #6b7f85; border-radius: 12px;
-        padding: 10px 12px; box-shadow: 0 8px 20px rgba(0,0,0,0.6);
+        position: fixed;
+        z-index: 80;
+        pointer-events: none;
+        width: 254px;
+        background: #2f3a3d;
+        border: 3px solid var(--kc-border);
+        border-radius: 12px;
+        padding: 9px 10px 10px;
+        box-shadow:
+          inset 0 0 0 2px var(--kc-rim),
+          0 7px 0 rgba(0, 0, 0, 0.56);
       }
-      .kc-tt-title { font-size: 16px; font-weight: 900; color: #fff; margin-bottom: 4px; text-align: center; }
+      .kc-tt-title {
+        font-size: 20px;
+        color: #ffffff;
+        margin-bottom: 6px;
+        text-align: center;
+        text-shadow: 0 2px 0 #121719;
+        line-height: 1.12;
+      }
       .kc-tt-desc {
-        background: #faf6ee; color: #22292d; border-radius: 7px;
-        padding: 6px 8px; font-size: 12px; font-weight: 700; line-height: 1.3; text-align: center;
+        background: #faf6ee;
+        color: #2d3538;
+        border: 2px solid var(--kc-border);
+        border-radius: 7px;
+        padding: 7px 9px;
+        font-size: 15px;
+        line-height: 1.38;
+        text-align: center;
+        box-shadow: inset 0 -3px 0 #dfd7c6;
       }
-      .kc-tt-badges { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px; margin-top: 7px; }
+      .kc-tt-badges {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 5px;
+        margin-top: 8px;
+      }
       .kc-tt-badge {
-        font-size: 11px; font-weight: 900; color: #fff;
-        padding: 2px 7px; border-radius: 6px; text-shadow: 0 1px 0 rgba(0,0,0,0.4);
+        font-size: 13px;
+        color: #ffffff;
+        padding: 2px 9px 3px;
+        border-radius: 6px;
+        border: 2px solid var(--kc-border);
+        box-shadow: 0 3px 0 var(--kc-border), inset 0 2px 0 rgba(255, 255, 255, 0.24);
+        text-shadow: 0 2px 0 rgba(0, 0, 0, 0.5);
       }
+
+      /* Rich Inline Syntax Highlighting Tokens */
+      .kc-hl-chips { color: #0084e6; }
+      .kc-hl-mult { color: #e03c31; }
+      .kc-hl-xmult {
+        display: inline-block;
+        background: #fe5f55;
+        color: #ffffff;
+        padding: 0px 5px 1px;
+        margin: 0;
+        border-radius: 5px;
+        border: 1px solid #9e261f;
+        box-shadow: 0 2px 0 #9e261f;
+        text-shadow: 0 1px 0 rgba(0, 0, 0, 0.45);
+        line-height: 1.2;
+      }
+      .kc-hl-money { color: #c77c00; }
+      .kc-hl-prob { color: #218c5c; }
+      .kc-hl-tarot { color: #7d4fa3; }
+      .kc-hl-spectral { color: #3b55c4; }
+      .kc-hl-holo { color: #c93b7b; }
+      .kc-hl-poly { color: #a644cc; }
+      .kc-hl-glass { color: #1b80b5; }
+      .kc-hl-steel { color: #54646e; }
+      .kc-hl-neg {
+        display: inline-block;
+        background: #2b323b;
+        color: #e2e8f5;
+        padding: 0 5px;
+        border-radius: 4px;
+      }
+      .kc-hl-suit { text-decoration: none; }
 
       /* Toast */
       .kc-toast {
-        position: fixed; bottom: 18px; right: 20px;
-        z-index: 95; background: #232b2e; border: 2px solid #f3b958; border-radius: 10px;
-        padding: 7px 16px; font-size: 14px; font-weight: 800; color: #fff;
-        box-shadow: 0 6px 18px rgba(0,0,0,0.5);
+        position: fixed;
+        bottom: 16px;
+        right: 18px;
+        z-index: 95;
+        background: var(--kc-slate-md);
+        border: 3px solid #f3b958;
+        border-radius: 10px;
+        padding: 7px 16px;
+        font-size: 16px;
+        color: #ffffff;
+        text-shadow: 0 2px 0 #101618;
+        box-shadow: 0 5px 0 var(--kc-border);
       }
     `;
     document.head.appendChild(style);
@@ -2451,7 +3756,15 @@ function describeVisualCard(
   const pushEdition = (ed: VisualCard['edition']) => {
     if (ed !== 'none') {
       const def = EDITION_DEFS[ed];
-      badges.push({ label: def?.name ?? ed.replace('e_', ''), color: PALETTE.PURPLE });
+      const edColor =
+        ed === 'e_foil'
+          ? PALETTE.BLUE
+          : ed === 'e_holo'
+            ? '#d94d8c'
+            : ed === 'e_polychrome'
+              ? '#9b59b6'
+              : '#343c4a';
+      badges.push({ label: def?.name ?? ed.replace('e_', ''), color: edColor });
     }
   };
 
@@ -2519,12 +3832,18 @@ function describeVisualCard(
     if (o.kind === 'playing_card') {
       return {
         title: `${o.rank ?? 'Ace'} of ${o.suit ?? 'Spades'}`,
-        desc: o.enhancement && o.enhancement !== 'none' ? (ENHANCEMENT_DEFS[o.enhancement]?.desc ?? o.enhancement) : 'Add to your deck',
+        desc:
+          o.enhancement && o.enhancement !== 'none'
+            ? (ENHANCEMENT_DEFS[o.enhancement]?.desc ?? o.enhancement)
+            : 'Add to your deck',
         badges,
       };
     }
     const cd = CONSUMABLE_MAP[o.key];
-    badges.push({ label: cd?.set ?? o.kind, color: PALETTE.PURPLE });
+    badges.push({
+      label: cd?.set ?? o.kind,
+      color: cd?.set === 'Planet' ? PALETTE.BLUE : cd?.set === 'Spectral' ? PALETTE.BOOSTER : PALETTE.PURPLE,
+    });
     return { title: cd?.name ?? o.key, desc: cd?.desc ?? '', badges };
   }
 
@@ -2545,16 +3864,25 @@ function describeVisualCard(
     pushEdition(pc.edition);
     if (pc.kind === 'joker') {
       const d = JOKER_MAP[pc.key];
+      const r = d?.rarity ?? 1;
+      badges.push({ label: RARITY_NAMES[r] ?? 'Joker', color: PALETTE.RARITY[r - 1] ?? PALETTE.BLUE });
       return { title: d?.name ?? pc.key, desc: d?.descTemplate ?? '', badges };
     }
     if (pc.kind === 'playing_card') {
       return {
         title: `${pc.rank ?? 'Ace'} of ${pc.suit ?? 'Hearts'}`,
-        desc: pc.enhancement && pc.enhancement !== 'none' ? (ENHANCEMENT_DEFS[pc.enhancement]?.desc ?? '') : 'Add this card to your deck',
+        desc:
+          pc.enhancement && pc.enhancement !== 'none'
+            ? (ENHANCEMENT_DEFS[pc.enhancement]?.desc ?? '')
+            : 'Add this card to your deck',
         badges,
       };
     }
     const cd = CONSUMABLE_MAP[pc.key];
+    badges.push({
+      label: cd?.set ?? pc.kind,
+      color: cd?.set === 'Planet' ? PALETTE.BLUE : cd?.set === 'Spectral' ? PALETTE.BOOSTER : PALETTE.PURPLE,
+    });
     return { title: cd?.name ?? pc.key, desc: cd?.desc ?? '', badges };
   }
 
