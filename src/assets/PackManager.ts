@@ -45,14 +45,20 @@ export class PackManager {
   private loading = false;
   private lastStatusMessage = 'Built-in Krunked Art Pack active';
 
-  async init(preferredMode: ArtPackMode = 'builtin'): Promise<void> {
+  async init(
+    preferredMode: ArtPackMode = 'builtin',
+    autoDetectLocalDev = false
+  ): Promise<void> {
     this.builtinAtlases = generateBuiltinAtlases();
 
     // Probe IndexedDB first, then local dev server custom pack
     const hasIdb = await this.probeIndexedDbPack();
     const hasLocalDev = await this.probeLocalDevPack();
 
-    if (preferredMode === 'custom' && (hasIdb || hasLocalDev)) {
+    if (
+      (preferredMode === 'custom' && (hasIdb || hasLocalDev)) ||
+      (autoDetectLocalDev && hasLocalDev)
+    ) {
       await this.setMode('custom');
     } else {
       await this.setMode('builtin');

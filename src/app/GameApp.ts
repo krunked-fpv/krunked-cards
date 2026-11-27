@@ -1,13 +1,15 @@
 // ============================================================================
 // Krunked Cards — Main Application Shell (Fixed 60 Hz Sim + Decoupled FPS Render)
 // Orchestrates PackManager, AudioEngine, WebGL2Renderer, CardSceneManager,
-// ScoreChoreographer, InputManager, UiOverlay, DebugDrawer, SaveManager, and
-// mounts window.__KRUNKED_DEBUG__ (DebugBridge).
+// ParticleSystem, ScoreChoreographer, InputManager, UiOverlay, DebugDrawer,
+// SaveManager, and mounts window.__KRUNKED_DEBUG__ (DebugBridge).
 // ============================================================================
 
 import {
+  SAVE_STORAGE_KEY,
   SIM_HZ,
   type ArtPackMode,
+  type CardInstance,
   type DebugBridge,
   type EditionId,
   type IAudioEngine,
@@ -24,6 +26,7 @@ import {
   createRngState,
   createTitleState,
   dispatchSim,
+  evaluatePokerHand,
   getActiveBlind,
   hashSimState,
   startRun,
@@ -32,6 +35,7 @@ import {
 import { createAudioEngine } from '../audio/index.ts';
 import { PackManager } from '../assets/PackManager.ts';
 import { CardSceneManager, type VisualCard } from '../render/Moveable.ts';
+import { ParticleSystem } from '../render/ParticleSystem.ts';
 import { ScoreChoreographer } from '../render/ScoreChoreographer.ts';
 import { WebGL2Renderer } from '../render/WebGL2Renderer.ts';
 import { InputManager } from '../input/InputManager.ts';
@@ -41,21 +45,32 @@ import { SaveManager } from './SaveManager.ts';
 
 const SIM_DT = 1 / SIM_HZ;
 
+function hasSavedUserPreference(): boolean {
+  try {
+    return typeof localStorage !== 'undefined' && localStorage.getItem(SAVE_STORAGE_KEY) !== null;
+  } catch {
+    return false;
+  }
+}
+
 export class GameApp {
   private canvas: HTMLCanvasElement;
   private uiRoot: HTMLElement;
 
+  private hadExistingSaveOnBoot: boolean;
   private saveManager: SaveManager;
   private packManager: PackManager;
   private audio: IAudioEngine;
   private renderer: WebGL2Renderer;
   private scene: CardSceneManager;
+  private particles: ParticleSystem;
   private choreographer: ScoreChoreographer;
   private ui: UiOverlay;
   private input: InputManager;
   private debugDrawer: DebugDrawer;
 
   private state: SimState;
+  private scoringCardIds: Set<string> | null = null;
   private rafId = 0;
   private lastRafMs = 0;
   private simAccumSec = 0;
@@ -73,6 +88,8 @@ export class GameApp {
     this.canvas = canvas;
     this.uiRoot = uiRoot;
 
+    // Detect before SaveManager initializes whether user already saved explicit prefs
+    this.hadExistingSaveOnBoot = hasSavedUserPreference();
     this.saveManager = new SaveManager();
     this.packManager = new PackManager();
     this.audio = createAudioEngine();
@@ -80,8 +97,14 @@ export class GameApp {
 
     this.state = this.createInitialTitleState();
     this.scene = new CardSceneManager();
+    this.particles = new ParticleSystem();
     this.choreographer = new ScoreChoreographer();
     this.renderer = new WebGL2Renderer(this.canvas, this.packManager);
+
+    this.choreographer.setParticleSystem(this.particles);
+    this.choreographer.setGlitchCallback((intensity) => {
+      this.renderer.triggerGlitchPulse(intensity);
+    });
 
     this.ui = new UiOverlay(this.uiRoot, this.packManager, {
       onDispatch: (action) => this.dispatch(action),
@@ -126,7 +149,12 @@ export class GameApp {
   async start(): Promise<void> {
     this.renderer.resize(window.innerWidth, window.innerHeight);
 
-    await this.packManager.init(this.saveManager.getSettings().artPackMode);
+    // Smart local dev pack auto-detection when no explicit save exists yet;
+    // preserves DEFAULT_SETTINGS.artPackMode = 'builtin' for clean-room & tests!
+    await this.packManager.init(
+      this.saveManager.getSettings().artPackMode,
+      !this.hadExistingSaveOnBoot
+    );
     this.renderer.uploadAllAtlases();
     await this.audio.setCustomPack(this.packManager.getCustomSoundUrls());
 
@@ -237,10 +265,39 @@ export class GameApp {
     const saved = this.saveManager.getActiveRun();
     if (!saved) return;
     this.choreographer.reset();
+    this.scoringCardIds = null;
     this.state = saved;
     this.ui.setSelectedOwned(null);
     this.ui.invalidateAll();
     this.syncMusicForPhase();
+  }
+
+  private computeScoringCardIds(state: SimState): Set<string> {
+    const ids = new Set<string>();
+    const byId = new Map<string, CardInstance>();
+    for (const c of state.fullDeck) byId.set(c.id, c);
+
+    const played: CardInstance[] = [];
+    for (const cid of state.playArea) {
+      const c = byId.get(cid);
+      if (c) played.push(c);
+    }
+
+    if (played.length > 0) {
+      try {
+        const evalRes = evaluatePokerHand(played, state.jokers);
+        for (const sc of evalRes.scoringCards) ids.add(sc.id);
+      } catch {
+        // Fall back to beat inspection below
+      }
+    }
+
+    for (const beat of state.lastHandBeats) {
+      if (beat.sourceType === 'card' && beat.sourceId) {
+        ids.add(beat.sourceId);
+      }
+    }
+    return ids;
   }
 
   dispatch(action: SimAction): SimState {
@@ -257,6 +314,7 @@ export class GameApp {
       if (action.type === 'START_RUN') {
         this.saveManager.recordRunStarted();
         this.choreographer.reset();
+        this.scoringCardIds = null;
         this.ui.setSelectedOwned(null);
       }
 
@@ -268,6 +326,7 @@ export class GameApp {
       // Trigger sequential beat choreography whenever entering SCORING
       if (this.state.phase === 'SCORING') {
         const beats = result.beats.length > 0 ? result.beats : this.state.lastHandBeats;
+        this.scoringCardIds = this.computeScoringCardIds(this.state);
         this.choreographer.start(this.state, beats, this.scene, this.audio, () => {
           if (this.state.phase === 'SCORING') {
             this.dispatch({ type: 'FINISH_SCORING' });
@@ -275,19 +334,43 @@ export class GameApp {
         });
       } else if (prevPhase === 'SCORING') {
         this.choreographer.reset();
+        this.scoringCardIds = null;
+      }
+
+      // Phase transition vortex warps & celebratory effects
+      if (this.state.phase !== prevPhase) {
+        if (this.state.phase === 'PACK_OPEN') {
+          this.renderer.triggerVortexPulse(0.65, 4.8);
+          const g = this.scene.getGeometry();
+          this.particles.emitAccentBurst(
+            g.packTray.x + g.packTray.w * 0.5,
+            g.packTray.y + g.packTray.h * 0.45,
+            'purple'
+          );
+        } else if (
+          this.state.phase === 'PLAYING' &&
+          prevPhase === 'BLIND_SELECT' &&
+          getActiveBlind(this.state)?.slot === 'Boss'
+        ) {
+          this.renderer.triggerVortexPulse(0.72, 5.4);
+          this.renderer.triggerGlitchPulse(0.55);
+          this.choreographer.triggerImpactFlash(0.30, [0.95, 0.34, 0.28], 4.0);
+        } else if (this.state.phase === 'TITLE') {
+          this.renderer.triggerTitleEntryFlash();
+        }
+        this.syncMusicForPhase();
+        this.ui.setSelectedOwned(null);
       }
 
       if (this.state.phase === 'VICTORY' && prevPhase !== 'VICTORY') {
         this.saveManager.recordRunWon(this.state);
         this.audio.playSfx('win');
+        const g = this.scene.getGeometry();
+        this.particles.emitAccentBurst(g.viewportW * 0.55, g.viewportH * 0.45, 'celebrate');
       }
 
       if (this.state.phase !== 'TITLE') {
         this.saveManager.saveRun(this.state);
-      }
-      if (this.state.phase !== prevPhase) {
-        this.syncMusicForPhase();
-        this.ui.setSelectedOwned(null);
       }
       this.ui.invalidateAll();
     } catch (err) {
@@ -298,13 +381,29 @@ export class GameApp {
   }
 
   private handleSimEvents(events: SimEvent[]): void {
+    const geom = this.scene.getGeometry();
+    const cx = geom.table.x + geom.table.w * 0.5;
+    const cy = geom.table.y + geom.table.h * 0.48;
+
     for (const ev of events) {
       if (ev.sound) {
         this.audio.playSfx(ev.sound);
-        continue;
+      } else {
+        const mapped = mapEventToSfx(ev.type);
+        if (mapped) this.audio.playSfx(mapped);
       }
-      const mapped = mapEventToSfx(ev.type);
-      if (mapped) this.audio.playSfx(mapped);
+
+      if (ev.type === 'ITEM_BOUGHT' || ev.type === 'ITEM_SOLD' || ev.type === 'CASHOUT_COMPLETE') {
+        this.particles.emitMoneyBurst(cx, cy, 1.1);
+      } else if (ev.type === 'VOUCHER_REDEEMED') {
+        this.particles.emitMoneyBurst(
+          geom.shopVoucherTray.x + geom.shopVoucherTray.w * 0.5,
+          geom.shopVoucherTray.y + geom.shopVoucherTray.h * 0.45,
+          1.4
+        );
+      } else if (ev.type === 'CONSUMABLE_USED') {
+        this.particles.emitAccentBurst(cx, cy, 'purple');
+      }
     }
   }
 
@@ -328,6 +427,8 @@ export class GameApp {
       this.ui.toggleRunInfo();
     } else if (card.kind === 'title_showcase') {
       card.moveable.juiceUp(0.45, undefined, nowSec);
+      this.particles.emitChipsBurst(card.moveable.vx, card.moveable.vy, 0.9);
+      this.particles.emitMultBurst(card.moveable.vx, card.moveable.vy, false, 0.8);
       this.audio.playSfx('card1');
     }
   }
@@ -432,9 +533,17 @@ export class GameApp {
       settings.highContrastSuits,
       settings.reducedMotion,
       renderDt,
-      this.elapsedSec
+      this.elapsedSec,
+      this.scoringCardIds
     );
-    this.choreographer.update(renderDt, this.state, settings.gameSpeed, this.scene, this.audio);
+    this.choreographer.update(
+      renderDt,
+      this.state,
+      settings.gameSpeed,
+      this.scene,
+      this.audio,
+      settings.reducedMotion
+    );
 
     const choreoDisplay = this.choreographer.getDisplay();
     const geom = this.scene.getGeometry();
@@ -444,10 +553,19 @@ export class GameApp {
     this.ui.render(this.state, geom, cards, settings, choreoDisplay, this.elapsedSec);
     this.debugDrawer.update(nowMs);
 
-    // 6. Render WebGL2 4-pass frame
+    // 6. Step crisp pixel particles & render multi-pass WebGL2 frame
     const activeBlind = getActiveBlind(this.state);
     const bossColor = activeBlind?.slot === 'Boss' ? activeBlind.bossColor : null;
     const flameAnchor = this.ui.getFlameAnchor(choreoDisplay.flameIntensity);
+
+    this.particles.update(
+      renderDt,
+      vw,
+      vh,
+      this.state.phase,
+      flameAnchor,
+      settings.reducedMotion
+    );
 
     this.renderer.render({
       timeSec: this.elapsedSec,
@@ -459,6 +577,11 @@ export class GameApp {
       mouseY: this.input.mouseY,
       settings,
       flameAnchor,
+      particles: this.particles,
+      screenFlash: choreoDisplay.screenFlash,
+      screenFlashColor: choreoDisplay.screenFlashColor,
+      shakeX: choreoDisplay.shakeX,
+      shakeY: choreoDisplay.shakeY,
     });
   }
 
@@ -507,6 +630,7 @@ export class GameApp {
       resetSave: () => {
         this.saveManager.resetAll();
         this.choreographer.reset();
+        this.scoringCardIds = null;
         this.state = this.createInitialTitleState();
         this.ui.invalidateAll();
       },

@@ -2,8 +2,9 @@
 // Krunked Cards — Score Choreographer
 // Steps sequentially through SimState ScoreBeat[] scaled by settings.gameSpeed,
 // triggers Moveable.juiceUp(), spawns crisp floating colored score pills,
-// ramps roaring flame intensity (log5 spring), fires pitch-escalating SFX,
-// and triggers FINISH_SCORING cleanly upon completion.
+// emits crisp pixel particles, triggers subtle impact flash & micro-shake on
+// big XMult / Boss / Glass shatter beats, ramps roaring flame intensity
+// (log5 spring), fires pitch-escalating SFX, and triggers FINISH_SCORING cleanly.
 // ============================================================================
 
 import {
@@ -15,6 +16,7 @@ import {
   type SoundKey,
 } from '../contracts/index.ts';
 import type { CardSceneManager } from './Moveable.ts';
+import type { ParticleSystem } from './ParticleSystem.ts';
 
 export interface FloatingPopup {
   id: number;
@@ -42,6 +44,11 @@ export interface ChoreographerDisplay {
   activeSourceId: string | null;
   chipsPulse: number;
   multPulse: number;
+  // Optional impact polish telemetry for WebGL2Renderer
+  screenFlash?: number;
+  screenFlashColor?: [number, number, number];
+  shakeX?: number;
+  shakeY?: number;
 }
 
 export class ScoreChoreographer {
@@ -64,9 +71,42 @@ export class ScoreChoreographer {
   private chipsPulse = 0;
   private multPulse = 0;
 
+  // Impact flash (flash.fs) & micro-shake impulses
+  private screenFlash = 0;
+  private screenFlashColor: [number, number, number] = [1, 1, 1];
+  private shakeMag = 0;
+  private shakePhase = 0;
+  private shakeX = 0;
+  private shakeY = 0;
+  private reducedMotion = false;
+
+  private particles: ParticleSystem | null = null;
+  private onGlitchImpulse: ((intensity: number) => void) | null = null;
+
   private popups: FloatingPopup[] = [];
   private nextPopupId = 1;
   private lastPlayedBeatKey = '';
+
+  setParticleSystem(particles: ParticleSystem | null): void {
+    this.particles = particles;
+  }
+
+  setGlitchCallback(cb: ((intensity: number) => void) | null): void {
+    this.onGlitchImpulse = cb;
+  }
+
+  triggerImpactFlash(
+    amount: number,
+    color: [number, number, number] = [1, 1, 1],
+    shake = 0
+  ): void {
+    if (this.reducedMotion) return;
+    this.screenFlash = Math.min(1, Math.max(this.screenFlash, amount));
+    this.screenFlashColor = color;
+    if (shake > 0) {
+      this.shakeMag = Math.min(10, Math.max(this.shakeMag, shake));
+    }
+  }
 
   isActive(): boolean {
     return this.active;
@@ -88,6 +128,10 @@ export class ScoreChoreographer {
       activeSourceId: this.activeSourceId,
       chipsPulse: this.chipsPulse,
       multPulse: this.multPulse,
+      screenFlash: this.screenFlash,
+      screenFlashColor: this.screenFlashColor,
+      shakeX: this.shakeX,
+      shakeY: this.shakeY,
     };
   }
 
@@ -169,8 +213,10 @@ export class ScoreChoreographer {
     state: SimState,
     gameSpeed: GameSpeed,
     scene: CardSceneManager,
-    audio: IAudioEngine
+    audio: IAudioEngine,
+    reducedMotion = false
   ): void {
+    this.reducedMotion = reducedMotion;
     const safeDt = Math.min(0.05, Math.max(0.001, dt));
 
     // Smooth numeric easing for display counters
@@ -179,6 +225,19 @@ export class ScoreChoreographer {
     this.displayMult += (this.targetMultVal - this.displayMult) * kNum;
     this.chipsPulse = Math.max(0, this.chipsPulse - safeDt * 3.8);
     this.multPulse = Math.max(0, this.multPulse - safeDt * 3.8);
+
+    // Decay impact flash & damped micro-shake
+    this.screenFlash = Math.max(0, this.screenFlash - safeDt * 3.6);
+    if (this.shakeMag > 0.05 && !reducedMotion) {
+      this.shakePhase += safeDt * 58;
+      this.shakeX = Math.sin(this.shakePhase) * this.shakeMag;
+      this.shakeY = Math.cos(this.shakePhase * 1.37) * this.shakeMag * 0.72;
+      this.shakeMag *= Math.exp(-14 * safeDt);
+    } else {
+      this.shakeMag = 0;
+      this.shakeX = 0;
+      this.shakeY = 0;
+    }
 
     // Update flame roar intensity (`log5` scale whenever hand score beats target!)
     const earned = this.active
@@ -195,7 +254,7 @@ export class ScoreChoreographer {
       const ratio = earned / Math.max(1, req);
       this.targetFlameIntensity = Math.min(
         10,
-        Math.max(1.2, Math.log(1 + ratio * 4) / Math.log(5) * 2.2)
+        Math.max(1.2, (Math.log(1 + ratio * 4) / Math.log(5)) * 2.2)
       );
     } else {
       this.targetFlameIntensity = 0;
@@ -229,7 +288,7 @@ export class ScoreChoreographer {
   }
 
   private advanceBeat(
-    state: SimState,
+    _state: SimState,
     scene: CardSceneManager,
     audio: IAudioEngine
   ): void {
@@ -257,18 +316,67 @@ export class ScoreChoreographer {
     // Juice the source card / joker / consumable
     const nowSec = performance.now() / 1000;
     const geom = scene.getGeometry();
-    let popupX = geom.playArea.x + geom.playArea.w * 0.5;
+    let emitX = geom.playArea.x + geom.playArea.w * 0.5;
+    let emitY = geom.playArea.y + geom.playArea.h * 0.46;
+    let popupX = emitX;
     let popupY = geom.playArea.y + geom.playArea.h * 0.36;
 
     if (beat.sourceId) {
       const vc = scene.getVisualCardById(beat.sourceId);
       if (vc) {
-        vc.moveable.juiceUp(beat.kind === 'retrigger' ? 0.52 : 0.42, undefined, nowSec);
+        const juiceAmt =
+          beat.kind === 'retrigger'
+            ? 0.52
+            : beat.xMult && beat.xMult >= 2
+              ? 0.50
+              : 0.42;
+        vc.moveable.juiceUp(juiceAmt, undefined, nowSec);
         if (beat.kind === 'card_shatter') {
-          vc.moveable.dissolve = 0.82;
+          vc.moveable.dissolve = 0.85;
         }
+        emitX = vc.moveable.vx;
+        emitY = vc.moveable.vy;
         popupX = vc.moveable.vx;
         popupY = vc.moveable.vy - vc.moveable.vh * 0.48;
+      }
+    }
+
+    // Emit crisp pixel particles & subtle impact flash / micro-shake
+    if (beat.kind === 'card_shatter') {
+      this.particles?.emitGlassShatter(emitX, emitY);
+      this.triggerImpactFlash(0.45, [0.76, 0.96, 1.0], 6.5);
+      this.onGlitchImpulse?.(0.65);
+    } else if (beat.kind === 'boss_debuff' || beat.kind === 'boss_modify') {
+      this.particles?.emitMultBurst(emitX, emitY, false, 1.1);
+      this.triggerImpactFlash(0.35, [0.95, 0.25, 0.28], 5.0);
+      this.onGlitchImpulse?.(0.55);
+    } else if (beat.kind === 'retrigger') {
+      this.particles?.emitAccentBurst(emitX, emitY, 'orange');
+    } else if (beat.kind === 'plasma_balance') {
+      this.particles?.emitAccentBurst(emitX, emitY, 'purple');
+      this.triggerImpactFlash(0.32, [0.72, 0.55, 1.0], 3.5);
+    } else if (beat.kind === 'blind_clear') {
+      this.particles?.emitAccentBurst(emitX, emitY, 'celebrate');
+      this.triggerImpactFlash(0.28, [1.0, 0.92, 0.62], 3.0);
+    } else {
+      if (beat.xMult && beat.xMult !== 1) {
+        const multWeight = Math.min(2.5, Math.max(1, beat.xMult * 0.65));
+        this.particles?.emitMultBurst(emitX, emitY, true, multWeight);
+        if (beat.xMult >= 1.5) {
+          this.triggerImpactFlash(
+            Math.min(0.48, 0.18 + beat.xMult * 0.08),
+            [1.0, 0.42, 0.34],
+            Math.min(7, 2.5 + beat.xMult * 1.1)
+          );
+        }
+      } else if (beat.multDelta && beat.multDelta !== 0) {
+        this.particles?.emitMultBurst(emitX, emitY, false, 1);
+      }
+      if (beat.chipsDelta && beat.chipsDelta !== 0) {
+        this.particles?.emitChipsBurst(emitX, emitY, beat.chipsDelta >= 30 ? 1.5 : 1);
+      }
+      if (beat.dollarsDelta && beat.dollarsDelta > 0) {
+        this.particles?.emitMoneyBurst(emitX, emitY, Math.min(2, 0.8 + beat.dollarsDelta * 0.15));
       }
     }
 
