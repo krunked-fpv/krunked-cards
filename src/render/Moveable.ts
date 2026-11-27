@@ -96,6 +96,7 @@ export class Moveable {
   targetTiltX = 0;
   targetTiltY = 0;
   dissolve = 0;
+  triggerGlow = 0;
   juice: JuiceState | null = null;
   initialized = false;
 
@@ -150,10 +151,14 @@ export class Moveable {
     return actualFaceDown;
   }
 
+  flashTrigger(amount = 1.0): void {
+    this.triggerGlow = Math.min(1.0, Math.max(this.triggerGlow, amount));
+  }
+
   juiceUp(amount = 0.4, rotAmt?: number, _nowSec?: number): void {
-    const a = Math.min(0.55, Math.max(0.1, amount));
-    const rAmt = rotAmt ?? (Math.random() > 0.5 ? 1 : -1) * (0.28 + Math.random() * 0.16);
-    this.vScale = Math.max(0.68, Math.min(1.25, 1 - 0.5 * a));
+    const a = Math.min(0.62, Math.max(0.1, amount));
+    const rAmt = rotAmt ?? (Math.random() > 0.5 ? 1 : -1) * (0.30 + Math.random() * 0.18);
+    this.vScale = Math.max(0.66, Math.min(1.28, 1 - 0.5 * a));
     this.velScale = 0;
     this.juice = {
       scale: 0,
@@ -161,7 +166,7 @@ export class Moveable {
       r: 0,
       rAmt,
       elapsed: 0,
-      duration: 0.4,
+      duration: 0.42,
     };
   }
 
@@ -189,9 +194,13 @@ export class Moveable {
       this.targetTiltY = 0;
       this.flipProgress = 1;
       this.flipDelay = 0;
+      this.triggerGlow = Math.max(0, this.triggerGlow - safeDt * 3.8);
       this.juice = null;
       return;
     }
+
+    // Smooth decay for radiant scoring trigger flash
+    this.triggerGlow = Math.max(0, this.triggerGlow - safeDt * 2.9);
 
     // Step 3D flip animation
     if (this.flipProgress < 1) {
@@ -310,6 +319,7 @@ export interface VisualCard {
   soulShader?: SoulShaderKind;
   floatingGlow?: 'black_hole';
   overlayEffect?: 'booster' | 'voucher';
+  consumableSet?: 'Tarot' | 'Planet' | 'Spectral';
   nonScoring?: boolean;
   cardShape?: CardShapeKind;
   flipScaleX?: number;
@@ -1459,6 +1469,7 @@ export class CardSceneManager {
           draggable: false,
           baseAtlas: 'Tarot',
           basePos: def?.pos ?? { x: 0, y: 0 },
+          consumableSet: cons.set,
           ...getConsumableSpecialFields(cons.key),
           flipScaleX: m.getFlipScaleX(),
           stickers: [],
@@ -2053,6 +2064,7 @@ function makeOfferVisual(
     draggable: false,
     baseAtlas: 'Tarot',
     basePos: cDef?.pos ?? { x: 0, y: 0 },
+    consumableSet: cDef?.set,
     ...getConsumableSpecialFields(offer.key),
     stickers,
     edition: offer.edition,
@@ -2157,6 +2169,7 @@ function makePackCardVisual(
     draggable: false,
     baseAtlas: 'Tarot',
     basePos: cDef?.pos ?? { x: 0, y: 0 },
+    consumableSet: cDef?.set,
     ...getConsumableSpecialFields(pc.key),
     flipScaleX: moveable.getFlipScaleX(),
     stickers,

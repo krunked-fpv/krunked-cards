@@ -300,6 +300,7 @@ export class UiOverlay {
 
   // Persistent DOM layers
   private railLayer: HTMLDivElement;
+  private hudFlameCanvas: HTMLCanvasElement;
   private tableLayer: HTMLDivElement;
   private popupLayer: HTMLDivElement;
   private modalLayer: HTMLDivElement;
@@ -353,6 +354,11 @@ export class UiOverlay {
 
     this.railLayer = document.createElement('div');
     this.railLayer.className = 'kc-layer';
+
+    this.hudFlameCanvas = document.createElement('canvas');
+    this.hudFlameCanvas.id = 'kc-hud-flame-canvas';
+    this.hudFlameCanvas.className = 'kc-hud-flame-canvas';
+    this.hudFlameCanvas.setAttribute('aria-hidden', 'true');
 
     this.tableLayer = document.createElement('div');
     this.tableLayer.className = 'kc-layer';
@@ -412,6 +418,7 @@ export class UiOverlay {
 
     this.root.append(
       this.railLayer,
+      this.hudFlameCanvas,
       this.tableLayer,
       this.popupLayer,
       this.bossBannerEl,
@@ -422,6 +429,10 @@ export class UiOverlay {
       this.folderInput,
       this.archiveInput
     );
+  }
+
+  getHudFlameCanvas(): HTMLCanvasElement {
+    return this.hudFlameCanvas;
   }
 
   private async handlePackUpload(files: FileList): Promise<void> {
@@ -559,8 +570,9 @@ export class UiOverlay {
   }
 
   /**
-   * Computes exact screen-space rectangles behind the Blue Chips and Red Mult boxes
-   * so WebGL2 Pass 3 (`flame.fs`) blazes seamlessly around and above them.
+   * Computes generous screen-space rectangles behind the Blue Chips and Red Mult
+   * boxes so the unobstructed high-Z HUD flame canvas (`flame.fs`) blazes high
+   * above and around both pills across Desktop, Mobile Landscape & Portrait!
    */
   getFlameAnchor(intensity: number): FlameAnchor | null {
     if (intensity <= 0.05) return null;
@@ -570,21 +582,48 @@ export class UiOverlay {
     const cr = chipsBox.getBoundingClientRect();
     const mr = multBox.getBoundingClientRect();
     if (cr.width <= 0 || mr.width <= 0) return null;
-    const extraTop = Math.round(52 + Math.min(52, intensity * 7.5));
+
+    const clampedInt = Math.min(10, Math.max(0.1, intensity));
+    const isPortrait = this.lastMode === 'mobile-portrait';
+    const isLandscape = this.lastMode === 'mobile-landscape';
+    const railEl = this.railLayer.querySelector('.kc-rail') as HTMLElement | null;
+    const railRect = railEl ? railEl.getBoundingClientRect() : null;
+
+    const padX = isPortrait || isLandscape
+      ? Math.round(10 + Math.min(14, clampedInt * 1.5))
+      : Math.round(14 + Math.min(20, clampedInt * 2.1));
+
+    const rawExtraTop = isPortrait
+      ? Math.round(54 + Math.min(68, clampedInt * 8.0))
+      : isLandscape
+        ? Math.round(58 + Math.min(108, clampedInt * 12.0))
+        : Math.round(96 + Math.min(185, clampedInt * 20.0));
+
+    const extraBottom = isPortrait ? 12 : isLandscape ? 10 : 18;
+
+    const minX = railRect ? Math.max(2, railRect.left + 3) : 2;
+    const maxRight = railRect ? railRect.right - 3 : 99999;
+
+    const cTop = Math.max(2, cr.top - rawExtraTop);
+    const mTop = Math.max(2, mr.top - rawExtraTop);
+    const cLeft = Math.max(minX, cr.left - padX);
+    const cRight = Math.min(maxRight, cr.right + padX);
+    const mLeft = Math.max(minX, mr.left - padX);
+    const mRight = Math.min(maxRight, mr.right + padX);
     return {
       chipsRect: {
-        x: cr.left - 14,
-        y: cr.top - extraTop,
-        w: cr.width + 28,
-        h: cr.height + extraTop + 10,
+        x: cLeft,
+        y: cTop,
+        w: Math.max(cr.width, cRight - cLeft),
+        h: Math.max(cr.height + extraBottom, cr.bottom + extraBottom - cTop),
       },
       multRect: {
-        x: mr.left - 14,
-        y: mr.top - extraTop,
-        w: mr.width + 28,
-        h: mr.height + extraTop + 10,
+        x: mLeft,
+        y: mTop,
+        w: Math.max(mr.width, mRight - mLeft),
+        h: Math.max(mr.height + extraBottom, mr.bottom + extraBottom - mTop),
       },
-      intensity,
+      intensity: clampedInt,
     };
   }
 
@@ -697,6 +736,11 @@ export class UiOverlay {
         ? state.handLevels[shownHandName as PokerHandId].level
         : 0;
 
+    const shownRoundChips =
+      choreo.active && choreo.displayHandScore === null
+        ? Math.max(0, state.roundChips - (state.lastHandScore || 0))
+        : state.roundChips;
+
     const activeBlind = getActiveBlind(state);
     const railKey = [
       state.phase,
@@ -707,7 +751,7 @@ export class UiOverlay {
       geom.hudDock.h,
       activeBlind?.key,
       activeBlind?.disabled,
-      state.roundChips,
+      shownRoundChips,
       state.targetChips,
       shownChips,
       shownMult,
@@ -734,6 +778,7 @@ export class UiOverlay {
           shownLevel,
           shownChips,
           shownMult,
+          shownRoundChips,
           choreo.flameIntensity > 0.1,
           settings.gameSpeed
         );
@@ -745,20 +790,53 @@ export class UiOverlay {
           shownLevel,
           shownChips,
           shownMult,
+          shownRoundChips,
           choreo.flameIntensity > 0.1,
           settings.gameSpeed
         );
       }
-    } else if (state.phase !== 'TITLE') {
+    }
+
+    // Drive continuous live flame glow power, hot-core state, and rhythmic heat tremble every frame!
+    if (state.phase !== 'TITLE') {
+      const flamePower = Math.min(1, Math.max(0, choreo.flameIntensity / 6.0));
+      const isHot = choreo.flameIntensity >= 4.0;
+      const stageEl = this.railLayer.querySelector(
+        '.kc-hand-box, .kc-port-hand-stage'
+      ) as HTMLElement | null;
+      if (stageEl) {
+        stageEl.style.setProperty('--flame-power', flamePower.toFixed(3));
+        stageEl.classList.toggle('flaming-hot', isHot);
+      }
+
       const cb = this.railLayer.querySelector('#kc-chips-box') as HTMLElement | null;
       const mb = this.railLayer.querySelector('#kc-mult-box') as HTMLElement | null;
+      const mx = this.railLayer.querySelector('.kc-math-x') as HTMLElement | null;
+      const canJitter = !settings.reducedMotion && flamePower > 0.12;
+      const jitterC = canJitter
+        ? `translate(${(Math.sin(nowSec * 44) * flamePower * 1.9).toFixed(2)}px, ${(Math.cos(nowSec * 53) * flamePower * 1.3).toFixed(2)}px)`
+        : '';
+      const jitterM = canJitter
+        ? `translate(${(Math.cos(nowSec * 48 + 1.2) * flamePower * 1.9).toFixed(2)}px, ${(Math.sin(nowSec * 57 + 0.7) * flamePower * 1.3).toFixed(2)}px)`
+        : '';
+
       if (cb) {
+        const s = 1 + choreo.chipsPulse * 0.15 + flamePower * 0.035;
         cb.style.transform =
-          choreo.chipsPulse > 0.01 ? `scale(${(1 + choreo.chipsPulse * 0.13).toFixed(3)})` : '';
+          choreo.chipsPulse > 0.01 || canJitter
+            ? `${jitterC} scale(${s.toFixed(3)})`.trim()
+            : '';
       }
       if (mb) {
+        const s = 1 + choreo.multPulse * 0.15 + flamePower * 0.035;
         mb.style.transform =
-          choreo.multPulse > 0.01 ? `scale(${(1 + choreo.multPulse * 0.13).toFixed(3)})` : '';
+          choreo.multPulse > 0.01 || canJitter
+            ? `${jitterM} scale(${s.toFixed(3)})`.trim()
+            : '';
+      }
+      if (mx) {
+        const xs = 1 + Math.max(choreo.chipsPulse, choreo.multPulse) * 0.14 + flamePower * 0.1;
+        mx.style.transform = flamePower > 0.05 || xs > 1.01 ? `scale(${xs.toFixed(3)})` : '';
       }
     }
 
@@ -1035,6 +1113,7 @@ export class UiOverlay {
     handLevel: number,
     chips: number,
     mult: number,
+    shownRoundChips: number,
     flaming: boolean,
     gameSpeed: GameSpeed
   ): void {
@@ -1062,9 +1141,9 @@ export class UiOverlay {
     const isShop = state.phase === 'SHOP';
     const progressPct =
       state.targetChips > 0
-        ? Math.min(100, Math.max(0, Math.round((state.roundChips / state.targetChips) * 100)))
+        ? Math.min(100, Math.max(0, Math.round((shownRoundChips / state.targetChips) * 100)))
         : 0;
-    const targetMet = state.targetChips > 0 && state.roundChips >= state.targetChips;
+    const targetMet = state.targetChips > 0 && shownRoundChips >= state.targetChips;
 
     const chipSize = isLandscape ? 32 : 58;
     const scoreChipSize = isLandscape ? 14 : 22;
@@ -1132,7 +1211,7 @@ export class UiOverlay {
             <span class="kc-round-lbl">${isLandscape ? 'Score' : 'Round<br/>score'}</span>
             <div class="kc-round-score-val">
               <canvas class="kc-score-chip-canvas" width="${roundChipSize}" height="${roundChipSize}"></canvas>
-              <span>${fmtNum(state.roundChips)}</span>
+              <span>${fmtNum(shownRoundChips)}</span>
             </div>
           </div>
           <div class="kc-round-progress-track" aria-label="Round progress ${progressPct}%">
@@ -1200,6 +1279,7 @@ export class UiOverlay {
     handLevel: number,
     chips: number,
     mult: number,
+    shownRoundChips: number,
     flaming: boolean,
     gameSpeed: GameSpeed
   ): void {
@@ -1225,9 +1305,9 @@ export class UiOverlay {
         : PALETTE.WHITE;
     const progressPct =
       state.targetChips > 0
-        ? Math.min(100, Math.max(0, Math.round((state.roundChips / state.targetChips) * 100)))
+        ? Math.min(100, Math.max(0, Math.round((shownRoundChips / state.targetChips) * 100)))
         : 0;
-    const targetMet = state.targetChips > 0 && state.roundChips >= state.targetChips;
+    const targetMet = state.targetChips > 0 && shownRoundChips >= state.targetChips;
 
     const blindBadgeHtml = isShop
       ? `<div class="kc-port-shop-badge">SHOP</div>`
@@ -1253,7 +1333,7 @@ export class UiOverlay {
               <div class="kc-port-blind-name" style="color:${isShop ? '#f3b958' : '#ffffff'};">${esc(isShop ? 'SHOP' : activeBlind?.name ?? 'Small Blind')}</div>
               <div class="kc-port-score-line">
                 <canvas class="kc-score-chip-canvas kc-port-chip-ic" width="14" height="14"></canvas>
-                <span class="kc-port-score-now">${fmtNum(state.roundChips)}</span>
+                <span class="kc-port-score-now">${fmtNum(shownRoundChips)}</span>
                 <span class="kc-port-score-sep">/</span>
                 <span class="kc-port-score-tgt">${fmtNum(state.targetChips)}</span>
               </div>
@@ -2140,10 +2220,13 @@ export class UiOverlay {
           popScale = 1.0 - Math.max(0, (progress - 0.74) * 0.45);
         }
         const isXMult = /^X\d/i.test(p.text);
-        const extraClass = isXMult ? 'kc-popup-xmult' : '';
+        const isCelebrate = /LEVEL UP|BLIND CLEARED|SAVED BY/i.test(p.text);
+        const extraClass = isXMult ? 'kc-popup-xmult' : isCelebrate ? 'kc-popup-celebrate' : '';
+        const scaleBoost = isXMult ? 1.12 : isCelebrate ? 1.08 : 1.0;
+        const finalScale = popScale * (p.scale || 1) * scaleBoost;
         const clampedTop = Math.max(20, Math.round(p.y));
         return `
-          <div class="kc-popup-pill ${extraClass}" style="left:${Math.round(p.x)}px;top:${clampedTop}px;background:${p.bgColor};color:${p.textColor};opacity:${alpha.toFixed(2)};transform:translate(-50%,-50%) scale(${popScale.toFixed(3)}) rotate(${(p.rotation * 57.3).toFixed(1)}deg);">
+          <div class="kc-popup-pill ${extraClass}" style="left:${Math.round(p.x)}px;top:${clampedTop}px;background:${p.bgColor};color:${p.textColor};opacity:${alpha.toFixed(2)};transform:translate(-50%,-50%) scale(${finalScale.toFixed(3)}) rotate(${(p.rotation * 57.3).toFixed(1)}deg);">
             ${renderDynaWord(p.text, 'kc-pop-char')}
           </div>
         `;
@@ -3130,7 +3213,8 @@ export class UiOverlay {
 
     const badgesHtml = info.badges
       .map(
-        (b) => `<span class="kc-tt-badge" style="background:${b.color};">${esc(b.label)}</span>`
+        (b) =>
+          `<span class="kc-tt-badge ${b.extraClass ?? ''}" style="background:${b.color};">${esc(b.label)}</span>`
       )
       .join('');
     const liveHtml = info.livePreview
@@ -3266,6 +3350,16 @@ export class UiOverlay {
       }
 
       .kc-layer { position: absolute; inset: 0; pointer-events: none; }
+      .kc-hud-flame-canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 6;
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+      }
       .kc-popups { z-index: 45; }
       .kc-modal-layer { z-index: 60; }
       .hidden { display: none !important; }
@@ -3350,15 +3444,11 @@ export class UiOverlay {
         pointer-events: auto;
       }
       .kc-rail.rail-flaming {
-        background: linear-gradient(
-          180deg,
-          var(--kc-slate-md) 0%,
-          var(--kc-slate-md) 30%,
-          rgba(28, 35, 38, 0.06) 39%,
-          rgba(28, 35, 38, 0.06) 62%,
-          var(--kc-slate-md) 70%,
-          var(--kc-slate-md) 100%
-        );
+        box-shadow:
+          0 6px 0 var(--kc-border),
+          0 0 28px rgba(255, 118, 36, 0.28),
+          inset 0 3px 0 rgba(255, 224, 140, 0.20),
+          inset 0 -3px 0 rgba(0, 0, 0, 0.30);
       }
 
       /* Rail Shop Marquee (replaces Blind Header cleanly during SHOP phase) */
@@ -3448,13 +3538,16 @@ export class UiOverlay {
         text-shadow: 0 2px 0 #0f1416;
       }
       .kc-blind-desc {
+        position: relative;
+        z-index: 10;
         font-size: 13px;
         color: #f3ead6;
         text-align: center;
-        background: #141a1d;
+        background: rgba(20, 26, 29, 0.88);
         border-top: 2px solid #263034;
         padding: 6px 8px;
         line-height: 1.28;
+        text-shadow: 0 1px 4px rgba(0, 0, 0, 0.85);
       }
 
       /* Round Score Well */
@@ -3495,35 +3588,50 @@ export class UiOverlay {
         box-shadow: 0 0 8px rgba(243, 185, 88, 0.55);
       }
       .kc-round-lbl {
+        position: relative;
+        z-index: 10;
         font-size: 15px;
-        color: #c8d6d9;
+        color: #d6e4e8;
         line-height: 1.15;
-        text-shadow: 0 2px 0 #0e1315;
+        text-shadow: 0 2px 0 #0e1315, 0 0 8px rgba(0, 0, 0, 0.85);
       }
       .kc-round-score-val {
+        position: relative;
+        z-index: 10;
         display: flex;
         align-items: center;
         gap: 7px;
         font-size: 28px;
         color: #ffffff;
-        text-shadow: 0 2px 0 #0e1315;
+        text-shadow: 0 2px 0 #0e1315, 0 0 10px rgba(0, 0, 0, 0.55);
       }
 
-      /* Hand Score Stage (transparent backing behind roaring WebGL2 flames!) */
+      /* Hand Score Stage (flames blaze freely at z:6 above backdrop & behind z:10 pills!) */
       .kc-hand-box {
         background: var(--kc-well);
         border: 3px solid var(--kc-border);
         border-radius: 11px;
         padding: 12px 9px 14px;
         box-shadow: inset 0 3px 0 rgba(0, 0, 0, 0.42);
-        transition: border-color 0.16s, background 0.16s;
+        transition: border-color 0.16s, background 0.16s, box-shadow 0.16s;
       }
       .kc-hand-box.flaming {
-        background: rgba(20, 26, 30, 0.16);
-        border-color: #fda200;
-        box-shadow: inset 0 0 0 2px rgba(254, 95, 85, 0.35);
+        background: rgba(18, 22, 26, 0.82);
+        border-color: #ffb833;
+        box-shadow:
+          0 0 calc(12px + var(--flame-power, 0.4) * 20px) rgba(255, 136, 36, 0.65),
+          inset 0 0 0 2px rgba(255, 214, 96, 0.42);
+      }
+      .kc-hand-box.flaming-hot {
+        border-color: #fff0a8;
+        box-shadow:
+          0 0 28px rgba(255, 196, 64, 0.85),
+          0 0 46px rgba(0, 196, 255, 0.45),
+          inset 0 0 0 2px rgba(255, 250, 210, 0.72);
       }
       .kc-hand-header {
+        position: relative;
+        z-index: 10;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -3534,7 +3642,7 @@ export class UiOverlay {
       .kc-hand-name {
         font-size: 22px;
         color: #ffffff;
-        text-shadow: 0 2px 0 #0e1315;
+        text-shadow: 0 2px 0 #0e1315, 0 0 8px rgba(0, 0, 0, 0.65);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -3556,6 +3664,8 @@ export class UiOverlay {
         gap: 6px;
       }
       .kc-math-pill {
+        position: relative;
+        z-index: 10;
         border-radius: 9px;
         padding: 10px 6px;
         text-align: center;
@@ -3563,27 +3673,55 @@ export class UiOverlay {
         color: #ffffff;
         border: 3px solid var(--kc-border);
         text-shadow: 0 2px 0 rgba(0, 0, 0, 0.55);
-        transition: transform 0.08s ease-out;
+        transition: transform 0.06s ease-out, box-shadow 0.14s ease-out, border-color 0.14s ease-out;
         overflow: hidden;
         text-overflow: ellipsis;
         line-height: 1.05;
       }
       .kc-chips-pill {
-        background: #009dff;
+        background: linear-gradient(180deg, #24b6ff 0%, #009dff 45%, #0082e6 100%);
         box-shadow:
           0 5px 0 #005b99,
-          inset 0 2px 0 rgba(255, 255, 255, 0.32);
+          inset 0 2px 0 rgba(255, 255, 255, 0.38);
       }
       .kc-mult-pill {
-        background: #fe5f55;
+        background: linear-gradient(180deg, #ff796f 0%, #fe5f55 45%, #e64239 100%);
         box-shadow:
           0 5px 0 #a82b24,
-          inset 0 2px 0 rgba(255, 255, 255, 0.32);
+          inset 0 2px 0 rgba(255, 255, 255, 0.38);
+      }
+      .kc-hand-box.flaming .kc-chips-pill,
+      .kc-port-hand-stage.flaming .kc-chips-pill {
+        border-color: #9bf3ff;
+        background: linear-gradient(180deg, #4ce6ff 0%, #00a8ff 50%, #0077e6 100%);
+        box-shadow:
+          0 5px 0 #005b99,
+          0 0 calc(12px + var(--flame-power, 0.5) * 24px) rgba(0, 212, 255, 0.96),
+          inset 0 2px 0 rgba(255, 255, 255, 0.65);
+      }
+      .kc-hand-box.flaming .kc-mult-pill,
+      .kc-port-hand-stage.flaming .kc-mult-pill {
+        border-color: #ffe270;
+        background: linear-gradient(180deg, #ff9938 0%, #fe5f55 50%, #d92b24 100%);
+        box-shadow:
+          0 5px 0 #a82b24,
+          0 0 calc(12px + var(--flame-power, 0.5) * 24px) rgba(255, 138, 32, 0.96),
+          inset 0 2px 0 rgba(255, 248, 196, 0.65);
       }
       .kc-math-x {
+        position: relative;
+        z-index: 10;
         font-size: 26px;
         color: #fe5f55;
         text-shadow: 0 3px 0 #141a1c;
+        transition: transform 0.08s ease-out, color 0.14s ease-out;
+      }
+      .kc-hand-box.flaming .kc-math-x,
+      .kc-port-hand-stage.flaming .kc-math-x {
+        color: #ffe26a;
+        text-shadow:
+          0 2px 0 #141a1c,
+          0 0 12px rgba(255, 186, 48, 0.95);
       }
 
       /* Lower 2-Column Console Grid (fills lower rail cleanly with zero void!) */
@@ -3939,17 +4077,40 @@ export class UiOverlay {
            0px  7px 0 #141a1c,
           -3px  7px 0 #141a1c,
            3px  7px 0 #141a1c,
-           0px 11px 0 rgba(0, 0, 0, 0.45);
-        animation: kc-logo-bob 2.4s ease-in-out infinite;
-        animation-delay: calc(var(--di, 0) * 0.11s);
+           0px 11px 0 rgba(0, 0, 0, 0.45),
+           0px  0px 22px rgba(76, 224, 255, 0.48);
+        animation: kc-logo-bob 2.4s ease-in-out infinite, kc-logo-glint 4.2s ease-in-out infinite;
+        animation-delay: calc(var(--di, 0) * 0.11s), calc(var(--di, 0) * 0.14s);
       }
       .kc-tl-white { color: #ffffff; }
-      .kc-tl-red { color: #fe5f55; }
+      .kc-tl-red {
+        color: #ff6b5c;
+        text-shadow:
+          -3px -3px 0 #1b2224,
+           3px -3px 0 #1b2224,
+          -3px  3px 0 #1b2224,
+           3px  3px 0 #1b2224,
+           0px -3px 0 #1b2224,
+           0px  3px 0 #1b2224,
+          -3px  0px 0 #1b2224,
+           3px  0px 0 #1b2224,
+           0px  7px 0 #141a1c,
+          -3px  7px 0 #141a1c,
+           3px  7px 0 #141a1c,
+           0px 11px 0 rgba(0, 0, 0, 0.45),
+           0px  0px 24px rgba(255, 132, 72, 0.62);
+      }
       .kc-title-letter:nth-child(odd) { --rot: -2.2deg; }
       .kc-title-letter:nth-child(even) { --rot: 2.2deg; }
       @keyframes kc-logo-bob {
         0%, 100% { transform: translateY(0px) rotate(var(--rot, 0deg)); }
         50% { transform: translateY(-9px) rotate(calc(var(--rot, 0deg) * -0.6)); }
+      }
+      @keyframes kc-logo-glint {
+        0%, 100% { filter: brightness(1.0) saturate(1.05); }
+        45% { filter: brightness(1.06) saturate(1.12); }
+        52% { filter: brightness(1.32) saturate(1.25); }
+        60% { filter: brightness(1.04) saturate(1.08); }
       }
 
       .kc-title-dock {
@@ -4243,11 +4404,20 @@ export class UiOverlay {
         text-shadow: 0 2px 0 rgba(0, 0, 0, 0.6);
       }
       .kc-popup-pill.kc-popup-xmult {
-        border-color: #f3b958;
+        border-color: #ffe066;
         box-shadow:
           0 0 0 2px var(--kc-border),
           0 5px 0 #13181a,
-          inset 0 2px 0 rgba(255, 255, 255, 0.35);
+          0 0 18px rgba(255, 166, 48, 0.85),
+          inset 0 2px 0 rgba(255, 255, 255, 0.55);
+      }
+      .kc-popup-pill.kc-popup-celebrate {
+        border-color: #7bf2ff;
+        box-shadow:
+          0 0 0 2px var(--kc-border),
+          0 5px 0 #13181a,
+          0 0 20px rgba(76, 230, 255, 0.85),
+          inset 0 2px 0 rgba(255, 255, 255, 0.55);
       }
       .kc-pop-char {
         display: inline-block;
@@ -4582,6 +4752,8 @@ export class UiOverlay {
         margin-top: 8px;
       }
       .kc-tt-badge {
+        position: relative;
+        overflow: hidden;
         font-size: 13px;
         color: #ffffff;
         padding: 2px 9px 3px;
@@ -4589,6 +4761,35 @@ export class UiOverlay {
         border: 2px solid var(--kc-border);
         box-shadow: 0 3px 0 var(--kc-border), inset 0 2px 0 rgba(255, 255, 255, 0.24);
         text-shadow: 0 2px 0 rgba(0, 0, 0, 0.5);
+      }
+      .kc-tt-badge.kc-badge-foil {
+        background: linear-gradient(125deg, #0077d4 0%, #6ee4ff 48%, #0088ee 100%) !important;
+        border-color: #a8f4ff;
+        box-shadow: 0 3px 0 var(--kc-border), 0 0 10px rgba(96, 224, 255, 0.65);
+      }
+      .kc-tt-badge.kc-badge-holo {
+        background: linear-gradient(125deg, #ff3898 0%, #7d52ff 45%, #20dcff 100%) !important;
+        border-color: #ff9ce6;
+        box-shadow: 0 3px 0 var(--kc-border), 0 0 12px rgba(255, 76, 186, 0.72);
+      }
+      .kc-tt-badge.kc-badge-poly {
+        background: linear-gradient(120deg, #ff4458 0%, #ffcf33 28%, #36e896 54%, #2cc6ff 78%, #b852ff 100%) !important;
+        background-size: 200% 200%;
+        border-color: #fff0a8;
+        box-shadow: 0 3px 0 var(--kc-border), 0 0 14px rgba(255, 208, 72, 0.75);
+        animation: kc-prism-shift 2.4s linear infinite;
+      }
+      .kc-tt-badge.kc-badge-neg {
+        background: linear-gradient(125deg, #1b1e2e 0%, #4d358c 55%, #1c3a52 100%) !important;
+        border-color: #9e82ff;
+        box-shadow: 0 3px 0 var(--kc-border), 0 0 12px rgba(132, 92, 255, 0.72);
+      }
+      @keyframes kc-prism-shift {
+        0% { background-position: 0% 50%; }
+        100% { background-position: 200% 50%; }
+      }
+      .kc-reduced-motion .kc-tt-badge.kc-badge-poly {
+        animation: none !important;
       }
 
       /* Rich Inline Syntax Highlighting Tokens */
@@ -4911,15 +5112,13 @@ export class UiOverlay {
           0 4px 0 var(--kc-border),
           inset 0 2px 0 rgba(255, 255, 255, 0.1);
         pointer-events: auto;
-        overflow: hidden;
+        overflow: visible;
       }
       .kc-hud-portrait.flaming {
-        background: linear-gradient(
-          180deg,
-          var(--kc-slate-md) 0%,
-          var(--kc-slate-md) 42%,
-          rgba(28, 35, 38, 0.24) 100%
-        );
+        box-shadow:
+          0 4px 0 var(--kc-border),
+          0 0 24px rgba(255, 138, 36, 0.45),
+          inset 0 2px 0 rgba(255, 232, 148, 0.25);
       }
       .kc-port-row-top {
         display: flex;
@@ -4929,6 +5128,8 @@ export class UiOverlay {
         min-height: 0;
       }
       .kc-port-blind-block {
+        position: relative;
+        z-index: 10;
         display: flex;
         align-items: center;
         gap: 6px;
@@ -4973,6 +5174,8 @@ export class UiOverlay {
       .kc-port-score-tgt { color: #fe5f55; }
       .kc-round-progress-track.port { height: 4px; border-width: 1px; }
       .kc-port-money {
+        position: relative;
+        z-index: 10;
         background: var(--kc-well);
         border: 2px solid var(--kc-border);
         border-radius: 7px;
@@ -4982,7 +5185,7 @@ export class UiOverlay {
         text-shadow: 0 2px 0 #0e1315;
         flex-shrink: 0;
       }
-      .kc-port-btns { display: flex; gap: 4px; flex-shrink: 0; }
+      .kc-port-btns { position: relative; z-index: 10; display: flex; gap: 4px; flex-shrink: 0; }
       .kc-port-btn {
         font-size: 12px;
         padding: 5px 7px;
@@ -5010,10 +5213,13 @@ export class UiOverlay {
         gap: 2px;
       }
       .kc-port-hand-stage.flaming {
-        background: rgba(20, 26, 30, 0.22);
-        border-color: #fda200;
+        background: rgba(18, 22, 26, 0.80);
+        border-color: #ffb833;
+        box-shadow: 0 0 18px rgba(255, 146, 40, 0.65);
       }
       .kc-port-hand-meta {
+        position: relative;
+        z-index: 10;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -5815,7 +6021,7 @@ export class UiOverlay {
 interface TooltipDescriptor {
   title: string;
   desc: string;
-  badges: Array<{ label: string; color: string }>;
+  badges: Array<{ label: string; color: string; extraClass?: string }>;
   livePreview?: { headline: string; detail: string; ok: boolean };
 }
 
@@ -5823,7 +6029,7 @@ function describeVisualCard(
   vc: VisualCard,
   state: SimState
 ): TooltipDescriptor | null {
-  const badges: Array<{ label: string; color: string }> = [];
+  const badges: Array<{ label: string; color: string; extraClass?: string }> = [];
   const pushEdition = (ed: VisualCard['edition']) => {
     if (ed !== 'none') {
       const def = EDITION_DEFS[ed];
@@ -5834,8 +6040,16 @@ function describeVisualCard(
             ? '#d94d8c'
             : ed === 'e_polychrome'
               ? '#9b59b6'
-              : '#343c4a';
-      badges.push({ label: def?.name ?? ed.replace('e_', ''), color: edColor });
+              : '#2b3242';
+      const extraClass =
+        ed === 'e_foil'
+          ? 'kc-badge-foil'
+          : ed === 'e_holo'
+            ? 'kc-badge-holo'
+            : ed === 'e_polychrome'
+              ? 'kc-badge-poly'
+              : 'kc-badge-neg';
+      badges.push({ label: def?.name ?? ed.replace('e_', ''), color: edColor, extraClass });
     }
   };
 

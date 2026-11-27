@@ -1,15 +1,19 @@
 // ============================================================================
-// Krunked Cards — Multi-Pass WebGL2 Renderer (with graceful Canvas2D fallback)
+// Krunked Cards — Multi-Pass WebGL2 Renderer (Visual Juice++)
 // Pass 1A: Title Splash Vortex (splash.fs)
-// Pass 1B: Gameplay Felt Swirl (background.fs)
-// Pass 2:  Crisp NEAREST Card & Sprite Quads (drop shadow + base + face +
-//          2-layer floating soulPos parallax & hologram.fs + translucent Foil /
-//          Negative Shine / Booster / Voucher overlays + Played dimming +
+// Pass 1B: Gameplay Felt Swirl (background.fs + flame-reactive ambient heat)
+// Pass 2:  Crisp NEAREST Card & Sprite Quads (drop shadow + prismatic edition
+//          & trigger rim aura + base + face + 2-layer floating soulPos parallax
+//          & hologram.fs + translucent Foil / Negative Shine / Booster Mylar /
+//          Voucher Gold / Glass / Steel / Gold / Cosmic / 3D Laminated Gloss +
 //          Holo / Polychrome / Debuff / Dissolve / GoldSeal + 3D skew & flips)
-// Pass 3:  Roaring Scoreboard Flames behind Chips & Mult boxes (flame.fs)
-// Pass 3B: Crisp Instanced Pixel-Square / Pixel-Diamond Particles
+// Pass 3:  Dedicated Unobstructed HUD Flame Overlay Canvas (#kc-hud-flame-canvas)
+//          at z-index 6 (behind Chips/Mult pills, in front of rail backdrop!)
+//          rendering colossal multi-band flame.fs pillars + soaring HUD embers!
+// Pass 3B: Crisp Instanced Table Particles (squares, diamonds, glass shards,
+//          4-point holographic sparkle stars, flame wisps)
 // Pass 3C: Impact / Entry Radial Pixel Flash (flash.fs)
-// Pass 4:  Screen Vortex Warp (vortex.fs) + Tuned CRT Post-Pass (CRT.fs)
+// Pass 4:  Screen Vortex Warp + Luminous Specular Bloom + Tuned CRT Post-Pass
 // ============================================================================
 
 import {
@@ -23,6 +27,7 @@ import {
 import type { AtlasImageSource, PackManager } from '../assets/PackManager.ts';
 import type { CardShapeKind, RectPx, VisualCard } from './Moveable.ts';
 import {
+  MAX_PARTICLES,
   PARTICLE_FLOATS_PER_INSTANCE,
   type ParticleSystem,
 } from './ParticleSystem.ts';
@@ -70,6 +75,7 @@ export interface RenderFrameInput {
   screenFlashColor?: [number, number, number];
   shakeX?: number;
   shakeY?: number;
+  activeSourceId?: string | null;
 }
 
 interface BgPaletteTarget {
@@ -99,6 +105,7 @@ interface UniformCache {
     c3: WebGLUniformLocation | null;
     contrast: WebGLUniformLocation | null;
     spinAmount: WebGLUniformLocation | null;
+    flameHeat: WebGLUniformLocation | null;
   };
   sprite: {
     res: WebGLUniformLocation | null;
@@ -120,6 +127,7 @@ interface UniformCache {
     cellPx: WebGLUniformLocation | null;
     burn1: WebGLUniformLocation | null;
     burn2: WebGLUniformLocation | null;
+    triggerGlow: WebGLUniformLocation | null;
   };
   flame: {
     res: WebGLUniformLocation | null;
@@ -148,6 +156,30 @@ interface UniformCache {
     vortexStrength: WebGLUniformLocation | null;
     vortexAmt: WebGLUniformLocation | null;
     glitchIntensity: WebGLUniformLocation | null;
+    bloomBoost: WebGLUniformLocation | null;
+  };
+}
+
+interface HudFlameGlState {
+  gl: WebGL2RenderingContext;
+  flameProg: WebGLProgram;
+  particleProg: WebGLProgram;
+  quadVao: WebGLVertexArrayObject;
+  quadVbo: WebGLBuffer;
+  particleVao: WebGLVertexArrayObject;
+  particleVbo: WebGLBuffer;
+  uFlame: {
+    res: WebGLUniformLocation | null;
+    rect: WebGLUniformLocation | null;
+    time: WebGLUniformLocation | null;
+    amount: WebGLUniformLocation | null;
+    c1: WebGLUniformLocation | null;
+    c2: WebGLUniformLocation | null;
+    id: WebGLUniformLocation | null;
+  };
+  uParticle: {
+    res: WebGLUniformLocation | null;
+    shakeOffset: WebGLUniformLocation | null;
   };
 }
 
@@ -247,7 +279,7 @@ function getPrimaryCardMode(edition: EditionId, debuffed: boolean, nonScoring: b
       return SHADER_MODE.POLYCHROME;
     case 'e_negative':
       return SHADER_MODE.NEGATIVE;
-    // e_foil renders crisp base first, followed by exact translucent foil.fs overlay pass!
+    // e_foil renders crisp base first, followed by liquid-chrome foil.fs overlay pass!
     default:
       return SHADER_MODE.BASE;
   }
@@ -258,6 +290,15 @@ export class WebGL2Renderer {
   private gl: WebGL2RenderingContext | null = null;
   private ctx2d: CanvasRenderingContext2D | null = null;
   private packManager: PackManager;
+
+  // Dedicated high-Z HUD Flame Overlay Canvas (blazes IN FRONT of rail backdrop, BEHIND Chips/Mult pills!)
+  private hudCanvas: HTMLCanvasElement | null = null;
+  private hudGl: HudFlameGlState | null = null;
+  private hudCtx2d: CanvasRenderingContext2D | null = null;
+  private hudContextLost = false;
+  private hudDirty = false;
+  private boundHudContextLost: ((e: Event) => void) | null = null;
+  private boundHudContextRestored: (() => void) | null = null;
 
   // WebGL2 programs & buffers
   private splashProg: WebGLProgram | null = null;
@@ -275,7 +316,7 @@ export class WebGL2Renderer {
   private particleVao: WebGLVertexArrayObject | null = null;
   private particleInstanceVbo: WebGLBuffer | null = null;
 
-  // Scene FBO for Vortex + CRT post-pass
+  // Scene FBO for Vortex + Luminous Bloom + CRT post-pass
   private sceneFbo: WebGLFramebuffer | null = null;
   private sceneTex: WebGLTexture | null = null;
   private fboW = 0;
@@ -322,6 +363,149 @@ export class WebGL2Renderer {
     this.canvas.addEventListener('webglcontextlost', this.boundContextLost, false);
     this.canvas.addEventListener('webglcontextrestored', this.boundContextRestored, false);
     this.initContext();
+  }
+
+  /**
+   * Attaches the transparent HUD Flame Overlay canvas (positioned inside #ui-root
+   * at z-index 6 so roaring pixel flames blaze over the dark rail backdrop and
+   * directly behind #kc-chips-box / #kc-mult-box on Desktop, Portrait & Landscape!).
+   */
+  attachHudFlameCanvas(canvas: HTMLCanvasElement): void {
+    this.detachHudFlameCanvas();
+    this.hudCanvas = canvas;
+    this.boundHudContextLost = (e: Event) => {
+      e.preventDefault();
+      this.hudContextLost = true;
+      this.hudGl = null;
+    };
+    this.boundHudContextRestored = () => {
+      this.hudContextLost = false;
+      this.initHudFlameContext();
+      this.syncHudCanvasSize();
+    };
+    canvas.addEventListener('webglcontextlost', this.boundHudContextLost, false);
+    canvas.addEventListener('webglcontextrestored', this.boundHudContextRestored, false);
+    this.initHudFlameContext();
+    this.syncHudCanvasSize();
+  }
+
+  private detachHudFlameCanvas(): void {
+    if (this.hudCanvas && this.boundHudContextLost) {
+      this.hudCanvas.removeEventListener('webglcontextlost', this.boundHudContextLost, false);
+    }
+    if (this.hudCanvas && this.boundHudContextRestored) {
+      this.hudCanvas.removeEventListener('webglcontextrestored', this.boundHudContextRestored, false);
+    }
+    if (this.hudGl && !this.hudContextLost) {
+      const hgl = this.hudGl.gl;
+      if (!hgl.isContextLost()) {
+        hgl.deleteBuffer(this.hudGl.quadVbo);
+        hgl.deleteVertexArray(this.hudGl.quadVao);
+        hgl.deleteBuffer(this.hudGl.particleVbo);
+        hgl.deleteVertexArray(this.hudGl.particleVao);
+        hgl.deleteProgram(this.hudGl.flameProg);
+        hgl.deleteProgram(this.hudGl.particleProg);
+      }
+    }
+    this.hudGl = null;
+    this.hudCtx2d = null;
+    this.hudCanvas = null;
+    this.boundHudContextLost = null;
+    this.boundHudContextRestored = null;
+  }
+
+  private initHudFlameContext(): void {
+    if (!this.hudCanvas) return;
+    const gl = this.hudCanvas.getContext('webgl2', {
+      alpha: true,
+      premultipliedAlpha: false,
+      antialias: false,
+      depth: false,
+      stencil: false,
+      preserveDrawingBuffer: false,
+      powerPreference: 'high-performance',
+    });
+    if (!gl) {
+      this.hudCtx2d = this.hudCanvas.getContext('2d');
+      return;
+    }
+    try {
+      const flameProg = compileProgram(gl, FLAME_VERT, FLAME_FRAG, 'hud-flame');
+      const particleProg = compileProgram(gl, PARTICLE_VERT, PARTICLE_FRAG, 'hud-particle');
+
+      const quadVao = gl.createVertexArray();
+      const quadVbo = gl.createBuffer();
+      const particleVao = gl.createVertexArray();
+      const particleVbo = gl.createBuffer();
+      if (!quadVao || !quadVbo || !particleVao || !particleVbo) {
+        throw new Error('Failed to create HUD flame VAOs/VBOs');
+      }
+
+      gl.bindVertexArray(quadVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadVbo);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+      gl.bindVertexArray(null);
+
+      const stride = PARTICLE_FLOATS_PER_INSTANCE * 4;
+      gl.bindVertexArray(particleVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadVbo);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, particleVbo);
+      gl.bufferData(gl.ARRAY_BUFFER, MAX_PARTICLES * stride, gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 0);
+      gl.vertexAttribDivisor(1, 1);
+      gl.enableVertexAttribArray(2);
+      gl.vertexAttribPointer(2, 4, gl.FLOAT, false, stride, 16);
+      gl.vertexAttribDivisor(2, 1);
+      gl.enableVertexAttribArray(3);
+      gl.vertexAttribPointer(3, 1, gl.FLOAT, false, stride, 32);
+      gl.vertexAttribDivisor(3, 1);
+      gl.bindVertexArray(null);
+
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+      this.hudGl = {
+        gl,
+        flameProg,
+        particleProg,
+        quadVao,
+        quadVbo,
+        particleVao,
+        particleVbo,
+        uFlame: {
+          res: gl.getUniformLocation(flameProg, 'u_resolution'),
+          rect: gl.getUniformLocation(flameProg, 'u_rect'),
+          time: gl.getUniformLocation(flameProg, 'u_time'),
+          amount: gl.getUniformLocation(flameProg, 'u_amount'),
+          c1: gl.getUniformLocation(flameProg, 'u_colour1'),
+          c2: gl.getUniformLocation(flameProg, 'u_colour2'),
+          id: gl.getUniformLocation(flameProg, 'u_id'),
+        },
+        uParticle: {
+          res: gl.getUniformLocation(particleProg, 'u_resolution'),
+          shakeOffset: gl.getUniformLocation(particleProg, 'u_shakeOffset'),
+        },
+      };
+    } catch {
+      this.hudGl = null;
+      this.hudCtx2d = this.hudCanvas.getContext('2d');
+    }
+  }
+
+  private syncHudCanvasSize(): void {
+    if (!this.hudCanvas) return;
+    const pw = Math.max(1, Math.round(this.cssW * this.dpr));
+    const ph = Math.max(1, Math.round(this.cssH * this.dpr));
+    if (this.hudCanvas.width !== pw || this.hudCanvas.height !== ph) {
+      this.hudCanvas.width = pw;
+      this.hudCanvas.height = ph;
+    }
   }
 
   private clearGlResourceRefs(): void {
@@ -378,7 +562,7 @@ export class WebGL2Renderer {
   }
 
   triggerTitleEntryFlash(): void {
-    this.titleMidFlash = 0.28;
+    this.titleMidFlash = 0.30;
     this.splashElapsed = 0;
   }
 
@@ -436,6 +620,7 @@ export class WebGL2Renderer {
           c3: gl.getUniformLocation(this.bgProg, 'u_colour3'),
           contrast: gl.getUniformLocation(this.bgProg, 'u_contrast'),
           spinAmount: gl.getUniformLocation(this.bgProg, 'u_spinAmount'),
+          flameHeat: gl.getUniformLocation(this.bgProg, 'u_flameHeat'),
         },
         sprite: {
           res: gl.getUniformLocation(this.spriteProg, 'u_resolution'),
@@ -457,6 +642,7 @@ export class WebGL2Renderer {
           cellPx: gl.getUniformLocation(this.spriteProg, 'u_cellPixels'),
           burn1: gl.getUniformLocation(this.spriteProg, 'u_burnColour1'),
           burn2: gl.getUniformLocation(this.spriteProg, 'u_burnColour2'),
+          triggerGlow: gl.getUniformLocation(this.spriteProg, 'u_triggerGlow'),
         },
         flame: {
           res: gl.getUniformLocation(this.flameProg, 'u_resolution'),
@@ -485,6 +671,7 @@ export class WebGL2Renderer {
           vortexStrength: gl.getUniformLocation(this.crtProg, 'u_vortexStrength'),
           vortexAmt: gl.getUniformLocation(this.crtProg, 'u_vortexAmt'),
           glitchIntensity: gl.getUniformLocation(this.crtProg, 'u_glitchIntensity'),
+          bloomBoost: gl.getUniformLocation(this.crtProg, 'u_bloomBoost'),
         },
       };
 
@@ -510,7 +697,7 @@ export class WebGL2Renderer {
       gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
       gl.bindBuffer(gl.ARRAY_BUFFER, this.particleInstanceVbo);
-      gl.bufferData(gl.ARRAY_BUFFER, 512 * stride, gl.DYNAMIC_DRAW);
+      gl.bufferData(gl.ARRAY_BUFFER, MAX_PARTICLES * stride, gl.DYNAMIC_DRAW);
       // location 1: vec4 a_geom (x, y, size, rot)
       gl.enableVertexAttribArray(1);
       gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 0);
@@ -576,7 +763,6 @@ export class WebGL2Renderer {
           }
         }
         if (maxOpaqueY <= 0) return fallback;
-        // If artwork spans near the full cell height (e.g. built-in full card), keep 1.0 so nothing clips
         const ratio = (maxOpaqueY + Math.max(1, Math.round(cellH * 0.015))) / cellH;
         return ratio >= 0.94 ? 1.0 : Math.max(0.55, Math.min(1.0, ratio));
       };
@@ -626,6 +812,8 @@ export class WebGL2Renderer {
       this.canvas.width = pw;
       this.canvas.height = ph;
     }
+
+    this.syncHudCanvasSize();
 
     if (this.gl && !this.contextLost && !this.gl.isContextLost() && (this.fboW !== pw || this.fboH !== ph)) {
       this.rebuildSceneFbo(pw, ph);
@@ -677,6 +865,202 @@ export class WebGL2Renderer {
     this.fboH = safeH;
   }
 
+  private drawFlamePlumes(
+    gl: WebGL2RenderingContext,
+    prog: WebGLProgram,
+    quadVao: WebGLVertexArrayObject,
+    uf: UniformCache['flame'],
+    anchor: FlameAnchor,
+    timeSec: number,
+    reducedMotion: boolean
+  ): number {
+    let calls = 0;
+    const intensity = Math.min(10, anchor.intensity);
+    const hotShift = Math.max(0, Math.min(1, (intensity - 3.0) / 5.5));
+    const animTime = reducedMotion ? timeSec * 0.25 : timeSec * (1.0 + hotShift * 0.48);
+
+    gl.useProgram(prog);
+    gl.bindVertexArray(quadVao);
+    gl.uniform2f(uf.res, this.cssW, this.cssH);
+    gl.uniform1f(uf.time, animTime);
+    gl.uniform1f(uf.amount, intensity);
+
+    // 1. Roaring Electric Cobalt -> Blazing Cyan -> Ice-White Chips Flame
+    const cr = anchor.chipsRect;
+    gl.uniform4f(uf.rect, cr.x, cr.y, cr.w, cr.h);
+    gl.uniform4f(
+      uf.c1,
+      0.0 + hotShift * 0.22,
+      0.54 + hotShift * 0.34,
+      1.0,
+      1.0
+    );
+    gl.uniform4f(
+      uf.c2,
+      0.48 + hotShift * 0.50,
+      0.94 + hotShift * 0.06,
+      1.0,
+      1.0
+    );
+    gl.uniform1f(uf.id, 1.0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    calls++;
+
+    // 2. Roaring Scarlet-Crimson -> Molten Gold -> Solar White Mult Flame
+    const mr = anchor.multRect;
+    gl.uniform4f(uf.rect, mr.x, mr.y, mr.w, mr.h);
+    gl.uniform4f(
+      uf.c1,
+      1.0,
+      0.26 + hotShift * 0.34,
+      0.16 + hotShift * 0.14,
+      1.0
+    );
+    gl.uniform4f(
+      uf.c2,
+      1.0,
+      0.86 + hotShift * 0.13,
+      0.20 + hotShift * 0.62,
+      1.0
+    );
+    gl.uniform1f(uf.id, 2.0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    calls++;
+
+    // 3. Twin Superheated Inner Plasma Tongues at massive overkill scores (>= 4.8)!
+    if (intensity >= 4.8) {
+      const superAmt = Math.min(10, (intensity - 3.6) * 1.15);
+      const insetX = Math.round(cr.w * 0.14);
+      const extraLift = Math.round(Math.min(26, (intensity - 4.5) * 4.8));
+      gl.uniform1f(uf.time, animTime * 1.24);
+      gl.uniform1f(uf.amount, superAmt);
+
+      // Chips super-core tongue
+      gl.uniform4f(uf.rect, cr.x + insetX, Math.max(0, cr.y - extraLift), cr.w - insetX * 2, cr.h + extraLift);
+      gl.uniform4f(uf.c1, 0.34, 0.90, 1.0, 1.0);
+      gl.uniform4f(uf.c2, 0.94, 0.99, 1.0, 1.0);
+      gl.uniform1f(uf.id, 5.7);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      calls++;
+
+      // Mult super-core tongue
+      const insetMX = Math.round(mr.w * 0.14);
+      gl.uniform4f(uf.rect, mr.x + insetMX, Math.max(0, mr.y - extraLift), mr.w - insetMX * 2, mr.h + extraLift);
+      gl.uniform4f(uf.c1, 1.0, 0.64, 0.12, 1.0);
+      gl.uniform4f(uf.c2, 1.0, 0.99, 0.86, 1.0);
+      gl.uniform1f(uf.id, 7.3);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      calls++;
+    }
+
+    return calls;
+  }
+
+  private renderHudFlameOverlay(
+    frame: RenderFrameInput,
+    shakeX: number,
+    shakeY: number,
+    activeShaderSet: Set<string>
+  ): number {
+    if (!this.hudCanvas) return 0;
+    const hasFlames = Boolean(frame.flameAnchor && frame.flameAnchor.intensity > 0.08);
+    const hudPacked = frame.particles ? frame.particles.packInstanceData('hud') : { data: new Float32Array(0), count: 0 };
+    const hasHudParticles = hudPacked.count > 0;
+
+    if (!hasFlames && !hasHudParticles) {
+      if (this.hudDirty) {
+        this.hudDirty = false;
+        if (this.hudGl && !this.hudContextLost && !this.hudGl.gl.isContextLost()) {
+          const hgl = this.hudGl.gl;
+          hgl.viewport(0, 0, this.hudCanvas.width, this.hudCanvas.height);
+          hgl.clearColor(0, 0, 0, 0);
+          hgl.clear(hgl.COLOR_BUFFER_BIT);
+        } else if (this.hudCtx2d) {
+          this.hudCtx2d.clearRect(0, 0, this.hudCanvas.width, this.hudCanvas.height);
+        }
+      }
+      return 0;
+    }
+
+    this.hudDirty = true;
+    let calls = 0;
+
+    if (this.hudGl && !this.hudContextLost && !this.hudGl.gl.isContextLost()) {
+      const hgl = this.hudGl.gl;
+      hgl.viewport(0, 0, this.hudCanvas.width, this.hudCanvas.height);
+      hgl.clearColor(0, 0, 0, 0);
+      hgl.clear(hgl.COLOR_BUFFER_BIT);
+      hgl.enable(hgl.BLEND);
+      hgl.blendFunc(hgl.SRC_ALPHA, hgl.ONE_MINUS_SRC_ALPHA);
+
+      if (hasFlames && frame.flameAnchor) {
+        activeShaderSet.add('flame');
+        calls += this.drawFlamePlumes(
+          hgl,
+          this.hudGl.flameProg,
+          this.hudGl.quadVao,
+          this.hudGl.uFlame,
+          frame.flameAnchor,
+          frame.timeSec,
+          frame.settings.reducedMotion
+        );
+      }
+
+      if (hasHudParticles) {
+        activeShaderSet.add('particles');
+        hgl.useProgram(this.hudGl.particleProg);
+        hgl.bindVertexArray(this.hudGl.particleVao);
+        hgl.uniform2f(this.hudGl.uParticle.res, this.cssW, this.cssH);
+        hgl.uniform2f(this.hudGl.uParticle.shakeOffset, shakeX * 0.5, shakeY * 0.5);
+        hgl.bindBuffer(hgl.ARRAY_BUFFER, this.hudGl.particleVbo);
+        hgl.bufferSubData(
+          hgl.ARRAY_BUFFER,
+          0,
+          hudPacked.data.subarray(0, hudPacked.count * PARTICLE_FLOATS_PER_INSTANCE)
+        );
+        hgl.drawArraysInstanced(hgl.TRIANGLE_STRIP, 0, 4, hudPacked.count);
+        calls++;
+      }
+      return calls;
+    }
+
+    // Crisp Canvas2D fallback for HUD flames & embers
+    if (this.hudCtx2d) {
+      const ctx = this.hudCtx2d;
+      ctx.save();
+      ctx.clearRect(0, 0, this.hudCanvas.width, this.hudCanvas.height);
+      ctx.scale(this.dpr, this.dpr);
+      ctx.imageSmoothingEnabled = false;
+      if (hasFlames && frame.flameAnchor) {
+        activeShaderSet.add('flame');
+        const drawBoxFlame2D = (rect: RectPx, c1: string, c2: string) => {
+          const g = ctx.createLinearGradient(0, rect.y + rect.h, 0, rect.y);
+          g.addColorStop(0, c2);
+          g.addColorStop(0.5, c1);
+          g.addColorStop(1, 'rgba(0,0,0,0)');
+          ctx.fillStyle = g;
+          ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+          calls++;
+        };
+        drawBoxFlame2D(frame.flameAnchor.chipsRect, '#009dff', '#7ef4ff');
+        drawBoxFlame2D(frame.flameAnchor.multRect, '#fe5f55', '#ffd94a');
+      }
+      if (hasHudParticles && frame.particles) {
+        for (const p of frame.particles.getParticles()) {
+          if (p.layer !== 'hud') continue;
+          const t = Math.min(1, p.age / Math.max(0.001, p.lifetime));
+          const a = p.alpha * (t > 0.65 ? Math.max(0, 1 - (t - 0.65) / 0.35) : 1);
+          const sz = p.size + (p.endSize - p.size) * t;
+          ctx.fillStyle = `rgba(${Math.round(p.r * 255)},${Math.round(p.g * 255)},${Math.round(p.b * 255)},${a.toFixed(2)})`;
+          ctx.fillRect(p.x - sz * 0.5, p.y - sz * 0.5, sz, sz);
+          calls++;
+        }
+      }
+      ctx.restore();
+    }
+    return calls;
+  }
+
   render(frame: RenderFrameInput): void {
     const safeDt = Math.min(0.05, Math.max(0.001, frame.dt));
     const motionScale = frame.settings.reducedMotion ? 0.15 : 1.0;
@@ -694,11 +1078,13 @@ export class WebGL2Renderer {
     this.bgCurrent.contrast += (targetBg.contrast - this.bgCurrent.contrast) * bgLerp;
     this.bgCurrent.spinAmount += (targetBg.spinAmount - this.bgCurrent.spinAmount) * bgLerp;
 
-    this.spinTime += safeDt * (1.0 + this.bgCurrent.spinAmount * 1.45) * motionScale;
+    const flameHeat = frame.flameAnchor
+      ? Math.min(1, Math.max(0, frame.flameAnchor.intensity / 6.5))
+      : 0;
+    this.spinTime += safeDt * (1.0 + this.bgCurrent.spinAmount * 1.45 + flameHeat * 1.85) * motionScale;
     this.splashElapsed += safeDt * motionScale;
     this.titleMidFlash = Math.max(0, this.titleMidFlash - Math.max(safeDt, frame.dt) * 0.9);
 
-    // Step background vortex swirl pulse (vortex.fs energy applied to Pass 1 so cards stay aligned with DOM buttons!)
     let vortexStrength = 0;
     let vortexAmt = 0;
     if (!frame.settings.reducedMotion && this.vortexElapsed < this.vortexDuration) {
@@ -717,6 +1103,9 @@ export class WebGL2Renderer {
 
     if (!this.gl || !this.uniforms) {
       this.renderCanvas2D(frame);
+      const hudSet = new Set<string>(this.lastActiveShaders);
+      this.lastDrawCalls += this.renderHudFlameOverlay(frame, 0, 0, hudSet);
+      this.lastActiveShaders = Array.from(hudSet);
       return;
     }
 
@@ -729,17 +1118,15 @@ export class WebGL2Renderer {
     const pw = Math.max(1, this.canvas.width);
     const ph = Math.max(1, this.canvas.height);
     const useCrt = frame.settings.crtAmount > 0.5;
-    const usePostFbo =
-      (useCrt || vortexStrength > 0.001 || this.glitchIntensity > 0.005) &&
-      this.sceneFbo !== null &&
-      this.sceneTex !== null;
+    // Always run Pass 4 when FBO is ready so holographic speculars & sparkles get crisp bloom even at 0% CRT!
+    const usePostFbo = this.sceneFbo !== null && this.sceneTex !== null;
     const activeShaderSet = new Set<string>();
     let drawCalls = 0;
 
     const shakeX = frame.settings.reducedMotion ? 0 : (frame.shakeX ?? 0);
     const shakeY = frame.settings.reducedMotion ? 0 : (frame.shakeY ?? 0);
 
-    // Bind scene FBO if CRT or Vortex post-pass is active, else default backbuffer
+    // Bind scene FBO for post-pass bloom/CRT/vortex
     gl.bindFramebuffer(gl.FRAMEBUFFER, usePostFbo ? this.sceneFbo : null);
     gl.viewport(0, 0, pw, ph);
 
@@ -750,11 +1137,10 @@ export class WebGL2Renderer {
       gl.useProgram(this.splashProg);
       gl.bindVertexArray(this.emptyVao);
       gl.uniform2f(u.splash.res, pw, ph);
-      // Steady-state splash.fs vortex time (>= 11.7s brings out vivid crimson + cerulean + core glow)
       gl.uniform1f(u.splash.time, 12.4 + this.splashElapsed);
       gl.uniform1f(u.splash.vortSpeed, 0.42);
-      gl.uniform4f(u.splash.c1, 0.871, 0.267, 0.231, 1.0); // #de443b iconic crimson
-      gl.uniform4f(u.splash.c2, 0.0, 0.420, 0.706, 1.0);   // #006bb4 iconic cerulean
+      gl.uniform4f(u.splash.c1, 0.871, 0.267, 0.231, 1.0);
+      gl.uniform4f(u.splash.c2, 0.0, 0.420, 0.706, 1.0);
       gl.uniform1f(u.splash.midFlash, frame.settings.reducedMotion ? 0.0 : this.titleMidFlash);
       gl.uniform1f(u.splash.vortOffset, 0.45);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -771,8 +1157,9 @@ export class WebGL2Renderer {
       gl.uniform4fv(u.bg.c1, this.bgCurrent.c1);
       gl.uniform4fv(u.bg.c2, this.bgCurrent.c2);
       gl.uniform4fv(u.bg.c3, this.bgCurrent.c3);
-      gl.uniform1f(u.bg.contrast, this.bgCurrent.contrast + vortexStrength * 0.55);
-      gl.uniform1f(u.bg.spinAmount, this.bgCurrent.spinAmount + vortexStrength * 0.45);
+      gl.uniform1f(u.bg.contrast, this.bgCurrent.contrast + vortexStrength * 0.55 + flameHeat * 0.42);
+      gl.uniform1f(u.bg.spinAmount, this.bgCurrent.spinAmount + vortexStrength * 0.45 + flameHeat * 0.24);
+      gl.uniform1f(u.bg.flameHeat, frame.settings.reducedMotion ? flameHeat * 0.4 : flameHeat);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       drawCalls++;
     }
@@ -780,63 +1167,22 @@ export class WebGL2Renderer {
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-    // --- PASS 3 (placed behind left-rail UI boxes): ROARING FLAMES (flame.fs) ---
-    if (this.flameProg && frame.flameAnchor && frame.flameAnchor.intensity > 0.08) {
+    // Fallback flame draw on main canvas ONLY if no dedicated HUD overlay canvas is attached
+    if (!this.hudCanvas && this.flameProg && frame.flameAnchor && frame.flameAnchor.intensity > 0.08) {
       activeShaderSet.add('flame');
-      const intensity = frame.flameAnchor.intensity;
-      const hotShift = Math.max(0, Math.min(1, (intensity - 4.0) / 5.5));
-
-      gl.useProgram(this.flameProg);
-      gl.bindVertexArray(this.quadVao);
-      gl.uniform2f(u.flame.res, this.cssW, this.cssH);
-      gl.uniform1f(u.flame.time, frame.timeSec * (1 + hotShift * 0.35));
-      gl.uniform1f(u.flame.amount, intensity);
-
-      // Roaring Blue Chips Flame (shifts toward electric cyan / white-hot at huge scores)
-      const cr = frame.flameAnchor.chipsRect;
-      const extraH = Math.round(Math.min(44, intensity * 5.2));
-      gl.uniform4f(u.flame.rect, cr.x - 4, cr.y - extraH, cr.w + 8, cr.h + extraH);
-      gl.uniform4f(
-        u.flame.c1,
-        0.0 + hotShift * 0.24,
-        0.62 + hotShift * 0.28,
-        1.0,
-        1.0
+      drawCalls += this.drawFlamePlumes(
+        gl,
+        this.flameProg,
+        this.quadVao!,
+        u.flame,
+        frame.flameAnchor,
+        frame.timeSec,
+        frame.settings.reducedMotion
       );
-      gl.uniform4f(
-        u.flame.c2,
-        0.68 + hotShift * 0.32,
-        0.95 + hotShift * 0.05,
-        1.0,
-        1.0
-      );
-      gl.uniform1f(u.flame.id, 1.0);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      drawCalls++;
-
-      // Roaring Crimson-Gold Mult Flame (shifts toward blazing gold / white-hot at huge scores)
-      const mr = frame.flameAnchor.multRect;
-      gl.uniform4f(u.flame.rect, mr.x - 4, mr.y - extraH, mr.w + 8, mr.h + extraH);
-      gl.uniform4f(
-        u.flame.c1,
-        1.0,
-        0.37 + hotShift * 0.30,
-        0.33 + hotShift * 0.12,
-        1.0
-      );
-      gl.uniform4f(
-        u.flame.c2,
-        1.0,
-        0.85 + hotShift * 0.14,
-        0.32 + hotShift * 0.56,
-        1.0
-      );
-      gl.uniform1f(u.flame.id, 2.0);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      drawCalls++;
     }
 
-    // --- PASS 2: CARD & SPRITE QUADS ---
+    // --- PASS 2: CARD & SPRITE QUADS (with Holographic, Foil, Prismatic, Enhancement & Gloss passes!) ---
+    let shinyCardsCount = 0;
     if (this.spriteProg && frame.cards.length > 0) {
       activeShaderSet.add('sprite');
       gl.useProgram(this.spriteProg);
@@ -880,7 +1226,8 @@ export class WebGL2Renderer {
         dissolve: number,
         isShadow: boolean,
         tint: Rgba,
-        uvCropH = 1.0
+        uvCropH = 1.0,
+        triggerGlow = 0.0
       ) => {
         if (!bindAtlas(atlas)) return;
         const spec = ATLAS_SPECS[atlas];
@@ -901,12 +1248,13 @@ export class WebGL2Renderer {
         gl.uniform1i(u.sprite.shadow, isShadow ? 1 : 0);
         gl.uniform4fv(u.sprite.tint, tint);
         gl.uniform2f(u.sprite.cellPx, spec.cellW, spec.cellH * uvCropH);
+        gl.uniform1f(u.sprite.triggerGlow, triggerGlow);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         drawCalls++;
       };
 
       const white: Rgba = [1, 1, 1, 1];
-      const glassTint: Rgba = [1, 1, 1, 0.90];
+      const glassTint: Rgba = [0.95, 0.99, 1.0, 0.90];
       const soulShadowTint: Rgba = [1, 1, 1, 0.82];
       const blackHoleTint: Rgba = [0.92, 0.86, 1.0, 1.0];
 
@@ -916,19 +1264,21 @@ export class WebGL2Renderer {
         const w = m.vw * m.vScale * flipX;
         const h = m.vh * m.vScale;
         const cropH = this.getUvCropH(vc);
+        const isActiveSource = Boolean(frame.activeSourceId && frame.activeSourceId === vc.id);
+        const trigGlow = Math.max(m.triggerGlow, isActiveSource ? 0.55 : 0);
         const hoverFac = m.dragging
-          ? 1.35
+          ? 1.4
           : m.hovered
-            ? 1.0
+            ? 1.15
             : vc.kind === 'title_showcase'
-              ? 0.55
+              ? 0.65
               : 0.0;
         const shadowOff = m.dragging
-          ? 19
+          ? 20
           : vc.kind === 'title_showcase'
-            ? 18
+            ? 20
             : m.hovered
-              ? 13
+              ? 14
               : vc.forced
                 ? 13
                 : vc.scoringPreview
@@ -941,6 +1291,9 @@ export class WebGL2Renderer {
         const primaryMode = getPrimaryCardMode(vc.edition, vc.debuffed, nonScoring);
         const hasFoilOverlay = !vc.debuffed && !nonScoring && !vc.faceDown && vc.edition === 'e_foil';
         const hasNegativeShine = !vc.debuffed && !nonScoring && !vc.faceDown && vc.edition === 'e_negative';
+        const hasEdition = !vc.debuffed && !nonScoring && !vc.faceDown && vc.edition !== 'none';
+
+        if (hasEdition || vc.overlayEffect || vc.soulPos || vc.floatingGlow) shinyCardsCount++;
 
         if (primaryMode === SHADER_MODE.HOLO) activeShaderSet.add('holo');
         else if (primaryMode === SHADER_MODE.POLYCHROME) activeShaderSet.add('polychrome');
@@ -952,16 +1305,17 @@ export class WebGL2Renderer {
         if (m.dissolve > 0.01) activeShaderSet.add('dissolve');
 
         const seed = vc.index * 0.61 + (vc.id.charCodeAt(vc.id.length - 1) || 0) * 0.13;
-        const effectX = m.vr * 2.5 + m.tiltX * 1.9 + frame.timeSec * 0.58 + seed;
-        const effectY = frame.timeSec * 0.52 + m.tiltY * 1.2 + seed * 1.3;
+        const motionTime = frame.timeSec * motionScale;
+        const effectX = m.vr * 2.8 + m.tiltX * 2.35 + motionTime * 0.68 + seed;
+        const effectY = motionTime * 0.58 + m.tiltY * 1.45 + seed * 1.3;
 
         // 1. Crisp drop shadow proportional to elevation
         drawLayer(
           vc.baseAtlas,
           vc.basePos.x,
           vc.basePos.y,
-          m.vx + shadowOff * 0.52 - m.tiltX * 5.5,
-          m.vy + shadowOff - m.tiltY * 3.0,
+          m.vx + shadowOff * 0.52 - m.tiltX * 6.0,
+          m.vy + shadowOff - m.tiltY * 3.5,
           w,
           h,
           m.vr,
@@ -977,8 +1331,30 @@ export class WebGL2Renderer {
           cropH
         );
 
-        // 1B. Crisp pixel rim cues for Cerulean Bell forced card & scoring preview cards
-        if (vc.forced) {
+        // 1B. Prismatic Edition Aura / Radiant Trigger Spotlight / Forced / Scoring Preview Rim
+        if (trigGlow > 0.05) {
+          const pad = 7 + trigGlow * 8;
+          drawLayer(
+            vc.baseAtlas,
+            vc.basePos.x,
+            vc.basePos.y,
+            m.vx,
+            m.vy,
+            w + pad,
+            h + pad,
+            m.vr,
+            m.tiltX,
+            m.tiltY,
+            hoverFac,
+            SHADER_MODE.EDITION_AURA,
+            effectX,
+            hasEdition ? 1.0 : 0.0,
+            m.dissolve,
+            false,
+            [1.0, 0.90, 0.48, Math.min(0.95, 0.45 + trigGlow * 0.5)],
+            cropH
+          );
+        } else if (vc.forced) {
           const pulse = frame.settings.reducedMotion
             ? 0.88
             : 0.78 + 0.18 * Math.sin(frame.timeSec * 5.4);
@@ -1007,16 +1383,16 @@ export class WebGL2Renderer {
           );
         } else if (vc.scoringPreview && !vc.debuffed) {
           const previewAlpha = frame.settings.reducedMotion
-            ? 0.52
-            : 0.48 + 0.12 * Math.sin(frame.timeSec * 3.6 + seed);
+            ? 0.56
+            : 0.52 + 0.14 * Math.sin(frame.timeSec * 3.8 + seed);
           drawLayer(
             vc.baseAtlas,
             vc.basePos.x,
             vc.basePos.y,
             m.vx,
             m.vy,
-            w + 4.5,
-            h + 4.5,
+            w + 5.5,
+            h + 5.5,
             m.vr,
             m.tiltX,
             m.tiltY,
@@ -1026,7 +1402,47 @@ export class WebGL2Renderer {
             effectY,
             m.dissolve,
             false,
-            [0.32, 0.84, 1.0, previewAlpha],
+            [0.32, 0.88, 1.0, previewAlpha],
+            cropH
+          );
+        } else if (hasEdition || vc.soulShader === 'soul_gem' || vc.floatingGlow === 'black_hole' || vc.kind === 'title_showcase') {
+          let auraCol: Rgba = [0.55, 0.88, 1.0, 0.46];
+          let rainbowFlag = 0.0;
+          let pad = m.hovered ? 8.5 : 5.5;
+          if (vc.edition === 'e_foil') {
+            auraCol = [0.45, 0.86, 1.0, m.hovered ? 0.72 : 0.48];
+          } else if (vc.edition === 'e_holo') {
+            auraCol = [1.0, 0.42, 0.90, m.hovered ? 0.78 : 0.54];
+            rainbowFlag = 1.0;
+          } else if (vc.edition === 'e_polychrome' || vc.soulShader === 'soul_gem') {
+            auraCol = [1.0, 0.84, 0.36, m.hovered ? 0.84 : 0.60];
+            rainbowFlag = 1.0;
+            pad = m.hovered ? 9.5 : 6.5;
+          } else if (vc.edition === 'e_negative' || vc.floatingGlow === 'black_hole') {
+            auraCol = [0.56, 0.38, 1.0, m.hovered ? 0.78 : 0.52];
+          } else if (vc.kind === 'title_showcase') {
+            auraCol = [0.46, 0.88, 1.0, 0.68];
+            rainbowFlag = 1.0;
+            pad = 13;
+          }
+          drawLayer(
+            vc.baseAtlas,
+            vc.basePos.x,
+            vc.basePos.y,
+            m.vx,
+            m.vy,
+            w + pad,
+            h + pad,
+            m.vr,
+            m.tiltX,
+            m.tiltY,
+            hoverFac,
+            SHADER_MODE.EDITION_AURA,
+            effectX,
+            rainbowFlag,
+            m.dissolve,
+            false,
+            auraCol,
             cropH
           );
         }
@@ -1057,7 +1473,8 @@ export class WebGL2Renderer {
           m.dissolve,
           false,
           baseTint,
-          cropH
+          cropH,
+          trigGlow
         );
 
         // 3. Playing Card Rank & Suit Face Layer
@@ -1080,29 +1497,29 @@ export class WebGL2Renderer {
             m.dissolve,
             false,
             white,
-            1.0
+            1.0,
+            trigGlow
           );
         }
 
         // 3B. True 2-Layer Floating soulPos Parallax (Legendaries, j_hologram, c_soul)
         if (!vc.faceDown && vc.soulAtlas && vc.soulPos) {
-          const t = frame.timeSec * motionScale;
+          const t = motionTime;
           const isHoloJoker = vc.soulShader === 'hologram';
           const isSoulGem = vc.soulShader === 'soul_gem';
           const breath = frame.settings.reducedMotion
             ? 1.04
-            : 1.04 + 0.03 * Math.sin(t * 2.1 + seed);
+            : 1.05 + 0.032 * Math.sin(t * 2.1 + seed);
           const soulW = w * breath;
           const soulH = h * breath;
           const soulRot =
             m.vr +
-            (frame.settings.reducedMotion ? 0 : -0.045 * Math.cos(t * 1.45 + seed));
-          const orbitX = frame.settings.reducedMotion ? 0 : Math.sin(t * 1.3 + seed) * 1.8;
-          const orbitY = frame.settings.reducedMotion ? 0 : Math.cos(t * 1.7 + seed) * 2.4;
-          const soulX = m.vx + orbitX - m.tiltX * 5.0;
-          const soulY = m.vy + orbitY - 2.0 - m.tiltY * 4.5;
+            (frame.settings.reducedMotion ? 0 : -0.048 * Math.cos(t * 1.45 + seed));
+          const orbitX = frame.settings.reducedMotion ? 0 : Math.sin(t * 1.3 + seed) * 2.0;
+          const orbitY = frame.settings.reducedMotion ? 0 : Math.cos(t * 1.7 + seed) * 2.6;
+          const soulX = m.vx + orbitX - m.tiltX * 5.5;
+          const soulY = m.vy + orbitY - 2.0 - m.tiltY * 5.0;
 
-          // Floating soul shadow slightly offset below/right of the hovering portrait
           drawLayer(
             vc.soulAtlas,
             vc.soulPos.x,
@@ -1124,7 +1541,6 @@ export class WebGL2Renderer {
             1.0
           );
 
-          // Floating soul sprite itself
           const soulMode: ShaderMode = isHoloJoker
             ? SHADER_MODE.HOLOGRAM
             : isSoulGem && primaryMode === SHADER_MODE.BASE
@@ -1135,7 +1551,7 @@ export class WebGL2Renderer {
           else if (soulMode === SHADER_MODE.POLYCHROME) activeShaderSet.add('polychrome');
 
           const soulEffX = isHoloJoker ? m.vr * 2.0 + m.tiltX * 1.5 + seed : effectX;
-          const soulEffY = isHoloJoker ? frame.timeSec * 1.65 + seed : effectY;
+          const soulEffY = isHoloJoker ? frame.timeSec * 1.75 + seed : effectY;
 
           drawLayer(
             vc.soulAtlas,
@@ -1155,10 +1571,10 @@ export class WebGL2Renderer {
             m.dissolve,
             false,
             white,
-            1.0
+            1.0,
+            trigGlow
           );
 
-          // Apply Foil or Negative Shine overlays to Legendary floating busts too!
           if (!isHoloJoker && !isSoulGem && hasFoilOverlay) {
             drawLayer(
               vc.soulAtlas,
@@ -1204,7 +1620,7 @@ export class WebGL2Renderer {
           }
         }
 
-        // 4A. Translucent Foil Overlay Pass (exact foil.fs over base + face)
+        // 4A. Translucent Liquid-Chrome Foil Overlay Pass (over base + face)
         if (hasFoilOverlay) {
           drawLayer(
             vc.baseAtlas,
@@ -1250,9 +1666,9 @@ export class WebGL2Renderer {
           }
         }
 
-        // 4B. Translucent Negative Shine Overlay Pass (exact negative_shine.fs)
+        // 4B. Translucent Electric Neon Negative Shine Overlay Pass
         if (hasNegativeShine) {
-          const nsX = m.vr * 1.4 + m.tiltX * 0.8 + frame.timeSec * 0.28 + seed;
+          const nsX = m.vr * 1.6 + m.tiltX * 1.1 + motionTime * 0.38 + seed;
           drawLayer(
             vc.baseAtlas,
             vc.basePos.x,
@@ -1297,79 +1713,296 @@ export class WebGL2Renderer {
           }
         }
 
-        // 4C. Booster Pack Glossy Foil Sheen (booster.fs) & Voucher Sheen (voucher.fs)
-        if (!vc.faceDown && vc.overlayEffect === 'booster') {
-          activeShaderSet.add('booster');
-          const br = m.vr * 1.5 + m.tiltX * 0.55 + frame.timeSec * 0.22 + seed;
-          drawLayer(
-            vc.baseAtlas,
-            vc.basePos.x,
-            vc.basePos.y,
-            m.vx,
-            m.vy,
-            w,
-            h,
-            m.vr,
-            m.tiltX,
-            m.tiltY,
-            hoverFac,
-            SHADER_MODE.BOOSTER,
-            br,
-            effectY,
-            m.dissolve,
-            false,
-            white,
-            1.0
-          );
-        } else if (!vc.faceDown && vc.overlayEffect === 'voucher') {
-          activeShaderSet.add('voucher');
-          const vr = m.vr * 1.5 + m.tiltX * 0.55 + frame.timeSec * 0.24 + seed;
-          drawLayer(
-            vc.baseAtlas,
-            vc.basePos.x,
-            vc.basePos.y,
-            m.vx,
-            m.vy,
-            w,
-            h,
-            m.vr,
-            m.tiltX,
-            m.tiltY,
-            hoverFac,
-            SHADER_MODE.VOUCHER,
-            vr,
-            effectY,
-            m.dissolve,
-            false,
-            white,
-            1.0
-          );
-        } else if (!vc.faceDown && vc.floatingGlow === 'black_hole') {
-          // Subtle cosmic sheen over Black Hole spectral
-          const br = m.vr * 1.4 + m.tiltX * 0.6 + frame.timeSec * 0.34 + seed;
-          drawLayer(
-            vc.baseAtlas,
-            vc.basePos.x,
-            vc.basePos.y,
-            m.vx,
-            m.vy,
-            w,
-            h,
-            m.vr,
-            m.tiltX,
-            m.tiltY,
-            hoverFac,
-            SHADER_MODE.NEGATIVE_SHINE,
-            br,
-            effectY,
-            m.dissolve,
-            false,
-            [0.85, 0.72, 1.0, 0.85],
-            1.0
-          );
+        // 4C. Booster Mylar Sheen, Voucher Gold-Foil Sheen, Black Hole Aura,
+        //     Enhancement Material Sheens (Glass/Steel/Gold/Wild/Lucky/Bonus/Mult),
+        //     Consumable Set Shimmers (Planet/Spectral/Tarot), & 3D Laminated Card Gloss!
+        if (!vc.faceDown && !vc.debuffed && !nonScoring) {
+          if (vc.overlayEffect === 'booster') {
+            activeShaderSet.add('booster');
+            const br = m.vr * 1.6 + m.tiltX * 0.85 + motionTime * 0.36 + seed;
+            drawLayer(
+              vc.baseAtlas,
+              vc.basePos.x,
+              vc.basePos.y,
+              m.vx,
+              m.vy,
+              w,
+              h,
+              m.vr,
+              m.tiltX,
+              m.tiltY,
+              hoverFac,
+              SHADER_MODE.BOOSTER,
+              br,
+              effectY,
+              m.dissolve,
+              false,
+              white,
+              1.0
+            );
+          } else if (vc.overlayEffect === 'voucher') {
+            activeShaderSet.add('voucher');
+            const vr = m.vr * 1.6 + m.tiltX * 0.85 + motionTime * 0.36 + seed;
+            drawLayer(
+              vc.baseAtlas,
+              vc.basePos.x,
+              vc.basePos.y,
+              m.vx,
+              m.vy,
+              w,
+              h,
+              m.vr,
+              m.tiltX,
+              m.tiltY,
+              hoverFac,
+              SHADER_MODE.VOUCHER,
+              vr,
+              effectY,
+              m.dissolve,
+              false,
+              white,
+              1.0
+            );
+          } else if (vc.floatingGlow === 'black_hole') {
+            const br = m.vr * 1.5 + m.tiltX * 0.8 + motionTime * 0.42 + seed;
+            drawLayer(
+              vc.baseAtlas,
+              vc.basePos.x,
+              vc.basePos.y,
+              m.vx,
+              m.vy,
+              w,
+              h,
+              m.vr,
+              m.tiltX,
+              m.tiltY,
+              hoverFac,
+              SHADER_MODE.NEGATIVE_SHINE,
+              br,
+              effectY,
+              m.dissolve,
+              false,
+              [0.88, 0.72, 1.0, 0.92],
+              1.0
+            );
+          } else if (vc.enhancement === 'm_glass') {
+            activeShaderSet.add('glass_shimmer');
+            drawLayer(
+              vc.baseAtlas,
+              vc.basePos.x,
+              vc.basePos.y,
+              m.vx,
+              m.vy,
+              w,
+              h,
+              m.vr,
+              m.tiltX,
+              m.tiltY,
+              hoverFac,
+              SHADER_MODE.GLASS_SHIMMER,
+              effectX,
+              effectY,
+              m.dissolve,
+              false,
+              white,
+              1.0
+            );
+          } else if (vc.enhancement === 'm_steel') {
+            activeShaderSet.add('steel_metallic');
+            drawLayer(
+              vc.baseAtlas,
+              vc.basePos.x,
+              vc.basePos.y,
+              m.vx,
+              m.vy,
+              w,
+              h,
+              m.vr,
+              m.tiltX,
+              m.tiltY,
+              hoverFac,
+              SHADER_MODE.STEEL_METALLIC,
+              effectX,
+              effectY,
+              m.dissolve,
+              false,
+              white,
+              1.0
+            );
+          } else if (vc.enhancement === 'm_gold') {
+            activeShaderSet.add('gold_foil');
+            drawLayer(
+              vc.baseAtlas,
+              vc.basePos.x,
+              vc.basePos.y,
+              m.vx,
+              m.vy,
+              w,
+              h,
+              m.vr,
+              m.tiltX,
+              m.tiltY,
+              hoverFac,
+              SHADER_MODE.GOLD_FOIL,
+              effectX,
+              effectY,
+              m.dissolve,
+              false,
+              white,
+              1.0
+            );
+          } else if (vc.enhancement === 'm_wild') {
+            drawLayer(
+              vc.baseAtlas,
+              vc.basePos.x,
+              vc.basePos.y,
+              m.vx,
+              m.vy,
+              w,
+              h,
+              m.vr,
+              m.tiltX,
+              m.tiltY,
+              hoverFac,
+              SHADER_MODE.COSMIC_SHEEN,
+              effectX,
+              1.0, // prismatic rainbow flag
+              m.dissolve,
+              false,
+              [1.0, 1.0, 1.0, 0.72],
+              1.0
+            );
+          } else if (vc.enhancement === 'm_lucky') {
+            drawLayer(
+              vc.baseAtlas,
+              vc.basePos.x,
+              vc.basePos.y,
+              m.vx,
+              m.vy,
+              w,
+              h,
+              m.vr,
+              m.tiltX,
+              m.tiltY,
+              hoverFac,
+              SHADER_MODE.COSMIC_SHEEN,
+              effectX,
+              0.0,
+              m.dissolve,
+              false,
+              [0.42, 1.0, 0.62, 0.72],
+              1.0
+            );
+          } else if (vc.enhancement === 'm_bonus') {
+            drawLayer(
+              vc.baseAtlas,
+              vc.basePos.x,
+              vc.basePos.y,
+              m.vx,
+              m.vy,
+              w,
+              h,
+              m.vr,
+              m.tiltX,
+              m.tiltY,
+              hoverFac,
+              SHADER_MODE.COSMIC_SHEEN,
+              effectX,
+              0.0,
+              m.dissolve,
+              false,
+              [0.28, 0.80, 1.0, 0.56],
+              1.0
+            );
+          } else if (vc.enhancement === 'm_mult') {
+            drawLayer(
+              vc.baseAtlas,
+              vc.basePos.x,
+              vc.basePos.y,
+              m.vx,
+              m.vy,
+              w,
+              h,
+              m.vr,
+              m.tiltX,
+              m.tiltY,
+              hoverFac,
+              SHADER_MODE.COSMIC_SHEEN,
+              effectX,
+              0.0,
+              m.dissolve,
+              false,
+              [1.0, 0.44, 0.36, 0.56],
+              1.0
+            );
+          } else if (vc.consumableSet && vc.edition === 'none' && !vc.soulPos) {
+            const setTint: Rgba =
+              vc.consumableSet === 'Planet'
+                ? [0.36, 0.88, 1.0, 0.80]
+                : vc.consumableSet === 'Spectral'
+                  ? [0.56, 0.72, 1.0, 0.90]
+                  : [0.96, 0.76, 1.0, 0.66];
+            drawLayer(
+              vc.baseAtlas,
+              vc.basePos.x,
+              vc.basePos.y,
+              m.vx,
+              m.vy,
+              w,
+              h,
+              m.vr,
+              m.tiltX,
+              m.tiltY,
+              hoverFac,
+              SHADER_MODE.COSMIC_SHEEN,
+              effectX,
+              vc.consumableSet === 'Spectral' ? 1.0 : 0.0,
+              m.dissolve,
+              false,
+              setTint,
+              1.0
+            );
+          } else if (vc.edition === 'none') {
+            // Subtle tilt-reactive laminated card-stock gloss on ALL normal cards & royal holo-glint on Title Ace!
+            const isTitleAce = vc.kind === 'title_showcase';
+            const glossAlpha = isTitleAce
+              ? 0.84
+              : m.dragging
+                ? 0.58
+                : m.hovered
+                  ? 0.52
+                  : vc.selected
+                    ? 0.30
+                    : vc.kind === 'joker' || vc.kind === 'shop_offer' || vc.kind === 'pack_card'
+                      ? 0.25
+                      : 0.15;
+            const holoHint = isTitleAce ? 0.78 : vc.kind === 'joker' ? 0.18 : 0.0;
+            if (glossAlpha > 0.05) {
+              drawLayer(
+                vc.baseAtlas,
+                vc.basePos.x,
+                vc.basePos.y,
+                m.vx,
+                m.vy,
+                w,
+                h,
+                m.vr,
+                m.tiltX,
+                m.tiltY,
+                hoverFac,
+                SHADER_MODE.CARD_GLOSS,
+                effectX,
+                holoHint,
+                m.dissolve,
+                false,
+                [1, 1, 1, glossAlpha],
+                cropH
+              );
+            }
+          }
         }
 
-        // 5. Wax Seal Overlay (Gold seal uses gold_seal.fs shimmer!)
+        // 5. Wax Seal Overlay (Gold seal blazes with molten gold_seal.fs; other seals get crisp gleam!)
         if (vc.sealPos) {
           const sealMode = vc.seal === 'Gold' ? SHADER_MODE.GOLD_SEAL : SHADER_MODE.BASE;
           if (sealMode === SHADER_MODE.GOLD_SEAL) activeShaderSet.add('gold_seal');
@@ -1391,8 +2024,31 @@ export class WebGL2Renderer {
             m.dissolve,
             false,
             white,
-            1.0
+            1.0,
+            trigGlow
           );
+          if (vc.seal && vc.seal !== 'Gold' && !vc.faceDown) {
+            drawLayer(
+              'centers',
+              vc.sealPos.x,
+              vc.sealPos.y,
+              m.vx,
+              m.vy,
+              w,
+              h,
+              m.vr,
+              m.tiltX,
+              m.tiltY,
+              hoverFac,
+              SHADER_MODE.CARD_GLOSS,
+              effectX * 1.2,
+              0.2,
+              m.dissolve,
+              false,
+              [1, 1, 1, 0.55],
+              1.0
+            );
+          }
         }
 
         // 6. Stickers (Eternal / Perishable / Rental)
@@ -1421,9 +2077,9 @@ export class WebGL2Renderer {
       }
     }
 
-    // --- PASS 3B: CRISP PIXEL-SQUARE / PIXEL-DIAMOND PARTICLES (1 Instanced Draw Call) ---
+    // --- PASS 3B: CRISP TABLE PIXEL PARTICLES (1 Instanced Draw Call) ---
     if (this.particleProg && this.particleVao && this.particleInstanceVbo && frame.particles) {
-      const { data, count } = frame.particles.packInstanceData();
+      const { data, count } = frame.particles.packInstanceData(this.hudCanvas ? 'table' : undefined);
       if (count > 0) {
         activeShaderSet.add('particles');
         gl.useProgram(this.particleProg);
@@ -1441,7 +2097,7 @@ export class WebGL2Renderer {
       }
     }
 
-    // --- PASS 3C: SUBTLE IMPACT RADIAL PIXEL FLASH (flash.fs) ---
+    // --- PASS 3C: IMPACT RADIAL PIXEL FLASH (flash.fs) ---
     const impactFlash = frame.settings.reducedMotion ? 0 : (frame.screenFlash ?? 0);
     if (this.flashProg && impactFlash > 0.005) {
       activeShaderSet.add('flash');
@@ -1456,10 +2112,15 @@ export class WebGL2Renderer {
       drawCalls++;
     }
 
-    // --- PASS 4: SCREEN VORTEX WARP (vortex.fs) + TUNED CRT POST-PASS (CRT.fs) ---
+    // --- PASS 4: LUMINOUS SPECULAR BLOOM + TUNED CRT POST-PASS ---
     if (usePostFbo && this.crtProg && this.sceneTex) {
       if (useCrt) activeShaderSet.add('CRT');
       if (vortexStrength > 0.001) activeShaderSet.add('vortex');
+
+      const bloomBoost = Math.min(
+        1.0,
+        flameHeat * 0.65 + (shinyCardsCount > 0 ? 0.35 : 0.15) + impactFlash * 0.5
+      );
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, pw, ph);
@@ -1472,13 +2133,16 @@ export class WebGL2Renderer {
       gl.uniform2f(u.crt.res, pw, ph);
       gl.uniform1f(u.crt.time, frame.timeSec);
       gl.uniform1f(u.crt.crtAmount, useCrt ? frame.settings.crtAmount / 100 : 0);
-      // Keep full-screen Pass 4 un-twisted so WebGL2 cards stay 100% locked onto DOM buttons
       gl.uniform1f(u.crt.vortexStrength, 0.0);
       gl.uniform1f(u.crt.vortexAmt, 0.0);
       gl.uniform1f(u.crt.glitchIntensity, this.glitchIntensity);
+      gl.uniform1f(u.crt.bloomBoost, bloomBoost);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       drawCalls++;
     }
+
+    // --- PASS 3 (HIGH-Z OVERLAY): UNOBSTRUCTED ROARING HUD FLAMES + RISING HUD EMBERS ---
+    drawCalls += this.renderHudFlameOverlay(frame, shakeX, shakeY, activeShaderSet);
 
     this.lastDrawCalls = drawCalls;
     this.lastActiveShaders = Array.from(activeShaderSet);
@@ -1545,9 +2209,9 @@ export class WebGL2Renderer {
       ctx.restore();
     }
 
-    // Crisp pixel particles fallback
     if (frame.particles) {
       for (const p of frame.particles.getParticles()) {
+        if (this.hudCanvas && p.layer === 'hud') continue;
         const t = Math.min(1, p.age / Math.max(0.001, p.lifetime));
         const a = p.alpha * (t > 0.65 ? Math.max(0, 1 - (t - 0.65) / 0.35) : 1);
         const sz = p.size + (p.endSize - p.size) * t;
@@ -1585,6 +2249,7 @@ export class WebGL2Renderer {
   }
 
   dispose(): void {
+    this.detachHudFlameCanvas();
     this.canvas.removeEventListener('webglcontextlost', this.boundContextLost, false);
     this.canvas.removeEventListener('webglcontextrestored', this.boundContextRestored, false);
     const gl = this.gl;

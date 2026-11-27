@@ -1,14 +1,15 @@
 // ============================================================================
-// Krunked Cards — Score Choreographer
+// Krunked Cards — Score Choreographer (Visual Juice++)
 // Steps sequentially through SimState ScoreBeat[] scaled by settings.gameSpeed,
-// triggers Moveable.juiceUp(), spawns crisp floating colored score pills,
-// emits crisp pixel particles, triggers subtle impact flash & micro-shake on
-// big XMult / Boss / Glass shatter beats, ramps roaring flame intensity
-// (log5 spring), fires pitch-escalating SFX, and triggers FINISH_SCORING cleanly.
+// triggers Moveable.juiceUp() & radiant triggerGlow flashes, spawns crisp
+// floating colored score pills, emits chromatic sparkle stars & particles,
+// triggers explosive roaring scoreboard flame ignitions & XMult flame surges,
+// fires pitch-escalating SFX, and triggers FINISH_SCORING cleanly.
 // ============================================================================
 
 import {
   PALETTE,
+  type EditionId,
   type GameSpeed,
   type IAudioEngine,
   type ScoreBeat,
@@ -16,7 +17,7 @@ import {
   type SoundKey,
 } from '../contracts/index.ts';
 import type { CardSceneManager } from './Moveable.ts';
-import type { ParticleSystem } from './ParticleSystem.ts';
+import type { ParticleFlameAnchors, ParticleSystem } from './ParticleSystem.ts';
 
 export interface FloatingPopup {
   id: number;
@@ -51,6 +52,7 @@ export interface ChoreographerDisplay {
   screenFlashColor?: [number, number, number];
   shakeX?: number;
   shakeY?: number;
+  flameFlare?: number;
 }
 
 const FAST_FORWARD_MULTIPLIER = 2.6;
@@ -76,6 +78,9 @@ export class ScoreChoreographer {
 
   private flameIntensity = 0;
   private targetFlameIntensity = 0;
+  private flameFlare = 0;
+  private flameIgnitedThisHand = false;
+  private lastFlameAnchor: ParticleFlameAnchors | null = null;
   private chipsPulse = 0;
   private multPulse = 0;
 
@@ -107,6 +112,10 @@ export class ScoreChoreographer {
     this.onGlitchImpulse = cb;
   }
 
+  setFlameAnchor(anchor: ParticleFlameAnchors | null): void {
+    this.lastFlameAnchor = anchor;
+  }
+
   setFastForward(active: boolean): void {
     this.fastForward = Boolean(active);
   }
@@ -124,12 +133,12 @@ export class ScoreChoreographer {
     this.screenFlash = Math.min(1, Math.max(this.screenFlash, amount));
     this.screenFlashColor = color;
     if (shake > 0) {
-      this.shakeMag = Math.min(10, Math.max(this.shakeMag, shake));
+      this.shakeMag = Math.min(12, Math.max(this.shakeMag, shake));
     }
   }
 
   /**
-   * Celebratory hand level-up burst: cyan/purple sparkle particles,
+   * Celebratory hand level-up burst: cyan/purple sparkle stars,
    * crisp `LEVEL UP!` popup (clamped mobile-safe), and optional shimmer SFX.
    */
   triggerLevelUpCelebration(
@@ -141,9 +150,10 @@ export class ScoreChoreographer {
     const pos = this.clampPopupPos(x, y);
     const compact = this.isCompactViewport();
 
-    this.particles?.emitStarBurst(pos.x, pos.y, '#4ce6ff', 1.25);
+    this.particles?.emitStarBurst(pos.x, pos.y, '#4ce6ff', 1.35);
+    this.particles?.emitHoloSparkle(pos.x, pos.y, 'e_holo', 1.25);
     this.particles?.emitAccentBurst(pos.x, pos.y, 'purple');
-    this.triggerImpactFlash(0.24, [0.46, 0.86, 1.0], 2.2);
+    this.triggerImpactFlash(0.28, [0.46, 0.86, 1.0], 2.5);
 
     const cleanLabel = typeof handLabel === 'string' ? handLabel.trim() : '';
     this.spawnPopup('LEVEL UP!', pos.x, pos.y, PALETTE.PURPLE, '#ffffff', 1.25, {
@@ -171,7 +181,7 @@ export class ScoreChoreographer {
   triggerRoundClearBurst(x: number, y: number): void {
     const pos = this.clampPopupPos(x, y);
     this.particles?.triggerRoundClearBurst(pos.x, pos.y);
-    this.triggerImpactFlash(0.3, [1.0, 0.92, 0.58], 3.2);
+    this.triggerImpactFlash(0.36, [1.0, 0.92, 0.54], 3.8);
   }
 
   isActive(): boolean {
@@ -179,7 +189,7 @@ export class ScoreChoreographer {
   }
 
   getFlameIntensity(): number {
-    return this.flameIntensity;
+    return Math.min(10, this.flameIntensity + this.flameFlare);
   }
 
   getDisplay(): ChoreographerDisplay {
@@ -187,13 +197,14 @@ export class ScoreChoreographer {
       this.active && this.beats.length > 0
         ? Math.min(1, Math.max(0, (this.beatIndex + 1) / this.beats.length))
         : 0;
+    const effectiveFlame = Math.min(10, this.flameIntensity + this.flameFlare);
     return {
       active: this.active,
       displayChips: Math.round(this.displayChips),
       displayMult: Math.round(this.displayMult * 100) / 100,
       displayHandScore: this.displayHandScore,
       handName: this.handName,
-      flameIntensity: this.flameIntensity,
+      flameIntensity: effectiveFlame,
       popups: this.popups,
       activeSourceId: this.activeSourceId,
       chipsPulse: this.chipsPulse,
@@ -204,6 +215,7 @@ export class ScoreChoreographer {
       screenFlashColor: this.screenFlashColor,
       shakeX: this.shakeX,
       shakeY: this.shakeY,
+      flameFlare: this.flameFlare,
     };
   }
 
@@ -229,6 +241,8 @@ export class ScoreChoreographer {
     this.handName = state.lastHandName;
     this.displayHandScore = null;
     this.activeSourceId = null;
+    this.flameIgnitedThisHand = false;
+    this.flameFlare = 0;
 
     const first = beats[0];
     this.displayChips = first ? first.chipsAfter : state.currentHandChips;
@@ -245,6 +259,23 @@ export class ScoreChoreographer {
     this.advanceBeat(state, scene, audio);
   }
 
+  /**
+   * Soft transition when leaving SCORING into CASHOUT / PLAYING: lets roaring
+   * flames fade out gracefully over ~0.45s instead of snapping off abruptly.
+   */
+  endScoringSoft(): void {
+    this.beats = [];
+    this.beatIndex = -1;
+    this.beatTimerMs = 0;
+    this.active = false;
+    this.fastForward = false;
+    this.fastForwardMul = 1;
+    this.finishedCallback = null;
+    this.activeSourceId = null;
+    this.targetFlameIntensity = 0;
+    this.lastPlayedBeatKey = '';
+  }
+
   reset(): void {
     this.beats = [];
     this.beatIndex = -1;
@@ -257,6 +288,8 @@ export class ScoreChoreographer {
     this.activeSourceId = null;
     this.flameIntensity = 0;
     this.targetFlameIntensity = 0;
+    this.flameFlare = 0;
+    this.flameIgnitedThisHand = false;
     this.screenFlash = 0;
     this.shakeMag = 0;
     this.shakeX = 0;
@@ -283,13 +316,13 @@ export class ScoreChoreographer {
       subtext: opts?.subtext,
       x: pos.x,
       y: pos.y,
-      vy: opts?.vy ?? (compact ? -30 : -42),
+      vy: opts?.vy ?? (compact ? -30 : -44),
       bgColor,
       textColor,
       age: 0,
       lifetime,
       scale: opts?.scale ?? (compact ? 0.84 : 1),
-      rotation: (Math.random() - 0.5) * (compact ? 0.08 : 0.12),
+      rotation: (Math.random() - 0.5) * (compact ? 0.08 : 0.14),
     });
     while (this.popups.length > maxPopups) {
       this.popups.shift();
@@ -327,49 +360,75 @@ export class ScoreChoreographer {
     if (Math.abs(this.targetMultVal - this.displayMult) < 0.005) {
       this.displayMult = this.targetMultVal;
     }
-    this.chipsPulse = Math.max(0, this.chipsPulse - safeDt * 3.8);
-    this.multPulse = Math.max(0, this.multPulse - safeDt * 3.8);
+    this.chipsPulse = Math.max(0, this.chipsPulse - safeDt * 3.6);
+    this.multPulse = Math.max(0, this.multPulse - safeDt * 3.6);
 
-    // Decay impact flash & damped micro-shake
-    this.screenFlash = Math.max(0, this.screenFlash - safeDt * 3.6);
+    // Decay impact flash, flame surge flare & damped micro-shake
+    this.screenFlash = Math.max(0, this.screenFlash - safeDt * 3.4);
+    this.flameFlare *= Math.exp(-4.0 * safeDt);
+    if (this.flameFlare < 0.02) this.flameFlare = 0;
+
     if (this.shakeMag > 0.05 && !reducedMotion) {
-      this.shakePhase += safeDt * 58;
+      this.shakePhase += safeDt * 62;
       this.shakeX = Math.sin(this.shakePhase) * this.shakeMag;
       this.shakeY = Math.cos(this.shakePhase * 1.37) * this.shakeMag * 0.72;
-      this.shakeMag *= Math.exp(-14 * safeDt);
+      this.shakeMag *= Math.exp(-13.5 * safeDt);
     } else {
       this.shakeMag = 0;
       this.shakeX = 0;
       this.shakeY = 0;
     }
 
-    // Update flame roar intensity (`log5` scale whenever hand score beats target!)
+    // Update roaring flame intensity whenever hand beats target (or finishes off blind!)
+    // Note: SimEngine adds state.lastHandScore into state.roundChips synchronously at PLAY_HAND,
+    // so compute preHandRoundChips to prevent false flame ignition on beat 0 before cards score!
     const earned = this.active
       ? Math.floor(this.targetChipsVal * this.targetMultVal)
       : state.currentHandChips * state.currentHandMult;
     const req = state.targetChips;
+    const preHandRoundChips = this.active
+      ? Math.max(0, state.roundChips - (state.lastHandScore || 0))
+      : state.roundChips;
+    const inScoring = this.active || state.phase === 'SCORING';
 
-    if (
-      (this.active || state.phase === 'SCORING') &&
-      req > 0 &&
-      earned >= req
-    ) {
-      // Exact log5 intensity ramp matching scoreboard roar
+    if (inScoring && req > 0 && earned >= req) {
+      // Dramatic log5 intensity curve: 1x target immediately blazes (~3.0),
+      // 3x+ roars high (~5.5), 10x+ turns into a towering solar/plasma inferno (8..10)!
       const ratio = earned / Math.max(1, req);
       this.targetFlameIntensity = Math.min(
         10,
-        Math.max(1.2, (Math.log(1 + ratio * 4) / Math.log(5)) * 2.2)
+        Math.max(2.6, 1.9 + (Math.log(1 + ratio * 5) / Math.log(5)) * 2.45)
       );
+      if (!this.flameIgnitedThisHand) {
+        this.flameIgnitedThisHand = true;
+        this.triggerFlameIgnitionJuice(this.targetFlameIntensity);
+      }
+    } else if (
+      inScoring &&
+      req > 0 &&
+      preHandRoundChips > 0 &&
+      preHandRoundChips + earned >= req
+    ) {
+      // Finishing hand that defeats the blind: victorious warm roar!
+      const over = (preHandRoundChips + earned - req) / Math.max(1, req);
+      this.targetFlameIntensity = Math.min(4.2, 2.0 + Math.min(2.2, over * 2.0));
+      if (!this.flameIgnitedThisHand) {
+        this.flameIgnitedThisHand = true;
+        this.triggerFlameIgnitionJuice(this.targetFlameIntensity);
+      }
     } else {
       this.targetFlameIntensity = 0;
     }
 
-    const flameLerp = 1 - Math.exp(-5.5 * safeDt);
+    // Fast explosive rise on ignition, smooth cinematic cool-down on fadeout
+    const flameRate = this.targetFlameIntensity > this.flameIntensity ? 11.5 : 3.8;
+    const flameLerp = 1 - Math.exp(-flameRate * safeDt);
     this.flameIntensity += (this.targetFlameIntensity - this.flameIntensity) * flameLerp;
     if (this.flameIntensity < 0.02 && this.targetFlameIntensity === 0) {
       this.flameIntensity = 0;
     }
-    audio.setFireIntensity(Math.min(1, this.flameIntensity / 6));
+    const effectiveFlame = Math.min(10, this.flameIntensity + this.flameFlare);
+    audio.setFireIntensity(Math.min(1, effectiveFlame / 5.2));
 
     // Step floating popups & enforce mobile-safe viewport clamping continuously
     const effectiveSpeed = Math.min(MAX_EFFECTIVE_SPEED, Math.max(0.25, gameSpeed) * this.fastForwardMul);
@@ -393,6 +452,24 @@ export class ScoreChoreographer {
     this.beatTimerMs -= safeDt * 1000 * effectiveSpeed;
     if (this.beatTimerMs <= 0) {
       this.advanceBeat(state, scene, audio);
+    }
+  }
+
+  private triggerFlameIgnitionJuice(intensity: number): void {
+    this.flameFlare = Math.min(3.0, Math.max(this.flameFlare, 1.8 + intensity * 0.16));
+    this.chipsPulse = Math.max(this.chipsPulse, 1.25);
+    this.multPulse = Math.max(this.multPulse, 1.25);
+    this.triggerImpactFlash(
+      Math.min(0.42, 0.22 + intensity * 0.025),
+      [1.0, 0.56, 0.20],
+      Math.min(6.5, 3.0 + intensity * 0.45)
+    );
+    if (this.lastFlameAnchor) {
+      this.particles?.emitFlameIgnitionBurst(
+        this.lastFlameAnchor.chipsRect,
+        this.lastFlameAnchor.multRect,
+        intensity
+      );
     }
   }
 
@@ -424,7 +501,7 @@ export class ScoreChoreographer {
   }
 
   private advanceBeat(
-    _state: SimState,
+    state: SimState,
     scene: CardSceneManager,
     audio: IAudioEngine
   ): void {
@@ -440,16 +517,46 @@ export class ScoreChoreographer {
     this.targetMultVal = beat.multAfter;
     this.activeSourceId = beat.sourceId ?? null;
 
-    if (beat.chipsDelta && beat.chipsDelta !== 0) this.chipsPulse = 1;
+    if (beat.chipsDelta && beat.chipsDelta !== 0) {
+      this.chipsPulse = beat.chipsDelta >= 50 ? 1.25 : 1.0;
+    }
     if ((beat.multDelta && beat.multDelta !== 0) || (beat.xMult && beat.xMult !== 1)) {
-      this.multPulse = 1;
+      this.multPulse = beat.xMult && beat.xMult >= 2 ? 1.35 : 1.05;
     }
 
     if (beat.kind === 'hand_total' || beat.kind === 'blind_clear') {
       this.displayHandScore = Math.floor(beat.chipsAfter * beat.multAfter);
     }
 
-    // Juice the source card / joker / consumable
+    // Check immediate flame ignition / surge right on the beat so flames erupt on-beat!
+    const beatEarned = Math.floor(beat.chipsAfter * beat.multAfter);
+    const req = state.targetChips;
+    const preHandRoundChips = Math.max(0, state.roundChips - (state.lastHandScore || 0));
+    const beatsTarget =
+      req > 0 &&
+      (beatEarned >= req || (preHandRoundChips > 0 && preHandRoundChips + beatEarned >= req));
+    if (beatsTarget) {
+      if (!this.flameIgnitedThisHand) {
+        this.flameIgnitedThisHand = true;
+        const ratio = beatEarned / Math.max(1, req);
+        const estInt = beatEarned >= req
+          ? Math.min(10, Math.max(2.6, 1.9 + (Math.log(1 + ratio * 5) / Math.log(5)) * 2.45))
+          : 2.2;
+        this.triggerFlameIgnitionJuice(estInt);
+      } else if (beat.xMult && beat.xMult >= 1.5) {
+        // Every XMult hit while on fire sends a dramatic surge up the flames!
+        this.flameFlare = Math.min(3.2, this.flameFlare + Math.min(2.0, 0.7 + beat.xMult * 0.32));
+        if (this.lastFlameAnchor) {
+          this.particles?.emitFlameIgnitionBurst(
+            this.lastFlameAnchor.chipsRect,
+            this.lastFlameAnchor.multRect,
+            Math.min(10, this.flameIntensity + this.flameFlare)
+          );
+        }
+      }
+    }
+
+    // Juice the source card / joker / consumable + radiant trigger glow flash
     const nowSec = performance.now() / 1000;
     const geom = scene.getGeometry();
     this.syncViewport(geom.viewportW, geom.viewportH);
@@ -461,17 +568,22 @@ export class ScoreChoreographer {
     let popupX = emitX;
     let popupY = geom.playArea.y + geom.playArea.h * 0.36;
     let spawnBelow = false;
+    let sourceEdition: EditionId = 'none';
 
     if (beat.sourceId) {
       const vc = scene.getVisualCardById(beat.sourceId);
       if (vc) {
+        sourceEdition = vc.edition;
         const juiceAmt =
           beat.kind === 'retrigger'
-            ? 0.52
+            ? 0.56
             : beat.xMult && beat.xMult >= 2
-              ? 0.50
-              : 0.42;
+              ? 0.58
+              : beat.kind === 'edition_trigger'
+                ? 0.52
+                : 0.44;
         vc.moveable.juiceUp(juiceAmt, undefined, nowSec);
+        vc.moveable.flashTrigger(beat.xMult && beat.xMult >= 2 ? 1.0 : 0.85);
         if (beat.kind === 'card_shatter') {
           vc.moveable.dissolve = 0.85;
         }
@@ -511,52 +623,78 @@ export class ScoreChoreographer {
     popupX = clampedPopup.x;
     popupY = clampedPopup.y;
 
-    // Emit crisp pixel particles & subtle impact flash / micro-shake
+    // Emit crisp pixel particles, chromatic holo sparkles & impact flash / micro-shake
     if (beat.kind === 'card_shatter') {
       this.particles?.emitGlassShatter(emitX, emitY);
-      this.triggerImpactFlash(0.45, [0.76, 0.96, 1.0], 6.5);
-      this.onGlitchImpulse?.(0.65);
+      this.triggerImpactFlash(0.48, [0.76, 0.96, 1.0], 7.0);
+      this.onGlitchImpulse?.(0.68);
     } else if (beat.kind === 'boss_debuff' || beat.kind === 'boss_modify') {
-      this.particles?.emitMultBurst(emitX, emitY, false, 1.1);
-      this.triggerImpactFlash(0.35, [0.95, 0.25, 0.28], 5.0);
+      this.particles?.emitMultBurst(emitX, emitY, false, 1.15);
+      this.triggerImpactFlash(0.36, [0.95, 0.25, 0.28], 5.2);
       this.onGlitchImpulse?.(0.55);
     } else if (beat.kind === 'retrigger') {
       this.particles?.emitAccentBurst(emitX, emitY, 'orange');
+      this.particles?.emitStarBurst(emitX, emitY, PALETTE.ORANGE, 0.85);
     } else if (beat.kind === 'plasma_balance') {
       this.particles?.emitAccentBurst(emitX, emitY, 'purple');
-      this.triggerImpactFlash(0.32, [0.72, 0.55, 1.0], 3.5);
+      this.particles?.emitHoloSparkle(emitX, emitY, 'e_holo', 1.3);
+      this.triggerImpactFlash(0.36, [0.72, 0.55, 1.0], 4.0);
     } else if (beat.kind === 'blind_clear') {
       this.triggerRoundClearBurst(emitX, emitY);
     } else if (beat.kind === 'mr_bones_save') {
-      this.particles?.emitStarBurst(emitX, emitY, PALETTE.GOLD, 1.3);
-      this.triggerImpactFlash(0.35, [1.0, 0.88, 0.48], 3.5);
+      this.particles?.emitStarBurst(emitX, emitY, PALETTE.GOLD, 1.4);
+      this.triggerImpactFlash(0.38, [1.0, 0.88, 0.48], 3.8);
+    } else if (beat.kind === 'edition_trigger') {
+      const edTheme: EditionId =
+        sourceEdition !== 'none'
+          ? sourceEdition
+          : beat.xMult
+            ? 'e_polychrome'
+            : beat.multDelta
+              ? 'e_holo'
+              : 'e_foil';
+      this.particles?.emitHoloSparkle(emitX, emitY, edTheme, beat.xMult ? 1.6 : 1.25);
+      if (beat.xMult && beat.xMult !== 1) {
+        this.particles?.emitMultBurst(emitX, emitY, true, 1.4);
+        this.triggerImpactFlash(0.30, [0.95, 0.56, 1.0], 4.2);
+      } else if (beat.multDelta && beat.multDelta !== 0) {
+        this.particles?.emitMultBurst(emitX, emitY, false, 1.2);
+        this.triggerImpactFlash(0.22, [0.98, 0.42, 0.86], 2.6);
+      } else if (beat.chipsDelta && beat.chipsDelta !== 0) {
+        this.particles?.emitChipsBurst(emitX, emitY, 1.4);
+        this.triggerImpactFlash(0.20, [0.46, 0.84, 1.0], 2.4);
+      }
     } else {
       if (beat.xMult && beat.xMult !== 1) {
-        const multWeight = Math.min(2.5, Math.max(1, beat.xMult * 0.65));
+        const multWeight = Math.min(2.8, Math.max(1.1, beat.xMult * 0.72));
         this.particles?.emitMultBurst(emitX, emitY, true, multWeight);
-        if (beat.xMult >= 2) {
+        if (beat.xMult >= 1.5) {
           this.particles?.emitStarBurst(
             emitX,
             emitY,
             beat.xMult >= 3 ? '#ffd859' : PALETTE.MULT,
-            Math.min(1.6, 0.75 + beat.xMult * 0.2)
+            Math.min(1.85, 0.85 + beat.xMult * 0.24)
           );
-        }
-        if (beat.xMult >= 1.5) {
+          if (sourceEdition !== 'none') {
+            this.particles?.emitHoloSparkle(emitX, emitY, sourceEdition, 1.2);
+          }
           this.triggerImpactFlash(
-            Math.min(0.48, 0.18 + beat.xMult * 0.08),
-            [1.0, 0.42, 0.34],
-            Math.min(7, 2.5 + beat.xMult * 1.1)
+            Math.min(0.50, 0.20 + beat.xMult * 0.085),
+            beat.xMult >= 3 ? [1.0, 0.78, 0.32] : [1.0, 0.42, 0.34],
+            Math.min(8.0, 2.8 + beat.xMult * 1.2)
           );
         }
       } else if (beat.multDelta && beat.multDelta !== 0) {
-        this.particles?.emitMultBurst(emitX, emitY, false, 1);
+        this.particles?.emitMultBurst(emitX, emitY, false, beat.multDelta >= 15 ? 1.4 : 1);
       }
       if (beat.chipsDelta && beat.chipsDelta !== 0) {
-        this.particles?.emitChipsBurst(emitX, emitY, beat.chipsDelta >= 30 ? 1.5 : 1);
+        this.particles?.emitChipsBurst(emitX, emitY, beat.chipsDelta >= 30 ? 1.6 : 1);
       }
       if (beat.dollarsDelta && beat.dollarsDelta > 0) {
-        this.particles?.emitMoneyBurst(emitX, emitY, Math.min(2, 0.8 + beat.dollarsDelta * 0.15));
+        this.particles?.emitMoneyBurst(emitX, emitY, Math.min(2.2, 0.9 + beat.dollarsDelta * 0.16));
+      }
+      if (beat.kind === 'seal_trigger') {
+        this.particles?.emitHoloSparkle(emitX, emitY, 'gold', 1.15);
       }
     }
 

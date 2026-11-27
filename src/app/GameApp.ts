@@ -130,6 +130,7 @@ export class GameApp {
       onReplaySeed: (deckId, stake, seed, challengeId) =>
         this.replaySeed(deckId, stake, seed, challengeId),
     });
+    this.renderer.attachHudFlameCanvas(this.ui.getHudFlameCanvas());
 
     this.input = new InputManager(this.canvas, this.scene, {
       getState: () => this.state,
@@ -447,13 +448,19 @@ export class GameApp {
       if (this.state.phase === 'SCORING') {
         const beats = result.beats.length > 0 ? result.beats : this.state.lastHandBeats;
         this.scoringCardIds = this.computeScoringCardIds(this.state);
+        const seedAnchor = this.ui.getFlameAnchor(3.0);
+        if (seedAnchor) this.choreographer.setFlameAnchor(seedAnchor);
         this.choreographer.start(this.state, beats, this.scene, this.audio, () => {
           if (this.state.phase === 'SCORING') {
             this.dispatch({ type: 'FINISH_SCORING' });
           }
         });
       } else if (prevPhase === 'SCORING') {
-        this.choreographer.reset();
+        if (this.state.phase === 'TITLE') {
+          this.choreographer.reset();
+        } else {
+          this.choreographer.endScoringSoft();
+        }
         this.scoringCardIds = null;
       }
 
@@ -463,11 +470,10 @@ export class GameApp {
         if (this.state.phase === 'PACK_OPEN') {
           this.renderer.triggerVortexPulse(0.65, 4.8);
           const g = this.scene.getGeometry();
-          this.particles.emitAccentBurst(
-            g.packTray.x + g.packTray.w * 0.5,
-            g.packTray.y + g.packTray.h * 0.45,
-            'purple'
-          );
+          const px = g.packTray.x + g.packTray.w * 0.5;
+          const py = g.packTray.y + g.packTray.h * 0.45;
+          this.particles.emitAccentBurst(px, py, 'purple');
+          this.particles.emitHoloSparkle(px, py, 'booster', 1.4);
         } else if (
           this.state.phase === 'PLAYING' &&
           prevPhase === 'BLIND_SELECT' &&
@@ -532,15 +538,19 @@ export class GameApp {
       if (ev.type === 'ROUND_WON') {
         this.choreographer.triggerRoundClearBurst(cx, cy);
       } else if (ev.type === 'ITEM_BOUGHT' || ev.type === 'ITEM_SOLD' || ev.type === 'CASHOUT_COMPLETE') {
-        this.particles.emitMoneyBurst(cx, cy, 1.1);
+        this.particles.emitMoneyBurst(cx, cy, 1.25);
+        if (ev.type === 'ITEM_BOUGHT') {
+          this.particles.emitHoloSparkle(cx, cy, 'gold', 0.9);
+        }
       } else if (ev.type === 'VOUCHER_REDEEMED') {
-        this.particles.emitMoneyBurst(
-          geom.shopVoucherTray.x + geom.shopVoucherTray.w * 0.5,
-          geom.shopVoucherTray.y + geom.shopVoucherTray.h * 0.45,
-          1.4
-        );
+        const vx = geom.shopVoucherTray.x + geom.shopVoucherTray.w * 0.5;
+        const vy = geom.shopVoucherTray.y + geom.shopVoucherTray.h * 0.45;
+        this.particles.emitMoneyBurst(vx, vy, 1.5);
+        this.particles.emitHoloSparkle(vx, vy, 'voucher', 1.45);
+        this.particles.emitStarBurst(vx, vy, '#ffd859', 1.15);
       } else if (ev.type === 'CONSUMABLE_USED') {
         this.particles.emitAccentBurst(cx, cy, 'purple');
+        this.particles.emitHoloSparkle(cx, cy, 'e_holo', 1.15);
       }
     }
   }
@@ -550,14 +560,26 @@ export class GameApp {
     if (card.kind === 'hand') {
       if (this.state.phase === 'PLAYING' || this.state.phase === 'PACK_OPEN') {
         this.ui.dismissInspect();
-        card.moveable.juiceUp(0.28, undefined, nowSec);
+        card.moveable.juiceUp(0.30, undefined, nowSec);
+        if (!card.selected) {
+          if (card.edition !== 'none') {
+            this.particles.emitHoloSparkle(card.moveable.vx, card.moveable.vy, card.edition, 0.72);
+          } else if (card.enhancement === 'm_gold' || card.seal === 'Gold') {
+            this.particles.emitHoloSparkle(card.moveable.vx, card.moveable.vy, 'gold', 0.65);
+          } else if (card.enhancement === 'm_glass') {
+            this.particles.emitHoloSparkle(card.moveable.vx, card.moveable.vy, 'glass', 0.65);
+          }
+        }
         this.audio.playSfx(card.selected ? 'cardSlide2' : 'cardSlide1', {
           pitch: card.selected ? 0.92 : 1.08,
         });
         this.dispatch({ type: 'TOGGLE_SELECT_CARD', cardId: card.id });
       }
     } else if (card.kind === 'joker' || card.kind === 'consumable') {
-      card.moveable.juiceUp(0.32, undefined, nowSec);
+      card.moveable.juiceUp(0.34, undefined, nowSec);
+      if (card.edition !== 'none') {
+        this.particles.emitHoloSparkle(card.moveable.vx, card.moveable.vy, card.edition, 0.8);
+      }
       this.audio.playSfx('highlight1');
       this.ui.setSelectedOwned(card.id);
       if (this.ui.getSelectedOwnedId() === card.id) {
@@ -571,7 +593,14 @@ export class GameApp {
       card.kind === 'shop_booster' ||
       card.kind === 'pack_card'
     ) {
-      card.moveable.juiceUp(0.28, undefined, nowSec);
+      card.moveable.juiceUp(0.30, undefined, nowSec);
+      if (card.edition !== 'none') {
+        this.particles.emitHoloSparkle(card.moveable.vx, card.moveable.vy, card.edition, 0.75);
+      } else if (card.overlayEffect === 'voucher') {
+        this.particles.emitHoloSparkle(card.moveable.vx, card.moveable.vy, 'voucher', 0.7);
+      } else if (card.overlayEffect === 'booster') {
+        this.particles.emitHoloSparkle(card.moveable.vx, card.moveable.vy, 'booster', 0.7);
+      }
       this.audio.playSfx('highlight1');
       this.ui.inspectCard(card, card.moveable.vx, card.moveable.vy, this.state);
     } else if (card.kind === 'deck_pile') {
@@ -580,9 +609,13 @@ export class GameApp {
       this.audio.playSfx('cardFan2');
       this.ui.toggleRunInfo();
     } else if (card.kind === 'title_showcase') {
-      card.moveable.juiceUp(0.45, undefined, nowSec);
-      this.particles.emitChipsBurst(card.moveable.vx, card.moveable.vy, 0.9);
-      this.particles.emitMultBurst(card.moveable.vx, card.moveable.vy, false, 0.8);
+      card.moveable.juiceUp(0.50, undefined, nowSec);
+      card.moveable.flashTrigger(0.95);
+      this.particles.emitHoloSparkle(card.moveable.vx, card.moveable.vy, 'e_polychrome', 1.35);
+      this.particles.emitStarBurst(card.moveable.vx, card.moveable.vy, '#ffd859', 1.0);
+      this.particles.emitChipsBurst(card.moveable.vx, card.moveable.vy, 1.0);
+      this.particles.emitMultBurst(card.moveable.vx, card.moveable.vy, false, 0.9);
+      this.audio.playSfx('polychrome1', { pitch: 1.04, volume: 0.75 });
       this.audio.playSfx('card1');
     }
   }
@@ -722,10 +755,16 @@ export class GameApp {
     this.ui.render(this.state, geom, cards, settings, choreoDisplay, this.elapsedSec);
     this.debugDrawer.update(nowMs);
 
-    // 6. Step crisp pixel particles & render multi-pass WebGL2 frame
+    // 6. Step crisp pixel particles & render multi-pass WebGL2 frame + unobstructed HUD flame overlay
     const activeBlind = getActiveBlind(this.state);
     const bossColor = activeBlind?.slot === 'Boss' ? activeBlind.bossColor : null;
     const flameAnchor = this.ui.getFlameAnchor(choreoDisplay.flameIntensity);
+    if (flameAnchor) {
+      this.choreographer.setFlameAnchor(flameAnchor);
+    } else if (this.state.phase === 'SCORING') {
+      const standbyAnchor = this.ui.getFlameAnchor(2.5);
+      if (standbyAnchor) this.choreographer.setFlameAnchor(standbyAnchor);
+    }
 
     this.particles.update(
       renderDt,
@@ -733,7 +772,8 @@ export class GameApp {
       vh,
       this.state.phase,
       flameAnchor,
-      settings.reducedMotion
+      settings.reducedMotion,
+      cards
     );
 
     this.renderer.render({
@@ -751,6 +791,7 @@ export class GameApp {
       screenFlashColor: choreoDisplay.screenFlashColor,
       shakeX: choreoDisplay.shakeX,
       shakeY: choreoDisplay.shakeY,
+      activeSourceId: choreoDisplay.activeSourceId,
     });
   }
 
