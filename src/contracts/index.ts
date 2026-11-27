@@ -159,6 +159,7 @@ export type SortMode = 'rank' | 'suit';
 export type ArtPackMode = 'builtin' | 'custom';
 export type GameSpeed = 0.5 | 1 | 2 | 4;
 export type TargetFps = 30 | 60 | 120;
+export type LayoutMode = 'desktop' | 'mobile-landscape' | 'mobile-portrait';
 
 export type GamePhase =
   | 'TITLE'
@@ -913,6 +914,21 @@ export const DEFAULT_SETTINGS: RenderSettings = {
   },
 };
 
+export interface RunHistoryEntry {
+  id: string;
+  finishedAt: string;
+  won: boolean;
+  deckId: string;
+  stake: StakeLevel;
+  challengeId: string | null;
+  seed: string;
+  ante: number;
+  round: number;
+  bestHand: number;
+  jokerKeys: string[];
+  defeatedBy: string | null;
+}
+
 export interface ProfileProgress {
   discoveredJokers: string[];
   discoveredConsumables: string[];
@@ -924,6 +940,7 @@ export interface ProfileProgress {
   bestHandScore: number;
   runsPlayed: number;
   runsWon: number;
+  runHistory?: RunHistoryEntry[];
 }
 
 export interface SaveData {
@@ -1062,6 +1079,52 @@ export interface HandPreview {
   baseMult: number;
   level: number;
   scoringCardIds: string[];
+}
+
+export interface BossWarningInfo {
+  severity: 'block' | 'warn' | 'info';
+  bossName: string;
+  message: string;
+}
+
+export interface ConsumablePreviewInfo {
+  headline: string;
+  detail: string;
+  canUseNow: boolean;
+  reason?: string;
+}
+
+export interface JokerLiveMeta {
+  blueprintCompat: boolean;
+  copyingName?: string;
+  copyingCompatible?: boolean;
+  statusBadge?: string;
+  statusColor?: string;
+}
+
+export interface DeckCellStats {
+  total: number;
+  remaining: number;
+  enhanced: number;
+  editioned: number;
+  sealed: number;
+}
+
+export interface DeckBreakdown {
+  total: number;
+  remaining: number;
+  suitTotals: Record<Suit, number>;
+  suitRemaining: Record<Suit, number>;
+  rankTotals: Record<Rank, number>;
+  rankRemaining: Record<Rank, number>;
+  matrix: Record<Suit, Record<Rank, DeckCellStats>>;
+  faceRemaining: number;
+  faceTotal: number;
+  enhancedTotal: number;
+  editionedTotal: number;
+  sealedTotal: number;
+  stoneTotal: number;
+  stoneRemaining: number;
 }
 
 export interface IAudioEngine {
