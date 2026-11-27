@@ -84,7 +84,8 @@ function clamp(v: number, lo: number, hi: number): number {
 
 export class MusicSequencer {
   private activeTrack: MusicTrackId = 'music1';
-  private intensity = 0.5;
+  private targetIntensity = 0.5;
+  private currentIntensity = 0.5;
   private started = false;
   private disposed = false;
 
@@ -326,8 +327,23 @@ export class MusicSequencer {
   setActiveTrack(track: MusicTrackId, intensity?: number): void {
     this.activeTrack = track;
     if (intensity !== undefined && Number.isFinite(intensity)) {
-      this.intensity = clamp(intensity, 0, 1);
+      this.targetIntensity = clamp(intensity, 0, 1);
     }
+  }
+
+  setIntensity(intensity: number): void {
+    if (Number.isFinite(intensity)) {
+      this.targetIntensity = clamp(intensity, 0, 1);
+    }
+  }
+
+  getIntensity(): number {
+    return this.currentIntensity;
+  }
+
+  resyncClock(): void {
+    if (!this.started || this.disposed) return;
+    this.nextStepTime = this.ctx.currentTime + 0.04;
   }
 
   setMusicMix(mix: number): void {
@@ -374,6 +390,22 @@ export class MusicSequencer {
     this.currentFireIntensity += (this.targetFireIntensity - this.currentFireIntensity) * fireLerp;
     if (this.currentFireIntensity < 0.001 && this.targetFireIntensity === 0) {
       this.currentFireIntensity = 0;
+    }
+
+    // Smooth dynamic musical tension boost from explicit intensity OR roaring flames
+    const combinedTargetTension = clamp(
+      Math.max(this.targetIntensity, this.currentFireIntensity * 0.92),
+      0,
+      1,
+    );
+    const tensionRate = combinedTargetTension > this.currentIntensity ? 2.8 : 1.2;
+    const tensionLerp = Math.min(1, tensionRate * safeDt);
+    this.currentIntensity += (combinedTargetTension - this.currentIntensity) * tensionLerp;
+
+    // Tighten room reverb slightly & open celestial shimmer as musical tension climbs
+    this.reverbSend.gain.setTargetAtTime(0.24 - this.currentIntensity * 0.06, now, 0.08);
+    if (this.celestialFilter) {
+      this.celestialFilter.frequency.setTargetAtTime(840 + this.currentIntensity * 340, now, 0.1);
     }
 
     const fInt = this.currentFireIntensity;
@@ -429,15 +461,18 @@ export class MusicSequencer {
   // -------------------------------------------------------------------------
   private scheduleMainLounge(step: number, barIdx: number, h: BarHarmony, t: number): void {
     const dest = this.stemGains.music1;
+    const tension = this.currentIntensity;
+    const tineBoost = 0.85 + tension * 0.45;
+    const groovePunch = 1 + Math.max(0, tension - 0.35) * 0.18;
 
     // Warm Rhodes chord hits in 7/4 (beats 1, 3.5, 5, 6.5 -> steps 0, 5, 8, 12)
     if (step === 0 || step === 8) {
       const dur = step === 0 ? EIGHTH_SEC * 4.6 : EIGHTH_SEC * 3.8;
-      const gain = step === 0 ? 0.13 : 0.1;
-      this.playRhodesChord(dest, h.rhodes, t, dur, gain);
+      const gain = (step === 0 ? 0.13 : 0.1) * groovePunch;
+      this.playRhodesChord(dest, h.rhodes, t, dur, gain, tineBoost);
     } else if (step === 5 || (step === 12 && barIdx % 2 === 1)) {
       // Gentle syncopated Rhodes upper-voice answer
-      this.playRhodesChord(dest, h.rhodes.slice(1), t, EIGHTH_SEC * 2.2, 0.072);
+      this.playRhodesChord(dest, h.rhodes.slice(1), t, EIGHTH_SEC * 2.2, 0.072 * groovePunch, tineBoost);
     }
 
     // Hypnotic electric-piano top melody motif (sparse, non-fatiguing, breathing space)
@@ -449,26 +484,32 @@ export class MusicSequencer {
     };
     const melHz = melodyMap[step];
     if (melHz && (barIdx !== 2 || step !== 13)) {
-      this.playRhodesNote(dest, melHz, t, EIGHTH_SEC * 2.1, 0.068);
+      this.playRhodesNote(dest, melHz, t, EIGHTH_SEC * 2.1, 0.068 * groovePunch, tineBoost);
+    } else if (tension > 0.62 && step === 7 && barIdx % 2 === 1) {
+      // High-tension upper tine sparkle when flames roar or final hand looms
+      this.playRhodesNote(dest, h.rhodes[3] * 2, t, EIGHTH_SEC * 1.5, 0.048 * tension, tineBoost * 1.15);
     }
 
     // Upright lounge bassline (steps 0, 4, 8, 11)
     if (step === 0) {
-      this.playWarmBass(dest, h.bassRoot, t, EIGHTH_SEC * 3.4, 0.24);
+      this.playWarmBass(dest, h.bassRoot, t, EIGHTH_SEC * 3.4, 0.24 * groovePunch, tension);
     } else if (step === 4) {
-      this.playWarmBass(dest, h.bassFifth, t, EIGHTH_SEC * 3.0, 0.17);
+      this.playWarmBass(dest, h.bassFifth, t, EIGHTH_SEC * 3.0, 0.17 * groovePunch, tension);
     } else if (step === 8) {
-      this.playWarmBass(dest, h.bassRoot * 1.5 > 165 ? h.bassRoot : h.bassRoot * 1.5, t, EIGHTH_SEC * 2.6, 0.19);
+      this.playWarmBass(dest, h.bassRoot * 1.5 > 165 ? h.bassRoot : h.bassRoot * 1.5, t, EIGHTH_SEC * 2.6, 0.19 * groovePunch, tension);
     } else if (step === 11) {
-      this.playWarmBass(dest, h.bassWalk, t, EIGHTH_SEC * 2.4, 0.18);
+      this.playWarmBass(dest, h.bassWalk, t, EIGHTH_SEC * 2.4, 0.18 * groovePunch, tension);
     }
 
     // Brushed jazz kit: soft felt kick on 0 and 8, gentle brush sweep on 2, 6, 10, 12
     if (step === 0 || step === 8) {
-      this.playSoftKick(dest, t, step === 0 ? 0.19 : 0.13);
+      this.playSoftKick(dest, t, (step === 0 ? 0.19 : 0.13) * groovePunch);
     }
     if (step === 2 || step === 6 || step === 10 || step === 12) {
-      this.playBrushHat(dest, t, step === 6 ? 0.055 : 0.036, step === 6 ? 0.11 : 0.055);
+      this.playBrushHat(dest, t, (step === 6 ? 0.055 : 0.036) * groovePunch, step === 6 ? 0.11 : 0.055);
+    } else if (tension > 0.58 && (step === 4 || step === 13)) {
+      // Subtle extra brushed pulse under heightened tension
+      this.playBrushHat(dest, t, 0.026 * tension, 0.04);
     }
   }
 
@@ -477,21 +518,22 @@ export class MusicSequencer {
   // -------------------------------------------------------------------------
   private scheduleArcanaPack(step: number, h: BarHarmony, t: number): void {
     const dest = this.stemGains.music2;
+    const lift = 0.92 + this.currentIntensity * 0.18;
 
     // Gentle cascading minor-7th harp notes every other eighth + occasional bell echo
     if (step % 2 === 0) {
       const idx = (step / 2) % h.harp.length;
       const hz = h.harp[idx];
-      this.playHarpPluck(dest, hz, t, EIGHTH_SEC * 3.4, 0.115);
+      this.playHarpPluck(dest, hz, t, EIGHTH_SEC * 3.4, 0.115 * lift);
     }
     // Shimmering high celesta bell accent on steps 3 and 9
     if (step === 3 || step === 9) {
       const hz = h.harp[step === 3 ? 4 : 2] * 2;
-      this.playBellShimmer(dest, hz, t, EIGHTH_SEC * 4.0, 0.055);
+      this.playBellShimmer(dest, hz, t, EIGHTH_SEC * 4.0, 0.055 * lift);
     }
     // Deep mysterious pedal root on beat 1
     if (step === 0) {
-      this.playWarmBass(dest, h.bassRoot, t, EIGHTH_SEC * 6.5, 0.16);
+      this.playWarmBass(dest, h.bassRoot, t, EIGHTH_SEC * 6.5, 0.16, this.currentIntensity * 0.4);
     }
   }
 
@@ -500,17 +542,18 @@ export class MusicSequencer {
   // -------------------------------------------------------------------------
   private scheduleCelestialPack(step: number, h: BarHarmony, t: number): void {
     const dest = this.stemGains.music3;
+    const lift = 0.92 + this.currentIntensity * 0.2;
 
     // Shimmering wide open-fifth chord swell on step 0 and gentle upper sparkle on step 7
     if (step === 0) {
-      this.playCosmicSwell(dest, h.fifths, t, EIGHTH_SEC * 7.5, 0.11);
+      this.playCosmicSwell(dest, h.fifths, t, EIGHTH_SEC * 7.5, 0.11 * lift);
     } else if (step === 7) {
-      this.playCosmicSwell(dest, [h.fifths[1] * 2, h.fifths[2] * 2], t, EIGHTH_SEC * 6.5, 0.068);
+      this.playCosmicSwell(dest, [h.fifths[1] * 2, h.fifths[2] * 2], t, EIGHTH_SEC * 6.5, 0.068 * lift);
     }
     // Starlight crystalline fifth pings on steps 4 and 11
     if (step === 4 || step === 11) {
       const hz = step === 4 ? h.fifths[2] * 2 : h.fifths[3] * 2;
-      this.playBellShimmer(dest, hz, t, EIGHTH_SEC * 4.2, 0.048);
+      this.playBellShimmer(dest, hz, t, EIGHTH_SEC * 4.2, 0.048 * lift);
     }
   }
 
@@ -519,12 +562,13 @@ export class MusicSequencer {
   // -------------------------------------------------------------------------
   private scheduleShopFunk(step: number, h: BarHarmony, t: number): void {
     const dest = this.stemGains.music4;
+    const tension = this.currentIntensity;
 
     // Syncopated funky muted clavinet stabs
     if (step === 0 || step === 3 || step === 6 || step === 8 || step === 11 || step === 13) {
       const accent = step === 0 || step === 8 ? 0.12 : 0.085;
       const chord = step === 3 || step === 11 ? h.clav.slice(1) : h.clav;
-      this.playClavStab(dest, chord, t, EIGHTH_SEC * 0.72, accent);
+      this.playClavStab(dest, chord, t, EIGHTH_SEC * 0.72, accent, tension);
     }
 
     // Bouncy octave funk bassline
@@ -553,27 +597,45 @@ export class MusicSequencer {
   // -------------------------------------------------------------------------
   private scheduleBossTension(step: number, barIdx: number, h: BarHarmony, t: number): void {
     const dest = this.stemGains.music5;
-    const drive = 0.8 + this.intensity * 0.4;
+    const tension = this.currentIntensity;
+    const drive = 0.82 + tension * 0.36;
 
     // Relentless pulsing 8th-note bass ostinato
     const bNote = h.bossBass[step % h.bossBass.length];
     const isAccent = step === 0 || step === 4 || step === 8 || step === 11;
-    this.playBossOstinato(dest, bNote, t, EIGHTH_SEC * 0.85, (isAccent ? 0.24 : 0.15) * drive, isAccent);
+    this.playBossOstinato(
+      dest,
+      bNote,
+      t,
+      EIGHTH_SEC * 0.85,
+      (isAccent ? 0.22 : 0.14) * drive,
+      isAccent,
+      tension,
+    );
 
     // Syncopated dark brass/organ stabs
     if (step === 0 || step === 6 || step === 11 || (barIdx === 3 && step === 13)) {
-      this.playBrassOrganStab(dest, h.bossStab, t, EIGHTH_SEC * 1.45, 0.145 * drive);
+      this.playBrassOrganStab(dest, h.bossStab, t, EIGHTH_SEC * 1.45, 0.135 * drive, tension);
+    }
+
+    // Peak-tension turnaround alarm shimmer on final bar
+    if (tension > 0.72 && barIdx === 3 && step === 12) {
+      this.playBellShimmer(dest, h.bossStab[3] * 2, t, EIGHTH_SEC * 2.2, 0.062 * tension);
     }
 
     // Tense heartbeat kick + tight metallic percussion tick
     if (step === 0 || step === 3 || step === 8) {
-      this.playSoftKick(dest, t, 0.26);
+      this.playSoftKick(dest, t, 0.24 * (0.94 + tension * 0.14));
+    } else if (tension > 0.55 && step === 11) {
+      this.playSoftKick(dest, t, 0.17 + tension * 0.07);
     }
     if (step === 4 || step === 10) {
-      this.playCrispSnareTick(dest, t, 0.11);
+      this.playCrispSnareTick(dest, t, 0.11 * (0.95 + tension * 0.18));
+    } else if (tension > 0.62 && (step === 7 || step === 13)) {
+      this.playCrispSnareTick(dest, t, 0.065 + tension * 0.035);
     }
     if (step % 2 === 1) {
-      this.playBrushHat(dest, t, 0.038, 0.025);
+      this.playBrushHat(dest, t, 0.038 * (0.9 + tension * 0.28), 0.025);
     }
   }
 
@@ -581,26 +643,40 @@ export class MusicSequencer {
   // Lightweight Instrument Voice Primitives (self-cleaning Web Audio nodes)
   // -------------------------------------------------------------------------
 
-  private playRhodesChord(dest: AudioNode, freqs: number[], t: number, dur: number, gain: number): void {
+  private playRhodesChord(
+    dest: AudioNode,
+    freqs: number[],
+    t: number,
+    dur: number,
+    gain: number,
+    tineScale = 1,
+  ): void {
     const per = gain / Math.sqrt(freqs.length);
     for (let i = 0; i < freqs.length; i++) {
       // Slight subtle strum (7ms) for human electric-piano feel
-      this.playRhodesNote(dest, freqs[i], t + i * 0.007, dur, per);
+      this.playRhodesNote(dest, freqs[i], t + i * 0.007, dur, per, tineScale);
     }
   }
 
-  private playRhodesNote(dest: AudioNode, freq: number, t: number, dur: number, gain: number): void {
+  private playRhodesNote(
+    dest: AudioNode,
+    freq: number,
+    t: number,
+    dur: number,
+    gain: number,
+    tineScale = 1,
+  ): void {
     const body = this.ctx.createOscillator();
     body.type = 'sine';
     body.frequency.setValueAtTime(freq, t);
 
-    // Gentle Rhodes tine harmonic overtone (decays rapidly)
+    // Gentle Rhodes tine harmonic overtone (decays rapidly, brightens with tension)
     const tine = this.ctx.createOscillator();
     tine.type = 'triangle';
     tine.frequency.setValueAtTime(freq * 3.0, t);
 
     const tineGain = this.ctx.createGain();
-    tineGain.gain.setValueAtTime(gain * 0.24, t);
+    tineGain.gain.setValueAtTime(gain * 0.24 * tineScale, t);
     tineGain.gain.exponentialRampToValueAtTime(0.0001, t + Math.min(0.14, dur * 0.4));
 
     const amp = this.ctx.createGain();
@@ -620,14 +696,21 @@ export class MusicSequencer {
     tine.stop(t + Math.min(0.16, dur) + 0.02);
   }
 
-  private playWarmBass(dest: AudioNode, freq: number, t: number, dur: number, gain: number): void {
+  private playWarmBass(
+    dest: AudioNode,
+    freq: number,
+    t: number,
+    dur: number,
+    gain: number,
+    tension = 0.5,
+  ): void {
     const osc = this.ctx.createOscillator();
     osc.type = 'triangle';
     osc.frequency.setValueAtTime(freq, t);
 
     const flt = this.ctx.createBiquadFilter();
     flt.type = 'lowpass';
-    flt.frequency.setValueAtTime(340, t);
+    flt.frequency.setValueAtTime(320 + tension * 120, t);
     flt.frequency.exponentialRampToValueAtTime(160, t + dur);
 
     const amp = this.ctx.createGain();
@@ -667,11 +750,18 @@ export class MusicSequencer {
     osc.stop(t + dur + 0.02);
   }
 
-  private playClavStab(dest: AudioNode, freqs: number[], t: number, dur: number, gain: number): void {
+  private playClavStab(
+    dest: AudioNode,
+    freqs: number[],
+    t: number,
+    dur: number,
+    gain: number,
+    tension = 0.5,
+  ): void {
     const flt = this.ctx.createBiquadFilter();
     flt.type = 'bandpass';
     flt.Q.setValueAtTime(2.4, t);
-    flt.frequency.setValueAtTime(2400, t);
+    flt.frequency.setValueAtTime(2200 + tension * 550, t);
     flt.frequency.exponentialRampToValueAtTime(740, t + dur);
 
     const amp = this.ctx.createGain();
@@ -780,6 +870,7 @@ export class MusicSequencer {
     dur: number,
     gain: number,
     accent: boolean,
+    tension = 0.5,
   ): void {
     const osc = this.ctx.createOscillator();
     osc.type = 'sawtooth';
@@ -791,8 +882,8 @@ export class MusicSequencer {
 
     const flt = this.ctx.createBiquadFilter();
     flt.type = 'lowpass';
-    flt.Q.setValueAtTime(accent ? 4.8 : 2.6, t);
-    flt.frequency.setValueAtTime(accent ? 760 : 380, t);
+    flt.Q.setValueAtTime((accent ? 4.4 : 2.5) + tension * 1.1, t);
+    flt.frequency.setValueAtTime((accent ? 740 : 370) * (0.9 + tension * 0.55), t);
     flt.frequency.exponentialRampToValueAtTime(140, t + dur);
 
     const amp = this.ctx.createGain();
@@ -811,12 +902,19 @@ export class MusicSequencer {
     sub.stop(t + dur + 0.02);
   }
 
-  private playBrassOrganStab(dest: AudioNode, freqs: number[], t: number, dur: number, gain: number): void {
+  private playBrassOrganStab(
+    dest: AudioNode,
+    freqs: number[],
+    t: number,
+    dur: number,
+    gain: number,
+    tension = 0.5,
+  ): void {
     const flt = this.ctx.createBiquadFilter();
     flt.type = 'lowpass';
-    flt.Q.setValueAtTime(2.5, t);
-    flt.frequency.setValueAtTime(480, t);
-    flt.frequency.exponentialRampToValueAtTime(2100, t + 0.045);
+    flt.Q.setValueAtTime(2.5 + tension * 0.8, t);
+    flt.frequency.setValueAtTime(480 + tension * 160, t);
+    flt.frequency.exponentialRampToValueAtTime(2000 + tension * 950, t + 0.045);
     flt.frequency.exponentialRampToValueAtTime(520, t + dur);
 
     const amp = this.ctx.createGain();

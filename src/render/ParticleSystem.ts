@@ -105,6 +105,36 @@ function pickColor(palette: readonly Rgb[]): Rgb {
   return palette[Math.floor(Math.random() * palette.length)] ?? palette[0]!;
 }
 
+function parseHexColor(colorHex?: string): Rgb | null {
+  if (!colorHex || typeof colorHex !== 'string') return null;
+  const trimmed = colorHex.trim();
+  const hex = trimmed.startsWith('#') ? trimmed.slice(1) : trimmed;
+  if (/^[0-9a-fA-F]{3}$/.test(hex)) {
+    const r = parseInt(hex[0]! + hex[0]!, 16) / 255;
+    const g = parseInt(hex[1]! + hex[1]!, 16) / 255;
+    const b = parseInt(hex[2]! + hex[2]!, 16) / 255;
+    return [r, g, b];
+  }
+  if (/^[0-9a-fA-F]{6}$/.test(hex)) {
+    const r = parseInt(hex.slice(0, 2), 16) / 255;
+    const g = parseInt(hex.slice(2, 4), 16) / 255;
+    const b = parseInt(hex.slice(4, 6), 16) / 255;
+    return [r, g, b];
+  }
+  return null;
+}
+
+function buildStarPalette(colorHex?: string): readonly Rgb[] {
+  const base = parseHexColor(colorHex) ?? ([1.0, 0.85, 0.34] as const);
+  const bright: Rgb = [
+    base[0] + (1 - base[0]) * 0.55,
+    base[1] + (1 - base[1]) * 0.55,
+    base[2] + (1 - base[2]) * 0.55,
+  ];
+  const deep: Rgb = [base[0] * 0.82, base[1] * 0.82, base[2] * 0.82];
+  return [base, bright, deep, [1.0, 1.0, 1.0]];
+}
+
 export class ParticleSystem {
   private particles: Particle[] = [];
   private instanceBuffer = new Float32Array(MAX_PARTICLES * PARTICLE_FLOATS_PER_INSTANCE);
@@ -281,6 +311,57 @@ export class ParticleSystem {
         lifetime: (kind === 'celebrate' ? 0.72 : 0.45) + Math.random() * 0.35,
         shape: i % 2 === 0 ? 1 : 0,
       });
+    }
+  }
+
+  /**
+   * Crisp radial starburst of pixel diamonds & squares for victories,
+   * voucher redemptions, level-ups, and huge XMult hits.
+   */
+  emitStarBurst(x: number, y: number, colorHex?: string, intensity = 1): void {
+    const safeIntensity = Math.min(3, Math.max(0.35, Number.isFinite(intensity) ? intensity : 1));
+    const palette = buildStarPalette(colorHex);
+    const count = this.reducedMotion ? 6 : Math.min(36, Math.round(14 + safeIntensity * 8));
+    const angleOffset = Math.random() * Math.PI * 2;
+
+    for (let i = 0; i < count; i++) {
+      const isOuterRay = i % 2 === 0;
+      const spokeAngle = angleOffset + (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.22;
+      const baseSpd = isOuterRay ? 135 : 70;
+      const spd = (baseSpd + Math.random() * (isOuterRay ? 165 : 90)) * (0.72 + safeIntensity * 0.28);
+      const col = isOuterRay && i % 4 === 0 ? palette[3]! : pickColor(palette);
+      const sz = (isOuterRay ? 5.2 : 3.6) + Math.random() * (3.2 + safeIntensity * 1.1);
+      this.push({
+        x: x + Math.cos(spokeAngle) * (isOuterRay ? 6 : 2),
+        y: y + Math.sin(spokeAngle) * (isOuterRay ? 6 : 2),
+        vx: Math.cos(spokeAngle) * spd,
+        vy: Math.sin(spokeAngle) * spd - 32,
+        gravity: isOuterRay ? 140 : 185,
+        drag: isOuterRay ? 2.4 : 2.9,
+        size: sz,
+        endSize: 1.0,
+        rotation: spokeAngle + Math.PI * 0.25,
+        vRot: (Math.random() - 0.5) * 11,
+        r: col[0],
+        g: col[1],
+        b: col[2],
+        alpha: 1,
+        age: 0,
+        lifetime: (isOuterRay ? 0.56 : 0.44) + Math.random() * 0.28,
+        shape: isOuterRay ? 1 : 0,
+      });
+    }
+  }
+
+  /**
+   * Festive multi-layered round-clear / victory celebration burst.
+   */
+  triggerRoundClearBurst(x: number, y: number): void {
+    this.emitStarBurst(x, y, '#ffd859', 1.35);
+    this.emitAccentBurst(x, y, 'celebrate');
+    if (!this.reducedMotion) {
+      this.emitStarBurst(x - 52, y - 14, '#00c8ff', 0.72);
+      this.emitStarBurst(x + 52, y - 14, '#fe5f55', 0.72);
     }
   }
 

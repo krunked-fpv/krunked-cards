@@ -155,6 +155,8 @@ class VoiceBuilder {
   readonly pitch: number;
   private readonly sources: AudioScheduledSourceNode[] = [];
   private readonly nodes: AudioNode[] = [];
+  private longestSource: AudioScheduledSourceNode | null = null;
+  private longestEnd = -Infinity;
   private maxEnd: number;
   private stopped = false;
 
@@ -165,7 +167,7 @@ class VoiceBuilder {
     this.maxEnd = sc.now + 0.02;
 
     this.bus = sc.ctx.createGain();
-    const vol = clamp(Number.isFinite(sc.volume) ? sc.volume : 1, 0.0001, 2.0);
+    const vol = clamp(Number.isFinite(sc.volume) ? sc.volume : 1, 0.0001, 1.35);
     this.bus.gain.setValueAtTime(vol, sc.now);
     this.bus.connect(sc.destination);
     this.nodes.push(this.bus);
@@ -180,6 +182,10 @@ class VoiceBuilder {
     this.sources.push(src);
     this.nodes.push(src);
     if (endTime > this.maxEnd) this.maxEnd = endTime;
+    if (endTime >= this.longestEnd) {
+      this.longestEnd = endTime;
+      this.longestSource = src;
+    }
     return src;
   }
 
@@ -202,7 +208,7 @@ class VoiceBuilder {
     const t0 = this.now + Math.max(0, startOffset);
     const dur = Math.max(0.012, duration);
     const t1 = t0 + dur;
-    const attack = Math.min(dur * 0.85, opts?.attack ?? 0.005);
+    const attack = Math.min(dur * 0.85, Math.max(0.002, opts?.attack ?? 0.005));
     const pMul = opts?.usePitch === false ? 1 : Math.pow(this.pitch, opts?.pitchPower ?? 1);
 
     const osc = this.ctx.createOscillator();
@@ -224,7 +230,7 @@ class VoiceBuilder {
     const g = this.ctx.createGain();
     const peak = Math.max(0.0005, peakGain);
     g.gain.setValueAtTime(0.0001, t0);
-    g.gain.linearRampToValueAtTime(peak, t0 + Math.max(0.002, attack));
+    g.gain.linearRampToValueAtTime(peak, t0 + attack);
     g.gain.exponentialRampToValueAtTime(0.0001, t1);
 
     osc.connect(g);
@@ -233,9 +239,8 @@ class VoiceBuilder {
     osc.start(t0);
     osc.stop(t1 + 0.01);
 
-    this.sources.push(osc);
-    this.nodes.push(osc, g);
-    if (t1 + 0.015 > this.maxEnd) this.maxEnd = t1 + 0.015;
+    this.trackSource(osc, t1 + 0.015);
+    this.nodes.push(g);
     return osc;
   }
 
@@ -259,7 +264,7 @@ class VoiceBuilder {
     const t0 = this.now + Math.max(0, startOffset);
     const dur = Math.max(0.012, duration);
     const t1 = t0 + dur;
-    const attack = Math.min(dur * 0.85, opts?.attack ?? 0.004);
+    const attack = Math.min(dur * 0.85, Math.max(0.001, opts?.attack ?? 0.004));
     const pMul = opts?.usePitch === false ? 1 : Math.pow(this.pitch, opts?.pitchPower ?? 0.4);
 
     const buf = this.sc.noise[kind];
@@ -280,7 +285,7 @@ class VoiceBuilder {
     const g = this.ctx.createGain();
     const peak = Math.max(0.0005, peakGain);
     g.gain.setValueAtTime(0.0001, t0);
-    g.gain.linearRampToValueAtTime(peak, t0 + Math.max(0.002, attack));
+    g.gain.linearRampToValueAtTime(peak, t0 + attack);
     g.gain.exponentialRampToValueAtTime(0.0001, t1);
 
     src.connect(filter);
@@ -290,9 +295,8 @@ class VoiceBuilder {
     const offset = opts?.bufferOffset ?? ((this.sc.voiceId * 0.371) % Math.max(0.2, buf.duration - 0.1));
     src.start(t0, offset, dur + 0.02);
 
-    this.sources.push(src);
-    this.nodes.push(src, filter, g);
-    if (t1 + 0.02 > this.maxEnd) this.maxEnd = t1 + 0.02;
+    this.trackSource(src, t1 + 0.02);
+    this.nodes.push(filter, g);
     return src;
   }
 
@@ -313,7 +317,7 @@ class VoiceBuilder {
     const t0 = this.now + Math.max(0, startOffset);
     const dur = Math.max(0.02, duration);
     const t1 = t0 + dur;
-    const attack = Math.min(dur * 0.35, opts?.attack ?? 0.004);
+    const attack = Math.min(dur * 0.35, Math.max(0.0015, opts?.attack ?? 0.004));
     const pMul = Math.pow(this.pitch, opts?.pitchPower ?? 0.85);
 
     const cFreq = safeFreq(carrierFreq * pMul, this.ctx);
@@ -349,13 +353,16 @@ class VoiceBuilder {
     carrier.stop(t1 + 0.015);
     mod.stop(t1 + 0.015);
 
-    this.sources.push(carrier, mod);
-    this.nodes.push(carrier, mod, modGain, amp);
-    if (t1 + 0.02 > this.maxEnd) this.maxEnd = t1 + 0.02;
+    this.trackSource(carrier, t1 + 0.02);
+    this.trackSource(mod, t1 + 0.02);
+    this.nodes.push(modGain, amp);
   }
 
   finish(): ActiveVoice {
+    let cleaned = false;
     const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
       for (const n of this.nodes) {
         try {
           n.disconnect();
@@ -365,10 +372,10 @@ class VoiceBuilder {
       }
     };
 
-    // Disconnect automatically when the last scheduled source completes
-    const lastSrc = this.sources[this.sources.length - 1];
-    if (lastSrc) {
-      lastSrc.onended = () => {
+    // Disconnect automatically only after the longest-ringing source completes
+    const endSrc = this.longestSource ?? this.sources[this.sources.length - 1];
+    if (endSrc) {
+      endSrc.onended = () => {
         if (!this.stopped) {
           this.stopped = true;
           cleanup();
@@ -393,16 +400,18 @@ class VoiceBuilder {
         } catch {
           // ignore scheduling errors on closing contexts
         }
+        let stoppedAny = false;
         for (const s of this.sources) {
           try {
             s.stop(t + fade + 0.005);
+            stoppedAny = true;
           } catch {
             // ignore already-stopped sources
           }
         }
-        // Schedule disconnect shortly after fade
-        const last = this.sources[this.sources.length - 1];
-        if (last) {
+        // Schedule disconnect cleanly once fade finishes
+        const last = this.longestSource ?? this.sources[this.sources.length - 1];
+        if (last && stoppedAny) {
           last.onended = cleanup;
         } else {
           cleanup();
@@ -723,8 +732,8 @@ export const SYNTH_HANDLERS: Record<SoundKey, SynthHandler> = {
     const vb = new VoiceBuilder(sc);
     // Punchy +Mult: warm tight bass kick + snappy saturated chord hit
     const subPitch = Math.max(0.65, Math.pow(vb.pitch, 0.5));
-    vb.osc('sine', 165 * subPitch, 62 * subPitch, 0, 0.14, 0.36, { attack: 0.002, usePitch: false });
-    vb.noiseBurst('white', 'bandpass', 2400, 1200, 2.2, 0, 0.024, 0.18, { attack: 0.001 });
+    vb.osc('sine', 165 * subPitch, 62 * subPitch, 0, 0.14, 0.32, { attack: 0.002, usePitch: false });
+    vb.noiseBurst('white', 'bandpass', 2400, 1200, 2.2, 0, 0.024, 0.16, { attack: 0.001 });
 
     const flt = vb.trackNode(vb.ctx.createBiquadFilter());
     flt.type = 'lowpass';
@@ -736,7 +745,7 @@ export const SYNTH_HANDLERS: Record<SoundKey, SynthHandler> = {
     // Warm power triad (D4, A4, F#5)
     const chord = [293.66, 440.0, 587.33];
     chord.forEach((hz, i) => {
-      vb.osc(i === 0 ? 'sawtooth' : 'triangle', hz, null, 0, 0.19, 0.18, {
+      vb.osc(i === 0 ? 'sawtooth' : 'triangle', hz, null, 0, 0.19, 0.15, {
         attack: 0.003,
         target: flt,
         detune: (i - 1) * 7,
@@ -749,9 +758,9 @@ export const SYNTH_HANDLERS: Record<SoundKey, SynthHandler> = {
     const vb = new VoiceBuilder(sc);
     // Dramatic XMult impact: deep resonant sub drop + triumphant FM brass-bell chord + shimmer
     const subPitch = Math.max(0.65, Math.pow(vb.pitch, 0.45));
-    vb.osc('sine', 148 * subPitch, 44 * subPitch, 0, 0.34, 0.44, { attack: 0.003, usePitch: false });
-    vb.osc('triangle', 98 * subPitch, 52 * subPitch, 0, 0.28, 0.22, { attack: 0.004, usePitch: false });
-    vb.noiseBurst('pink', 'bandpass', 2800, 900, 1.8, 0, 0.045, 0.24, { attack: 0.001 });
+    vb.osc('sine', 148 * subPitch, 44 * subPitch, 0, 0.34, 0.36, { attack: 0.003, usePitch: false });
+    vb.osc('triangle', 98 * subPitch, 52 * subPitch, 0, 0.28, 0.18, { attack: 0.004, usePitch: false });
+    vb.noiseBurst('pink', 'bandpass', 2800, 900, 1.8, 0, 0.045, 0.20, { attack: 0.001 });
 
     const flt = vb.trackNode(vb.ctx.createBiquadFilter());
     flt.type = 'lowpass';
@@ -763,7 +772,7 @@ export const SYNTH_HANDLERS: Record<SoundKey, SynthHandler> = {
     // Rich resonant 9th power chord
     const chord = [220.0, 329.63, 440.0, 554.37, 659.25];
     chord.forEach((hz, i) => {
-      vb.osc('sawtooth', hz, null, 0, 0.38, 0.13, {
+      vb.osc('sawtooth', hz, null, 0, 0.38, 0.105, {
         attack: 0.005,
         target: flt,
         detune: (i - 2) * 8,
@@ -771,7 +780,7 @@ export const SYNTH_HANDLERS: Record<SoundKey, SynthHandler> = {
       });
     });
     // Crystalline resonance ring on top
-    vb.fmBell(880, 2.0, 420, 0.008, 0.42, 0.15, { attack: 0.004, pitchPower: 0.82 });
+    vb.fmBell(880, 2.0, 420, 0.008, 0.42, 0.14, { attack: 0.004, pitchPower: 0.82 });
     return vb.finish();
   },
 
@@ -941,24 +950,24 @@ export const SYNTH_HANDLERS: Record<SoundKey, SynthHandler> = {
   },
   explosion1: (sc) => {
     const vb = new VoiceBuilder(sc);
-    vb.osc('sine', 140, 32, 0, 0.42, 0.45, { attack: 0.003, pitchPower: 0.45 });
-    vb.osc('sawtooth', 95, 28, 0, 0.28, 0.18, { attack: 0.004, pitchPower: 0.45 });
-    vb.noiseBurst('brown', 'lowpass', 1400, 140, 1.4, 0, 0.52, 0.44, { attack: 0.004 });
-    vb.noiseBurst('crackle', 'bandpass', 2200, 650, 1.2, 0.015, 0.45, 0.22, { attack: 0.006 });
+    vb.osc('sine', 140, 32, 0, 0.42, 0.38, { attack: 0.003, pitchPower: 0.45 });
+    vb.osc('sawtooth', 95, 28, 0, 0.28, 0.15, { attack: 0.004, pitchPower: 0.45 });
+    vb.noiseBurst('brown', 'lowpass', 1400, 140, 1.4, 0, 0.52, 0.36, { attack: 0.004 });
+    vb.noiseBurst('crackle', 'bandpass', 2200, 650, 1.2, 0.015, 0.45, 0.18, { attack: 0.006 });
     return vb.finish();
   },
   explosion_buildup1: (sc) => {
     const vb = new VoiceBuilder(sc);
-    vb.osc('sawtooth', 110, 680, 0, 0.62, 0.16, { attack: 0.32, pitchPower: 0.7 });
-    vb.osc('sine', 55, 220, 0, 0.62, 0.22, { attack: 0.28, pitchPower: 0.6 });
-    vb.noiseBurst('pink', 'bandpass', 320, 3400, 2.8, 0, 0.62, 0.24, { attack: 0.36 });
+    vb.osc('sawtooth', 110, 680, 0, 0.62, 0.15, { attack: 0.32, pitchPower: 0.7 });
+    vb.osc('sine', 55, 220, 0, 0.62, 0.2, { attack: 0.28, pitchPower: 0.6 });
+    vb.noiseBurst('pink', 'bandpass', 320, 3400, 2.8, 0, 0.62, 0.22, { attack: 0.36 });
     return vb.finish();
   },
   explosion_release1: (sc) => {
     const vb = new VoiceBuilder(sc);
-    vb.osc('sine', 165, 30, 0, 0.58, 0.48, { attack: 0.002, pitchPower: 0.45 });
-    vb.noiseBurst('brown', 'lowpass', 2200, 120, 1.5, 0, 0.66, 0.46, { attack: 0.003 });
-    vb.fmBell(293.66, 1.73, 420, 0.01, 0.54, 0.18, { attack: 0.004, pitchPower: 0.75 });
+    vb.osc('sine', 165, 30, 0, 0.58, 0.40, { attack: 0.002, pitchPower: 0.45 });
+    vb.noiseBurst('brown', 'lowpass', 2200, 120, 1.5, 0, 0.66, 0.38, { attack: 0.003 });
+    vb.fmBell(293.66, 1.73, 420, 0.01, 0.54, 0.16, { attack: 0.004, pitchPower: 0.75 });
     return vb.finish();
   },
   gong: (sc) => {
