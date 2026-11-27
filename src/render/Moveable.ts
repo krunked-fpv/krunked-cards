@@ -1823,32 +1823,28 @@ export class CardSceneManager {
         let pY: number;
 
         if (g.mode === 'desktop') {
-          if (state.pack.needsHand && g.viewportH < 640) {
-            const topEdge = g.packTray.y + 34;
-            const bottomEdge = g.handTray.y - 32;
-            const availH = Math.max(64, bottomEdge - topEdge);
-            pCardH = Math.min(Math.round(g.cardH * 0.96), availH);
+          if (state.pack.needsHand) {
+            const topEdge = g.packTray.y + (g.viewportH < 640 ? 48 : 62);
+            const bottomEdge = g.handTray.y - 36;
+            const availH = Math.max(68, bottomEdge - topEdge);
+            pCardH = Math.min(Math.round(g.cardH * (g.viewportH < 640 ? 0.96 : 1.02)), availH);
             pCardW = Math.round(pCardH * aspect);
             pY = topEdge + availH * 0.5;
           } else {
             pCardH = Math.round(g.cardH * 1.04);
             pCardW = Math.round(g.cardW * 1.04);
-            pY = g.packTray.y + 52 + pCardH * 0.52;
-            if (state.pack.needsHand) {
-              const maxCenterY = g.handTray.y - pCardH * 0.5 - 32;
-              pY = Math.min(pY, Math.max(g.packTray.y + 40 + pCardH * 0.5, maxCenterY));
-            }
+            pY = g.packTray.y + 62 + pCardH * 0.5;
           }
         } else if (g.mode === 'mobile-landscape') {
           if (state.pack.needsHand) {
-            const topEdge = g.packTray.y + 28;
-            const bottomEdge = g.handTray.y + handPackOffsetY - 34;
-            const availH = Math.max(52, bottomEdge - topEdge);
-            pCardH = Math.min(Math.round(g.cardH * 0.96), availH);
+            const topEdge = g.packTray.y + 36;
+            const bottomEdge = g.handTray.y + handPackOffsetY - 30;
+            const availH = Math.max(54, bottomEdge - topEdge);
+            pCardH = Math.min(Math.round(g.cardH * 0.94), availH);
             pCardW = Math.round(pCardH * aspect);
             pY = topEdge + availH * 0.5;
           } else {
-            const topEdge = g.packTray.y + 34;
+            const topEdge = g.packTray.y + 38;
             const bottomEdge = g.viewportH - g.safeInsets.bottom - 38;
             const availH = Math.max(70, bottomEdge - topEdge);
             pCardH = Math.min(Math.round(g.cardH * 1.1), availH);

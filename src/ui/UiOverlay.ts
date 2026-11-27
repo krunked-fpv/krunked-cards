@@ -1381,8 +1381,12 @@ export class UiOverlay {
       );
       if (ownedVis) {
         const halfPad = ownedVis.kind === 'consumable' ? 76 : 56;
+        const minOwnedX =
+          ownedVis.kind === 'joker' && isPortrait
+            ? Math.max(halfPad, geom.jokerTray.x + 76)
+            : halfPad;
         const px = Math.max(
-          halfPad,
+          minOwnedX,
           Math.min(geom.viewportW - halfPad, Math.round(ownedVis.moveable.tx))
         );
         const py = Math.min(
@@ -1545,7 +1549,7 @@ export class UiOverlay {
 
         <div class="kc-title-dock">
           <div class="kc-title-main-btns ${isPortrait ? 'grid-2x2' : ''}">
-            <button class="kc-btn kc-btn-blue kc-title-btn interactive" data-title="play">PLAY</button>
+            <button class="kc-btn kc-btn-blue kc-title-btn interactive ${isPortrait && !hasSave ? 'span-full' : ''}" data-title="play">PLAY</button>
             ${
               hasSave
                 ? `<button class="kc-btn kc-btn-teal kc-title-btn interactive" data-title="continue">CONTINUE</button>`
@@ -1592,7 +1596,7 @@ export class UiOverlay {
   private buildBlindSelectHtml(state: SimState, geom: TableGeometry): string {
     const isPortrait = geom.mode === 'mobile-portrait';
     const isLandscape = geom.mode === 'mobile-landscape';
-    const topY = geom.jokerTray.y + geom.jokerTray.h + (isLandscape ? 16 : 22);
+    const topY = geom.jokerTray.y + geom.jokerTray.h + (isLandscape ? 14 : 22);
     const h = Math.max(160, geom.table.y + geom.table.h - topY);
     const slots: BlindSlot[] = ['Small', 'Big', 'Boss'];
     const canRerollBoss =
@@ -1601,9 +1605,9 @@ export class UiOverlay {
       state.dollars - state.bankruptAt >= 10 &&
       state.blinds.Boss.status !== 'Defeated';
 
-    const chipSize = isLandscape ? 42 : isPortrait ? 48 : 72;
-    const scoreChipSize = isLandscape ? 16 : isPortrait ? 18 : 24;
-    const tagSize = isLandscape ? 26 : isPortrait ? 30 : 38;
+    const chipSize = isLandscape ? 30 : isPortrait ? 48 : 72;
+    const scoreChipSize = isLandscape ? 15 : isPortrait ? 18 : 24;
+    const tagSize = isLandscape ? 22 : isPortrait ? 30 : 38;
 
     const cols = slots
       .map((slot) => {
@@ -1709,7 +1713,7 @@ export class UiOverlay {
                 <span>${fmtNum(b.targetChips)}</span>
               </div>
               <div class="kc-blind-reward">Reward: <span class="kc-gold">${'$'.repeat(Math.max(1, Math.min(8, b.dollars)))}</span></div>
-              ${def?.desc ? `<div class="kc-blind-col-desc">${esc(def.desc)}</div>` : ''}
+              ${def?.desc && (!isLandscape || slot === 'Boss') ? `<div class="kc-blind-col-desc">${esc(def.desc)}</div>` : ''}
             </div>
             ${skipBlock}
           </div>
@@ -1885,8 +1889,12 @@ export class UiOverlay {
     const isMobile = geom.mode !== 'desktop';
     const minX = geom.safeInsets.left + 44;
     const maxX = geom.viewportW - geom.safeInsets.right - 44;
+    const handPackOffsetY =
+      pack.needsHand && geom.mode === 'mobile-landscape'
+        ? Math.round(geom.actionBar.h * 0.78)
+        : 0;
     const maxBtnY = pack.needsHand
-      ? Math.min(geom.viewportH - geom.safeInsets.bottom - 28, geom.handTray.y - 24)
+      ? Math.min(geom.viewportH - geom.safeInsets.bottom - 28, geom.handTray.y + handPackOffsetY - 26)
       : geom.viewportH - geom.safeInsets.bottom - 30;
 
     const pickBtns = cards
@@ -3148,6 +3156,10 @@ export class UiOverlay {
     const vw = this.lastViewportW || window.innerWidth;
     const vh = this.lastViewportH || window.innerHeight;
     const isDesktop = this.lastMode === 'desktop';
+    const isLandscape = this.lastMode === 'mobile-landscape';
+    const reserveBottom =
+      isLandscape && (state.phase === 'PLAYING' || state.phase === 'SCORING') ? 56 : 8;
+    const maxBottomY = Math.max(8, vh - th - reserveBottom);
 
     let tx = card.moveable.vx - tw * 0.5;
     let ty: number;
@@ -3166,23 +3178,38 @@ export class UiOverlay {
       // Lower half -> anchor cleanly above card
       ty = card.moveable.vy - card.moveable.vh * 0.54 - th - 12;
       if (ty < 8) {
-        ty = card.moveable.vy + card.moveable.vh * 0.54 + 14;
+        if (isLandscape) {
+          tx = card.moveable.vx + card.moveable.vw * 0.58;
+          if (tx + tw + 8 > vw) tx = card.moveable.vx - card.moveable.vw * 0.58 - tw;
+          ty = Math.min(maxBottomY, Math.max(8, card.moveable.vy - th * 0.5));
+        } else {
+          ty = card.moveable.vy + card.moveable.vh * 0.54 + 14;
+        }
       }
     } else {
       // Upper half -> anchor cleanly below card (leave clearance for contextual SELL/USE pill if owned)
       const ownedExtra =
         (card.kind === 'joker' || card.kind === 'consumable') &&
         this.selectedOwnedId === card.id
-          ? 36
+          ? (isLandscape ? 28 : 36)
           : 0;
-      ty = card.moveable.vy + card.moveable.vh * 0.54 + 14 + ownedExtra;
-      if (ty + th + 8 > vh) {
-        ty = card.moveable.vy - card.moveable.vh * 0.54 - th - 12;
+      ty = card.moveable.vy + card.moveable.vh * 0.54 + (isLandscape ? 8 : 14) + ownedExtra;
+      if (ty > maxBottomY) {
+        if (isLandscape) {
+          // Place cleanly beside card on short landscape screens so bottom action bar stays clear
+          tx = card.moveable.vx + card.moveable.vw * 0.58 + 6;
+          if (tx + tw + 8 > vw) {
+            tx = card.moveable.vx - card.moveable.vw * 0.58 - tw - 6;
+          }
+          ty = Math.min(maxBottomY, Math.max(8, card.moveable.vy - th * 0.25));
+        } else {
+          ty = card.moveable.vy - card.moveable.vh * 0.54 - th - 12;
+        }
       }
     }
 
     tx = Math.max(8, Math.min(Math.max(8, vw - tw - 8), tx));
-    ty = Math.max(8, Math.min(Math.max(8, vh - th - 8), ty));
+    ty = Math.max(8, Math.min(maxBottomY, ty));
 
     this.tooltipEl.style.left = `${Math.round(tx)}px`;
     this.tooltipEl.style.top = `${Math.round(ty)}px`;
@@ -4674,6 +4701,19 @@ export class UiOverlay {
       .kc-boss-warning-pill.sev-info .kc-bw-icon { background: #009dff; color: #ffffff; }
       .kc-bw-boss { color: #f3b958; flex-shrink: 0; }
       .kc-bw-msg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .kc-mode-mobile-portrait .kc-boss-warning-pill {
+        font-size: 12px;
+        padding: 4px 9px;
+        gap: 5px;
+        flex-wrap: wrap;
+        justify-content: center;
+        text-align: center;
+      }
+      .kc-mode-mobile-portrait .kc-bw-msg {
+        white-space: normal;
+        overflow: visible;
+        text-overflow: clip;
+      }
 
       /* Boss Intro Banner (non-blocking dramatic callout) */
       .kc-boss-banner {
@@ -4734,6 +4774,7 @@ export class UiOverlay {
         transform: translateX(-100%);
         z-index: 52;
         pointer-events: none;
+        white-space: nowrap;
         background: rgba(20, 28, 34, 0.94);
         border: 2px solid #f3b958;
         border-radius: 8px;
@@ -5133,34 +5174,62 @@ export class UiOverlay {
         padding: 11px 10px;
         min-height: 46px;
       }
+      .kc-title-main-btns.grid-2x2 .kc-title-btn.span-full {
+        grid-column: 1 / -1;
+      }
 
       /* Blind Select Landscape & Portrait Modes */
       .kc-blind-arena.landscape {
-        gap: 8px;
+        gap: 6px;
         overflow-y: auto;
         -webkit-overflow-scrolling: touch;
         touch-action: pan-y;
       }
       .kc-blind-arena.landscape .kc-blind-col {
-        padding: 6px;
-        gap: 5px;
+        padding: 5px;
+        gap: 3px;
         border-width: 2px;
-        border-top-width: 4px;
-        border-radius: 9px;
+        border-top-width: 3px;
+        border-radius: 8px;
+        min-height: 0;
+        overflow: hidden;
       }
       .kc-blind-arena.landscape .kc-blind-col.active { transform: none; }
-      .kc-blind-arena.landscape .kc-blind-col-top .kc-btn { font-size: 14px; padding: 5px 6px; }
-      .kc-blind-arena.landscape .kc-blind-status-pill { font-size: 12px; padding: 4px 5px; }
-      .kc-blind-arena.landscape .kc-blind-col-banner { font-size: 14px; padding: 3px 5px; border-width: 2px; }
-      .kc-blind-arena.landscape .kc-blind-col-body { padding: 5px; border-width: 2px; }
-      .kc-blind-arena.landscape .kc-blind-col-chip { width: 42px; height: 42px; margin-bottom: 2px; }
-      .kc-blind-arena.landscape .kc-target-score.lg { font-size: 18px; margin: 2px 0; }
-      .kc-blind-arena.landscape .kc-blind-reward { font-size: 12px; }
-      .kc-blind-arena.landscape .kc-blind-col-desc { font-size: 10px; padding: 3px 4px; margin-top: 3px; }
-      .kc-blind-arena.landscape .kc-skip-box { padding: 5px; gap: 4px; border-width: 2px; }
-      .kc-blind-arena.landscape .kc-tag-canvas { width: 26px; height: 26px; }
-      .kc-blind-arena.landscape .kc-skip-tag-name { font-size: 12px; }
-      .kc-blind-arena.landscape .kc-skip-tag-desc { font-size: 10px; }
+      .kc-blind-arena.landscape .kc-blind-col-top .kc-btn { font-size: 13px; padding: 3px 6px; }
+      .kc-blind-arena.landscape .kc-blind-status-pill { font-size: 11px; padding: 3px 4px; }
+      .kc-blind-arena.landscape .kc-blind-col-banner { font-size: 13px; padding: 2px 4px; border-width: 2px; }
+      .kc-blind-arena.landscape .kc-blind-col-body { padding: 3px 4px; border-width: 2px; min-height: 0; }
+      .kc-blind-arena.landscape .kc-blind-col-chip { width: 30px; height: 30px; margin-bottom: 1px; }
+      .kc-blind-arena.landscape .kc-target-score.lg { font-size: 16px; margin: 1px 0; }
+      .kc-blind-arena.landscape .kc-score-chip-canvas { width: 15px; height: 15px; }
+      .kc-blind-arena.landscape .kc-blind-reward { font-size: 11px; }
+      .kc-blind-arena.landscape .kc-blind-col-desc {
+        font-size: 10px;
+        padding: 2px 4px;
+        margin-top: 2px;
+        line-height: 1.15;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
+      .kc-blind-arena.landscape .kc-skip-box { padding: 4px 5px; gap: 3px; border-width: 2px; }
+      .kc-blind-arena.landscape .kc-skip-box .kc-btn-sm { padding: 3px 6px; font-size: 12px; }
+      .kc-blind-arena.landscape .kc-skip-tag-row { gap: 5px; }
+      .kc-blind-arena.landscape .kc-tag-canvas { width: 22px; height: 22px; }
+      .kc-blind-arena.landscape .kc-skip-tag-name { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .kc-blind-arena.landscape .kc-skip-tag-desc {
+        font-size: 9px;
+        line-height: 1.15;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .kc-blind-arena.landscape .kc-skip-preview-lbl,
+      .kc-blind-arena.landscape .kc-boss-ante-foot {
+        font-size: 10px;
+        padding: 2px 4px;
+      }
 
       .kc-blind-arena.portrait {
         display: flex;
@@ -5259,6 +5328,14 @@ export class UiOverlay {
         opacity: 0.74;
         letter-spacing: 0.04em;
       }
+      .kc-mode-mobile-landscape .kc-pocket-stamp.inside {
+        top: 2px;
+        left: 6px;
+        bottom: auto;
+        right: auto;
+        font-size: 9px;
+        opacity: 0.72;
+      }
       .kc-price-tag.compact {
         font-size: 12px;
         padding: 0 6px 1px;
@@ -5274,11 +5351,15 @@ export class UiOverlay {
         min-height: 24px;
       }
       .kc-pack-banner.compact {
-        padding: 4px 8px;
+        padding: 2px 8px;
         border-width: 2px;
       }
-      .kc-pack-banner.compact .kc-pack-title { font-size: 14px; margin-right: 8px; }
-      .kc-pack-banner.compact .kc-pack-sub { font-size: 12px; }
+      .kc-pack-banner.compact .kc-btn-sm {
+        padding: 2px 9px;
+        font-size: 12px;
+      }
+      .kc-pack-banner.compact .kc-pack-title { font-size: 13px; margin-right: 8px; }
+      .kc-pack-banner.compact .kc-pack-sub { font-size: 11px; }
       .kc-pack-banner-text {
         min-width: 0;
         overflow: hidden;
@@ -5291,6 +5372,28 @@ export class UiOverlay {
       /* =================================================================== */
       .kc-tooltip {
         max-width: min(264px, calc(100vw - 16px));
+      }
+      .kc-mode-mobile-landscape .kc-tooltip {
+        width: 222px;
+        padding: 6px 8px 7px;
+        border-radius: 10px;
+      }
+      .kc-mode-mobile-landscape .kc-tt-title {
+        font-size: 16px;
+        margin-bottom: 4px;
+      }
+      .kc-mode-mobile-landscape .kc-tt-desc {
+        padding: 5px 7px;
+        font-size: 13px;
+        line-height: 1.28;
+      }
+      .kc-mode-mobile-landscape .kc-tt-badges {
+        gap: 4px;
+        margin-top: 5px;
+      }
+      .kc-mode-mobile-landscape .kc-tt-badge {
+        font-size: 11px;
+        padding: 1px 6px 2px;
       }
       .kc-tooltip.pinned {
         box-shadow:
