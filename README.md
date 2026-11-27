@@ -2,6 +2,8 @@
 
 **Krunked Cards** is a roguelike poker deckbuilder built from the ground up with TypeScript, WebGL2 (GLSL ES 3.00), Web Audio API, and a 100% deterministic 60 Hz simulation engine.
 
+**Play Online:** https://krunked-fpv.github.io/krunked-cards/
+
 ## Features
 
 - **Complete Roguelike Poker Engine**: 12 poker hands (including secret Flush Five, Flush House, and Five of a Kind), 150 Jokers across 4 rarities, 22 Tarots, 12 Planets, 18 Spectrals, 32 Vouchers (16 Tier-1 / Tier-2 upgrade pairs), 32 Booster Packs, 30 Blinds (Small, Big, 23 Boss Blinds, and 5 Ante-8 Showdown Bosses), 24 Skip Tags, 15 Playable Decks, 8 Cumulative Stakes, and 20 Challenges — plus Endless Mode beyond Ante 8.
