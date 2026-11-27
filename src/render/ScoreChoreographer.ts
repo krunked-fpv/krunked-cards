@@ -44,12 +44,17 @@ export interface ChoreographerDisplay {
   activeSourceId: string | null;
   chipsPulse: number;
   multPulse: number;
-  // Optional impact polish telemetry for WebGL2Renderer
+  // Optional impact & choreography telemetry (backwards-compatible)
+  fastForward?: boolean;
+  progressRatio?: number;
   screenFlash?: number;
   screenFlashColor?: [number, number, number];
   shakeX?: number;
   shakeY?: number;
 }
+
+const FAST_FORWARD_MULTIPLIER = 2.6;
+const MAX_EFFECTIVE_SPEED = 8.5;
 
 export class ScoreChoreographer {
   private beats: ScoreBeat[] = [];
@@ -57,6 +62,9 @@ export class ScoreChoreographer {
   private beatTimerMs = 0;
   private active = false;
   private finishedCallback: (() => void) | null = null;
+
+  private fastForward = false;
+  private fastForwardMul = 1;
 
   private displayChips = 0;
   private displayMult = 0;
@@ -80,6 +88,10 @@ export class ScoreChoreographer {
   private shakeY = 0;
   private reducedMotion = false;
 
+  // Cached viewport dimensions for mobile-safe popup clamping & compact staggering
+  private lastViewportW = 1280;
+  private lastViewportH = 720;
+
   private particles: ParticleSystem | null = null;
   private onGlitchImpulse: ((intensity: number) => void) | null = null;
 
@@ -95,6 +107,14 @@ export class ScoreChoreographer {
     this.onGlitchImpulse = cb;
   }
 
+  setFastForward(active: boolean): void {
+    this.fastForward = Boolean(active);
+  }
+
+  isFastForwarding(): boolean {
+    return this.fastForward;
+  }
+
   triggerImpactFlash(
     amount: number,
     color: [number, number, number] = [1, 1, 1],
@@ -108,6 +128,52 @@ export class ScoreChoreographer {
     }
   }
 
+  /**
+   * Celebratory hand level-up burst: cyan/purple sparkle particles,
+   * crisp `LEVEL UP!` popup (clamped mobile-safe), and optional shimmer SFX.
+   */
+  triggerLevelUpCelebration(
+    x: number,
+    y: number,
+    handLabel: string,
+    audio?: IAudioEngine
+  ): void {
+    const pos = this.clampPopupPos(x, y);
+    const compact = this.isCompactViewport();
+
+    this.particles?.emitStarBurst(pos.x, pos.y, '#4ce6ff', 1.25);
+    this.particles?.emitAccentBurst(pos.x, pos.y, 'purple');
+    this.triggerImpactFlash(0.24, [0.46, 0.86, 1.0], 2.2);
+
+    const cleanLabel = typeof handLabel === 'string' ? handLabel.trim() : '';
+    this.spawnPopup('LEVEL UP!', pos.x, pos.y, PALETTE.PURPLE, '#ffffff', 1.25, {
+      subtext: cleanLabel || undefined,
+      scale: compact ? 0.92 : 1.08,
+      vy: compact ? -28 : -38,
+    });
+    if (cleanLabel) {
+      const subOffsetY = compact ? 22 : 28;
+      this.spawnPopup(cleanLabel, pos.x, pos.y + subOffsetY, PALETTE.CHIPS, '#ffffff', 1.15, {
+        scale: compact ? 0.8 : 0.92,
+        vy: compact ? -24 : -32,
+      });
+    }
+
+    if (audio) {
+      audio.playSfx('polychrome1', { pitch: 1.06, volume: 0.85 });
+      audio.playSfx('tarot1', { pitch: 1.14, volume: 0.72 });
+    }
+  }
+
+  /**
+   * Celebratory round-clear / victory starburst with golden flash.
+   */
+  triggerRoundClearBurst(x: number, y: number): void {
+    const pos = this.clampPopupPos(x, y);
+    this.particles?.triggerRoundClearBurst(pos.x, pos.y);
+    this.triggerImpactFlash(0.3, [1.0, 0.92, 0.58], 3.2);
+  }
+
   isActive(): boolean {
     return this.active;
   }
@@ -117,6 +183,10 @@ export class ScoreChoreographer {
   }
 
   getDisplay(): ChoreographerDisplay {
+    const progressRatio =
+      this.active && this.beats.length > 0
+        ? Math.min(1, Math.max(0, (this.beatIndex + 1) / this.beats.length))
+        : 0;
     return {
       active: this.active,
       displayChips: Math.round(this.displayChips),
@@ -128,6 +198,8 @@ export class ScoreChoreographer {
       activeSourceId: this.activeSourceId,
       chipsPulse: this.chipsPulse,
       multPulse: this.multPulse,
+      fastForward: this.fastForward,
+      progressRatio,
       screenFlash: this.screenFlash,
       screenFlashColor: this.screenFlashColor,
       shakeX: this.shakeX,
@@ -142,6 +214,9 @@ export class ScoreChoreographer {
     audio: IAudioEngine,
     onComplete: () => void
   ): void {
+    const geom = scene.getGeometry();
+    this.syncViewport(geom.viewportW, geom.viewportH);
+
     const key = `${state.tick}:${state.round}:${state.handsLeft}:${beats.length}`;
     if (this.active && this.lastPlayedBeatKey === key) return;
     this.lastPlayedBeatKey = key;
@@ -175,6 +250,8 @@ export class ScoreChoreographer {
     this.beatIndex = -1;
     this.beatTimerMs = 0;
     this.active = false;
+    this.fastForward = false;
+    this.fastForwardMul = 1;
     this.finishedCallback = null;
     this.displayHandScore = null;
     this.activeSourceId = null;
@@ -194,22 +271,27 @@ export class ScoreChoreographer {
     y: number,
     bgColor: string,
     textColor = '#ffffff',
-    lifetime = 0.85
+    lifetime = 0.85,
+    opts?: { subtext?: string; scale?: number; vy?: number }
   ): void {
+    const compact = this.isCompactViewport();
+    const pos = this.clampPopupPos(x, y);
+    const maxPopups = compact ? 14 : 24;
     this.popups.push({
       id: this.nextPopupId++,
       text,
-      x,
-      y,
-      vy: -42,
+      subtext: opts?.subtext,
+      x: pos.x,
+      y: pos.y,
+      vy: opts?.vy ?? (compact ? -30 : -42),
       bgColor,
       textColor,
       age: 0,
       lifetime,
-      scale: 1,
-      rotation: (Math.random() - 0.5) * 0.12,
+      scale: opts?.scale ?? (compact ? 0.84 : 1),
+      rotation: (Math.random() - 0.5) * (compact ? 0.08 : 0.12),
     });
-    if (this.popups.length > 24) {
+    while (this.popups.length > maxPopups) {
       this.popups.shift();
     }
   }
@@ -224,11 +306,27 @@ export class ScoreChoreographer {
   ): void {
     this.reducedMotion = reducedMotion;
     const safeDt = Math.min(0.05, Math.max(0.001, dt));
+    const geom = scene.getGeometry();
+    this.syncViewport(geom.viewportW, geom.viewportH);
 
-    // Smooth numeric easing for display counters
-    const kNum = 1 - Math.exp(-18 * safeDt);
+    // Smooth hold-to-accelerate ramp (1.0x <-> 2.6x)
+    const targetFfMul = this.fastForward ? FAST_FORWARD_MULTIPLIER : 1;
+    const ffLerp = 1 - Math.exp(-16 * safeDt);
+    this.fastForwardMul += (targetFfMul - this.fastForwardMul) * ffLerp;
+    if (Math.abs(targetFfMul - this.fastForwardMul) < 0.01) {
+      this.fastForwardMul = targetFfMul;
+    }
+
+    // Smooth numeric easing for display counters (tracks faster during fast-forward)
+    const kNum = 1 - Math.exp(-18 * Math.min(FAST_FORWARD_MULTIPLIER, this.fastForwardMul) * safeDt);
     this.displayChips += (this.targetChipsVal - this.displayChips) * kNum;
     this.displayMult += (this.targetMultVal - this.displayMult) * kNum;
+    if (Math.abs(this.targetChipsVal - this.displayChips) < 0.35) {
+      this.displayChips = this.targetChipsVal;
+    }
+    if (Math.abs(this.targetMultVal - this.displayMult) < 0.005) {
+      this.displayMult = this.targetMultVal;
+    }
     this.chipsPulse = Math.max(0, this.chipsPulse - safeDt * 3.8);
     this.multPulse = Math.max(0, this.multPulse - safeDt * 3.8);
 
@@ -273,24 +371,56 @@ export class ScoreChoreographer {
     }
     audio.setFireIntensity(Math.min(1, this.flameIntensity / 6));
 
-    // Step floating popups
+    // Step floating popups & enforce mobile-safe viewport clamping continuously
+    const effectiveSpeed = Math.min(MAX_EFFECTIVE_SPEED, Math.max(0.25, gameSpeed) * this.fastForwardMul);
+    const popupAgeScale = Math.max(1, effectiveSpeed * 0.6);
     for (let i = this.popups.length - 1; i >= 0; i--) {
       const p = this.popups[i]!;
-      p.age += safeDt * Math.max(1, gameSpeed * 0.65);
+      p.age += safeDt * popupAgeScale;
       p.y += p.vy * safeDt;
       p.vy *= Math.exp(-3.2 * safeDt);
+      const clamped = this.clampPopupPos(p.x, p.y, geom.viewportW, geom.viewportH);
+      p.x = clamped.x;
+      p.y = clamped.y;
       if (p.age >= p.lifetime) {
         this.popups.splice(i, 1);
       }
     }
 
-    // Advance beat queue if scoring is active
+    // Advance beat queue if scoring is active (capped so every beat fires cleanly)
     if (!this.active) return;
 
-    this.beatTimerMs -= safeDt * 1000 * gameSpeed;
+    this.beatTimerMs -= safeDt * 1000 * effectiveSpeed;
     if (this.beatTimerMs <= 0) {
       this.advanceBeat(state, scene, audio);
     }
+  }
+
+  private syncViewport(viewportW: number, viewportH: number): void {
+    if (Number.isFinite(viewportW) && viewportW > 0) this.lastViewportW = viewportW;
+    if (Number.isFinite(viewportH) && viewportH > 0) this.lastViewportH = viewportH;
+  }
+
+  private isCompactViewport(vw = this.lastViewportW, vh = this.lastViewportH): boolean {
+    return vw < 760 || vh < 480;
+  }
+
+  private clampPopupPos(
+    x: number,
+    y: number,
+    vw = this.lastViewportW,
+    vh = this.lastViewportH
+  ): { x: number; y: number } {
+    const safeW = Number.isFinite(vw) && vw > 0 ? vw : 1280;
+    const safeH = Number.isFinite(vh) && vh > 0 ? vh : 720;
+    const minX = 48;
+    const maxX = Math.max(96, safeW - 48);
+    const minY = 26;
+    const maxY = Math.max(64, safeH - 36);
+    return {
+      x: Math.min(maxX, Math.max(minX, Number.isFinite(x) ? x : minX)),
+      y: Math.min(maxY, Math.max(minY, Number.isFinite(y) ? y : minY)),
+    };
   }
 
   private advanceBeat(
@@ -322,10 +452,15 @@ export class ScoreChoreographer {
     // Juice the source card / joker / consumable
     const nowSec = performance.now() / 1000;
     const geom = scene.getGeometry();
+    this.syncViewport(geom.viewportW, geom.viewportH);
+    const compact = this.isCompactViewport(geom.viewportW, geom.viewportH);
+    const topRowThreshold = compact ? Math.min(135, geom.viewportH * 0.34) : 185;
+
     let emitX = geom.playArea.x + geom.playArea.w * 0.5;
     let emitY = geom.playArea.y + geom.playArea.h * 0.46;
     let popupX = emitX;
     let popupY = geom.playArea.y + geom.playArea.h * 0.36;
+    let spawnBelow = false;
 
     if (beat.sourceId) {
       const vc = scene.getVisualCardById(beat.sourceId);
@@ -343,26 +478,38 @@ export class ScoreChoreographer {
         emitX = vc.moveable.vx;
         emitY = vc.moveable.vy;
         popupX = vc.moveable.vx;
-        // For top-row Jokers/Consumables, spawn popups slightly below card center so they never clip y < 0
-        if (vc.moveable.vy < 185) {
-          popupY = vc.moveable.vy + vc.moveable.vh * 0.36;
+        // For top-row Jokers/Consumables, spawn popups slightly below card center so they never clip y < 26
+        if (vc.moveable.vy < topRowThreshold) {
+          spawnBelow = true;
+          popupY = vc.moveable.vy + vc.moveable.vh * (compact ? 0.28 : 0.36);
         } else {
-          popupY = Math.max(26, vc.moveable.vy - vc.moveable.vh * 0.48);
+          popupY = vc.moveable.vy - vc.moveable.vh * (compact ? 0.36 : 0.48);
         }
-        // Stagger overlapping popups near the same card cleanly
-        let overlaps = 0;
-        for (const existing of this.popups) {
-          if (Math.abs(existing.x - popupX) < 56 && Math.abs(existing.y - popupY) < 34) {
-            overlaps++;
-          }
-        }
-        if (overlaps > 0) {
-          popupY += (vc.moveable.vy < 185 ? 28 : -28) * overlaps;
-          popupX += (overlaps % 2 === 1 ? 18 : -18);
-        }
-        popupY = Math.max(24, popupY);
+      }
+    } else if (popupY < topRowThreshold) {
+      spawnBelow = true;
+    }
+
+    // Stagger overlapping popups cleanly with compact mobile spacing
+    const overlapDx = compact ? 44 : 56;
+    const overlapDy = compact ? 24 : 34;
+    let overlaps = 0;
+    for (const existing of this.popups) {
+      if (Math.abs(existing.x - popupX) < overlapDx && Math.abs(existing.y - popupY) < overlapDy) {
+        overlaps++;
       }
     }
+    if (overlaps > 0) {
+      const stepY = compact ? 20 : 28;
+      const stepX = compact ? 14 : 18;
+      const clampedStep = Math.min(overlaps, 3);
+      popupY += (spawnBelow ? stepY : -stepY) * clampedStep;
+      popupX += (overlaps % 2 === 1 ? 1 : -1) * stepX * Math.min(Math.ceil(overlaps / 2), 2);
+    }
+
+    const clampedPopup = this.clampPopupPos(popupX, popupY, geom.viewportW, geom.viewportH);
+    popupX = clampedPopup.x;
+    popupY = clampedPopup.y;
 
     // Emit crisp pixel particles & subtle impact flash / micro-shake
     if (beat.kind === 'card_shatter') {
@@ -379,12 +526,22 @@ export class ScoreChoreographer {
       this.particles?.emitAccentBurst(emitX, emitY, 'purple');
       this.triggerImpactFlash(0.32, [0.72, 0.55, 1.0], 3.5);
     } else if (beat.kind === 'blind_clear') {
-      this.particles?.emitAccentBurst(emitX, emitY, 'celebrate');
-      this.triggerImpactFlash(0.28, [1.0, 0.92, 0.62], 3.0);
+      this.triggerRoundClearBurst(emitX, emitY);
+    } else if (beat.kind === 'mr_bones_save') {
+      this.particles?.emitStarBurst(emitX, emitY, PALETTE.GOLD, 1.3);
+      this.triggerImpactFlash(0.35, [1.0, 0.88, 0.48], 3.5);
     } else {
       if (beat.xMult && beat.xMult !== 1) {
         const multWeight = Math.min(2.5, Math.max(1, beat.xMult * 0.65));
         this.particles?.emitMultBurst(emitX, emitY, true, multWeight);
+        if (beat.xMult >= 2) {
+          this.particles?.emitStarBurst(
+            emitX,
+            emitY,
+            beat.xMult >= 3 ? '#ffd859' : PALETTE.MULT,
+            Math.min(1.6, 0.75 + beat.xMult * 0.2)
+          );
+        }
         if (beat.xMult >= 1.5) {
           this.triggerImpactFlash(
             Math.min(0.48, 0.18 + beat.xMult * 0.08),
@@ -406,7 +563,7 @@ export class ScoreChoreographer {
     // Spawn crisp colored floating pill matching the beat deltas / message
     const pill = formatBeatPill(beat);
     if (pill) {
-      this.spawnPopup(pill.text, popupX, popupY, pill.bgColor, '#ffffff', 0.92);
+      this.spawnPopup(pill.text, popupX, popupY, pill.bgColor, '#ffffff', compact ? 0.82 : 0.92);
     }
 
     // Play pitch-escalating SFX (`pitch = 0.3 + 0.08 * pitchStep`)
@@ -414,7 +571,7 @@ export class ScoreChoreographer {
     if (soundKey) {
       const step = beat.pitchStep ?? Math.min(18, this.beatIndex + 5);
       const pitch = Math.max(0.35, Math.min(2.4, 0.3 + 0.08 * step));
-      audio.playSfx(soundKey, { pitch, volume: 0.95 });
+      audio.playSfx(soundKey, { pitch, volume: this.fastForward ? 0.84 : 0.95 });
     }
   }
 

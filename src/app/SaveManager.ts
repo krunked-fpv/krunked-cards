@@ -11,11 +11,14 @@ import {
   type GameSpeed,
   type ProfileProgress,
   type RenderSettings,
+  type RunHistoryEntry,
   type SaveData,
   type SimState,
   type StakeLevel,
   type TargetFps,
 } from '../contracts/index.ts';
+
+export const MAX_RUN_HISTORY = 15 as const;
 
 export function createDefaultProfile(): ProfileProgress {
   return {
@@ -29,6 +32,7 @@ export function createDefaultProfile(): ProfileProgress {
     bestHandScore: 0,
     runsPlayed: 0,
     runsWon: 0,
+    runHistory: [],
   };
 }
 
@@ -98,6 +102,83 @@ function sanitizeStringList(raw: unknown): string[] {
   return Array.from(new Set(raw.filter((x): x is string => typeof x === 'string')));
 }
 
+function sanitizeStakeLevel(v: unknown): StakeLevel {
+  if (typeof v === 'number' && Number.isFinite(v)) {
+    const floored = Math.floor(v);
+    if (floored >= 1 && floored <= 8) return floored as StakeLevel;
+  }
+  return 1;
+}
+
+function sanitizeRunHistory(raw: unknown): RunHistoryEntry[] {
+  if (!Array.isArray(raw)) return [];
+  const out: RunHistoryEntry[] = [];
+  const seenIds = new Set<string>();
+
+  for (let i = 0; i < raw.length && out.length < MAX_RUN_HISTORY; i++) {
+    const item = raw[i];
+    if (!item || typeof item !== 'object') continue;
+    const r = item as Record<string, unknown>;
+    if (typeof r.deckId !== 'string' || r.deckId.trim().length === 0) continue;
+
+    const deckId = r.deckId.trim().slice(0, 64);
+    const seed = typeof r.seed === 'string' ? r.seed.slice(0, 64) : '';
+    const ante = Math.floor(clampNum(r.ante, 0, 999, 1));
+    const round = Math.floor(clampNum(r.round, 0, 9999, 0));
+    const won = typeof r.won === 'boolean' ? r.won : false;
+    const stake = sanitizeStakeLevel(r.stake);
+    const idRaw = typeof r.id === 'string' && r.id.trim().length > 0 ? r.id.trim().slice(0, 160) : '';
+    const id = idRaw || `legacy:${seed}:${deckId}:${stake}:${ante}:${round}:${won ? 'win' : 'loss'}:${i}`;
+    if (seenIds.has(id)) continue;
+    seenIds.add(id);
+
+    const jokerKeys = Array.isArray(r.jokerKeys)
+      ? r.jokerKeys
+          .filter((k): k is string => typeof k === 'string' && k.trim().length > 0)
+          .slice(0, 24)
+      : [];
+
+    const finishedAt =
+      typeof r.finishedAt === 'string' && r.finishedAt.trim().length > 0
+        ? r.finishedAt.trim().slice(0, 64)
+        : new Date().toISOString();
+
+    out.push({
+      id,
+      finishedAt,
+      won,
+      deckId,
+      stake,
+      challengeId:
+        typeof r.challengeId === 'string' && r.challengeId.trim().length > 0
+          ? r.challengeId.trim().slice(0, 64)
+          : null,
+      seed,
+      ante,
+      round,
+      bestHand: Math.floor(clampNum(r.bestHand, 0, Number.MAX_SAFE_INTEGER, 0)),
+      jokerKeys,
+      defeatedBy:
+        !won && typeof r.defeatedBy === 'string' && r.defeatedBy.trim().length > 0
+          ? r.defeatedBy.trim().slice(0, 64)
+          : null,
+    });
+  }
+
+  return out;
+}
+
+function buildRunHistoryId(state: SimState, won: boolean): string {
+  const seed = typeof state.rng?.seed === 'string' ? state.rng.seed.slice(0, 64) : '';
+  const deckId = typeof state.deckId === 'string' ? state.deckId : 'b_red';
+  const stake = sanitizeStakeLevel(state.stake);
+  const challengeId = typeof state.challengeId === 'string' ? state.challengeId : '';
+  const ante = Math.max(0, Math.floor(Number.isFinite(state.ante) ? state.ante : 0));
+  const round = Math.max(0, Math.floor(Number.isFinite(state.round) ? state.round : 0));
+  const tick = Math.max(0, Math.floor(Number.isFinite(state.tick) ? state.tick : 0));
+  return `run:${seed}:${deckId}:${stake}:${challengeId}:${ante}:${round}:${tick}:${won ? 'win' : 'loss'}`;
+}
+
 function sanitizeProfile(raw: unknown): ProfileProgress {
   const base = createDefaultProfile();
   if (!raw || typeof raw !== 'object') return base;
@@ -121,6 +202,7 @@ function sanitizeProfile(raw: unknown): ProfileProgress {
     bestHandScore: clampNum(r.bestHandScore, 0, Number.MAX_SAFE_INTEGER, 0),
     runsPlayed: clampNum(r.runsPlayed, 0, Number.MAX_SAFE_INTEGER, 0),
     runsWon: clampNum(r.runsWon, 0, Number.MAX_SAFE_INTEGER, 0),
+    runHistory: sanitizeRunHistory(r.runHistory),
   };
 }
 
@@ -143,6 +225,7 @@ function isValidSimState(raw: unknown): raw is SimState {
 
 export class SaveManager {
   private data: SaveData;
+  private recordedRunIds = new Set<string>();
 
   constructor() {
     this.data = this.load();
@@ -160,15 +243,31 @@ export class SaveManager {
     return this.data.profile;
   }
 
+  getRunHistory(): RunHistoryEntry[] {
+    const history = this.data.profile.runHistory ?? [];
+    return history.map((entry) => ({
+      ...entry,
+      jokerKeys: entry.jokerKeys.slice(),
+    }));
+  }
+
   getActiveRun(): SimState | null {
     return this.data.activeRun;
   }
 
   load(): SaveData {
     try {
-      if (typeof localStorage === 'undefined') return createDefaultSave();
+      if (typeof localStorage === 'undefined') {
+        const fresh = createDefaultSave();
+        this.recordedRunIds.clear();
+        return fresh;
+      }
       const raw = localStorage.getItem(SAVE_STORAGE_KEY);
-      if (!raw) return createDefaultSave();
+      if (!raw) {
+        const fresh = createDefaultSave();
+        this.recordedRunIds.clear();
+        return fresh;
+      }
       const parsed = JSON.parse(raw) as Record<string, unknown>;
       if (!parsed || typeof parsed !== 'object' || parsed.version !== SAVE_SCHEMA_VERSION) {
         return this.recoverCorruptSave();
@@ -181,15 +280,25 @@ export class SaveManager {
         activeRun: isValidSimState(parsed.activeRun) ? parsed.activeRun : null,
       };
       this.data = save;
+      this.syncRecordedRunIds();
       return save;
     } catch {
       return this.recoverCorruptSave();
     }
   }
 
+  private syncRecordedRunIds(): void {
+    this.recordedRunIds.clear();
+    const history = this.data.profile.runHistory ?? [];
+    for (const entry of history) {
+      if (entry.id) this.recordedRunIds.add(entry.id);
+    }
+  }
+
   private recoverCorruptSave(): SaveData {
     const fresh = createDefaultSave();
     this.data = fresh;
+    this.recordedRunIds.clear();
     this.persist();
     return fresh;
   }
@@ -224,6 +333,12 @@ export class SaveManager {
     this.persist();
   }
 
+  recordRunFinished(state: SimState, won: boolean): void {
+    this.recordDiscoveriesFromState(state);
+    this.appendRunHistory(state, won);
+    this.persist();
+  }
+
   recordRunWon(state: SimState): void {
     this.data.profile.runsWon += 1;
     const prev = this.data.profile.deckMaxStake[state.deckId] ?? 0;
@@ -237,7 +352,62 @@ export class SaveManager {
       this.data.profile.challengesCompleted.push(state.challengeId);
     }
     this.recordDiscoveriesFromState(state);
+    this.appendRunHistory(state, true);
     this.persist();
+  }
+
+  private appendRunHistory(state: SimState, won: boolean): boolean {
+    const id = buildRunHistoryId(state, won);
+    const history = this.data.profile.runHistory ?? (this.data.profile.runHistory = []);
+    if (this.recordedRunIds.has(id) || history.some((e) => e.id === id)) {
+      return false;
+    }
+
+    const activeBlindName = state.blinds?.[state.activeBlindSlot]?.name ?? null;
+    const defeatedBy = won
+      ? null
+      : (typeof state.stats?.defeatedBy === 'string' && state.stats.defeatedBy.trim().length > 0
+          ? state.stats.defeatedBy.trim()
+          : activeBlindName);
+
+    const bestHand = Math.floor(
+      clampNum(
+        Math.max(state.stats?.bestHand ?? 0, state.lastHandScore ?? 0),
+        0,
+        Number.MAX_SAFE_INTEGER,
+        0
+      )
+    );
+
+    const entry: RunHistoryEntry = {
+      id,
+      finishedAt: new Date().toISOString(),
+      won,
+      deckId: typeof state.deckId === 'string' && state.deckId.trim().length > 0 ? state.deckId : 'b_red',
+      stake: sanitizeStakeLevel(state.stake),
+      challengeId:
+        typeof state.challengeId === 'string' && state.challengeId.trim().length > 0
+          ? state.challengeId
+          : null,
+      seed: typeof state.rng?.seed === 'string' ? state.rng.seed.slice(0, 64) : '',
+      ante: Math.floor(clampNum(state.ante, 0, 999, 1)),
+      round: Math.floor(clampNum(state.round, 0, 9999, 0)),
+      bestHand,
+      jokerKeys: Array.isArray(state.jokers)
+        ? state.jokers
+            .map((j) => j.key)
+            .filter((k): k is string => typeof k === 'string' && k.trim().length > 0)
+            .slice(0, 24)
+        : [],
+      defeatedBy,
+    };
+
+    history.unshift(entry);
+    if (history.length > MAX_RUN_HISTORY) {
+      history.length = MAX_RUN_HISTORY;
+    }
+    this.recordedRunIds.add(id);
+    return true;
   }
 
   private recordDiscoveriesFromState(state: SimState): void {
@@ -273,6 +443,7 @@ export class SaveManager {
 
   resetAll(): void {
     this.data = createDefaultSave();
+    this.recordedRunIds.clear();
     try {
       if (typeof localStorage !== 'undefined') {
         localStorage.removeItem(SAVE_STORAGE_KEY);

@@ -75,6 +75,10 @@ export class AudioEngine implements IAudioEngine {
   private mode: 'builtin' | 'custom' = 'builtin';
   private disposed = false;
   private unlockInFlight = false;
+  private suspendedManually = false;
+  private autoSuspended = false;
+  private hasUnlockedOnce = false;
+  private visibilityHandler: (() => void) | null = null;
 
   // Polyphony tracker (unified across procedural & custom SFX voices)
   private readonly activeVoices: ActiveVoice[] = [];
@@ -104,6 +108,18 @@ export class AudioEngine implements IAudioEngine {
   private customFire2: CustomFireChannel | null = null;
   private customFireActive = false;
 
+  constructor() {
+    // Mobile Safari / Chrome lifecycle: safely pause when backgrounded & resume on return
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      this.visibilityHandler = () => this.handleVisibilityChange();
+      try {
+        document.addEventListener('visibilitychange', this.visibilityHandler);
+      } catch {
+        this.visibilityHandler = null;
+      }
+    }
+  }
+
   private ensureGraph(): boolean {
     if (this.disposed) return false;
     if (this.ctx) return true;
@@ -114,11 +130,11 @@ export class AudioEngine implements IAudioEngine {
     try {
       const ctx = new Ctor();
       const limiter = ctx.createDynamicsCompressor();
-      limiter.threshold.value = -8;
-      limiter.knee.value = 12;
-      limiter.ratio.value = 10;
-      limiter.attack.value = 0.003;
-      limiter.release.value = 0.12;
+      limiter.threshold.value = -6;
+      limiter.knee.value = 10;
+      limiter.ratio.value = 12;
+      limiter.attack.value = 0.002;
+      limiter.release.value = 0.1;
       limiter.connect(ctx.destination);
 
       const masterGain = ctx.createGain();
@@ -162,9 +178,12 @@ export class AudioEngine implements IAudioEngine {
     if (this.disposed) return;
     if (!this.ensureGraph() || !this.ctx) return;
 
+    this.suspendedManually = false;
+    this.autoSuspended = false;
     this.unlockInFlight = true;
     try {
-      if (this.ctx.state === 'suspended') {
+      const state = this.ctx.state as string;
+      if (state !== 'running' && state !== 'closed') {
         await this.ctx.resume();
       }
     } catch {
@@ -176,11 +195,139 @@ export class AudioEngine implements IAudioEngine {
     if (this.disposed || !this.ctx) return;
 
     if (this.ctx.state === 'running') {
+      this.hasUnlockedOnce = true;
+      this.applyMasterFadeIn(false);
+      this.sequencer?.resyncClock();
       this.sequencer?.start();
-      if (this.mode === 'custom' && this.customUrls) {
+      if (this.mode === 'custom' && this.customUrls && !this.customMusicActive) {
         void this.bootstrapCustomLoops(this.packGeneration);
       }
     }
+  }
+
+  suspend(): void {
+    if (this.disposed) return;
+    this.suspendedManually = true;
+    this.autoSuspended = false;
+    this.stopActiveSfxVoices(0.01);
+    this.suspendContextSafely();
+  }
+
+  resume(): void {
+    if (this.disposed) return;
+    this.suspendedManually = false;
+    this.autoSuspended = false;
+    if (!this.ctx) return;
+    this.resumeContextSafely(true);
+  }
+
+  private handleVisibilityChange(): void {
+    if (this.disposed || typeof document === 'undefined') return;
+    const isHidden = Boolean(document.hidden || document.visibilityState === 'hidden');
+    if (isHidden) {
+      if (this.ctx && this.ctx.state === 'running') {
+        this.autoSuspended = true;
+        this.stopActiveSfxVoices(0.008);
+        this.suspendContextSafely();
+      }
+      return;
+    }
+
+    if (
+      !this.suspendedManually &&
+      this.ctx &&
+      (this.autoSuspended || (this.hasUnlockedOnce && this.ctx.state !== 'running'))
+    ) {
+      this.autoSuspended = false;
+      this.resumeContextSafely(true);
+    }
+  }
+
+  private suspendContextSafely(): void {
+    if (!this.ctx) return;
+    try {
+      if (this.ctx.state === 'running') {
+        if (this.masterGain) {
+          const now = this.ctx.currentTime;
+          try {
+            this.masterGain.gain.cancelScheduledValues(now);
+            this.masterGain.gain.setTargetAtTime(0.0001, now, 0.008);
+          } catch {
+            // ignore gain scheduling errors
+          }
+        }
+        const maybePromise = this.ctx.suspend();
+        if (maybePromise && typeof maybePromise.catch === 'function') {
+          void maybePromise.catch(() => {});
+        }
+      }
+    } catch {
+      // Never throw on restricted/mock audio contexts
+    }
+  }
+
+  private resumeContextSafely(fadeIn: boolean): void {
+    if (this.disposed || !this.ctx) return;
+    const state = this.ctx.state as string;
+    if (state === 'closed') return;
+
+    const onRunning = () => {
+      if (this.disposed || !this.ctx || this.suspendedManually) return;
+      if (this.ctx.state !== 'running') return;
+      this.hasUnlockedOnce = true;
+      this.applyMasterFadeIn(fadeIn);
+      this.sequencer?.resyncClock();
+      this.sequencer?.start();
+      if (this.mode === 'custom' && this.customUrls && !this.customMusicActive) {
+        void this.bootstrapCustomLoops(this.packGeneration);
+      }
+    };
+
+    if (state === 'running') {
+      onRunning();
+      return;
+    }
+
+    try {
+      const maybePromise = this.ctx.resume();
+      if (maybePromise && typeof maybePromise.then === 'function') {
+        maybePromise.then(onRunning).catch(() => {});
+      } else {
+        onRunning();
+      }
+    } catch {
+      // Mobile browsers may require the next touch gesture to resume; ignore safely
+    }
+  }
+
+  private applyMasterFadeIn(fadeIn: boolean): void {
+    if (!this.ctx || !this.masterGain) return;
+    const now = this.ctx.currentTime;
+    const target = clamp(this.masterVolume, 0, 1);
+    try {
+      this.masterGain.gain.cancelScheduledValues(now);
+      if (fadeIn && target > 0.001 && this.ctx.state === 'running') {
+        this.masterGain.gain.setValueAtTime(0.0001, now);
+        this.masterGain.gain.linearRampToValueAtTime(target, now + 0.035);
+      } else if (this.ctx.state === 'running') {
+        this.masterGain.gain.setTargetAtTime(target, now, 0.015);
+      } else {
+        this.masterGain.gain.value = target;
+      }
+    } catch {
+      this.masterGain.gain.value = target;
+    }
+  }
+
+  private stopActiveSfxVoices(fadeOutSec: number): void {
+    for (const v of this.activeVoices) {
+      try {
+        v.stop(fadeOutSec);
+      } catch {
+        // ignore
+      }
+    }
+    this.activeVoices.length = 0;
   }
 
   setSettings(settings: Pick<RenderSettings, 'masterVolume' | 'musicVolume' | 'sfxVolume'>): void {
@@ -273,13 +420,18 @@ export class AudioEngine implements IAudioEngine {
 
     this.enforcePolyphonyCap();
 
+    // Polyphony-aware headroom scaling so rapid 16-voice cascades remain crisp with zero clipping
+    const activeCount = this.activeVoices.length;
+    const polyScale = activeCount <= 4 ? 1 : 1 / Math.sqrt(1 + (activeCount - 4) * 0.22);
+    const effectiveVolume = volume * polyScale;
+
     // Custom Pack Mode: use cached decoded AudioBuffer if ready, otherwise lazily fetch & fall back to SynthBank
     if (this.mode === 'custom' && this.customUrls) {
       const url = this.customUrls[key];
       if (url && !this.failedUrls.has(url)) {
         const cached = this.bufferCache.get(url);
         if (cached) {
-          const voice = this.playDecodedBuffer(key, cached, pitch, volume);
+          const voice = this.playDecodedBuffer(key, cached, pitch, effectiveVolume);
           if (voice) {
             this.registerVoice(voice);
             return;
@@ -294,7 +446,7 @@ export class AudioEngine implements IAudioEngine {
     // Procedural fallback / Built-In Mode
     try {
       const voiceId = this.nextVoiceId++;
-      const voice = this.synth.play(key, this.sfxGain, { pitch, volume }, voiceId);
+      const voice = this.synth.play(key, this.sfxGain, { pitch, volume: effectiveVolume }, voiceId);
       this.registerVoice(voice);
     } catch {
       // Defensive guard so audio can never break game simulation/rendering
@@ -360,14 +512,20 @@ export class AudioEngine implements IAudioEngine {
     this.disposed = true;
     this.packGeneration++;
 
-    for (const v of this.activeVoices) {
+    if (
+      this.visibilityHandler &&
+      typeof document !== 'undefined' &&
+      typeof document.removeEventListener === 'function'
+    ) {
       try {
-        v.stop(0.005);
+        document.removeEventListener('visibilitychange', this.visibilityHandler);
       } catch {
         // ignore
       }
+      this.visibilityHandler = null;
     }
-    this.activeVoices.length = 0;
+
+    this.stopActiveSfxVoices(0.005);
 
     this.stopCustomLoops();
     this.sequencer?.dispose();
