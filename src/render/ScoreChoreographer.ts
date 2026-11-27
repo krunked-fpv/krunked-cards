@@ -178,7 +178,13 @@ export class ScoreChoreographer {
     this.finishedCallback = null;
     this.displayHandScore = null;
     this.activeSourceId = null;
+    this.flameIntensity = 0;
     this.targetFlameIntensity = 0;
+    this.screenFlash = 0;
+    this.shakeMag = 0;
+    this.shakeX = 0;
+    this.shakeY = 0;
+    this.popups = [];
     this.lastPlayedBeatKey = '';
   }
 
@@ -337,7 +343,24 @@ export class ScoreChoreographer {
         emitX = vc.moveable.vx;
         emitY = vc.moveable.vy;
         popupX = vc.moveable.vx;
-        popupY = vc.moveable.vy - vc.moveable.vh * 0.48;
+        // For top-row Jokers/Consumables, spawn popups slightly below card center so they never clip y < 0
+        if (vc.moveable.vy < 185) {
+          popupY = vc.moveable.vy + vc.moveable.vh * 0.36;
+        } else {
+          popupY = Math.max(26, vc.moveable.vy - vc.moveable.vh * 0.48);
+        }
+        // Stagger overlapping popups near the same card cleanly
+        let overlaps = 0;
+        for (const existing of this.popups) {
+          if (Math.abs(existing.x - popupX) < 56 && Math.abs(existing.y - popupY) < 34) {
+            overlaps++;
+          }
+        }
+        if (overlaps > 0) {
+          popupY += (vc.moveable.vy < 185 ? 28 : -28) * overlaps;
+          popupX += (overlaps % 2 === 1 ? 18 : -18);
+        }
+        popupY = Math.max(24, popupY);
       }
     }
 

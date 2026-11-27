@@ -463,7 +463,7 @@ void main() {
 
     float low = min(tex.r, min(tex.g, tex.b));
     float high = max(tex.r, max(tex.g, tex.b));
-    float delta = 0.2 + 0.3 * (high - low) + 0.1 * high;
+    float delta = 0.14 + 0.24 * (high - low) + 0.08 * high;
     float gridsize = 0.79;
     float fac = 0.5 * max(
       max(max(0.0, 7.0 * abs(cos(uv.x * gridsize * 20.0)) - 6.0),

@@ -767,7 +767,7 @@ export class CardSceneManager {
         m.vh = h;
         m.initialized = true;
         if (initialFlipFromBack && !reducedMotion) {
-          m.triggerFlip(true, 0.32, flipDelay);
+          m.triggerFlip(true, 0.22, flipDelay);
         }
         this.moveables.set(id, m);
       }
@@ -1047,7 +1047,7 @@ export class CardSceneManager {
         const sStep = sCount > 1 ? Math.min(sCardW + 30, (g.shopOfferTray.w - sCardW - 36) / (sCount - 1)) : 0;
         const sSpan = sStep * Math.max(0, sCount - 1);
         const sStartX = g.shopOfferTray.x + g.shopOfferTray.w * 0.5 - sSpan * 0.5;
-        const sY = g.shopOfferTray.y + sCardH * 0.5 + 10;
+        const sY = g.shopOfferTray.y + sCardH * 0.5 + 20;
 
         activeOffers.forEach((offer, idx) => {
           const shape =
@@ -1161,7 +1161,7 @@ export class CardSceneManager {
             shape.tw,
             shape.th,
             true,
-            idx * 0.06
+            idx * 0.03
           );
           m.tx = pStartX + idx * pStep;
           m.ty = pY + (reducedMotion ? 0 : Math.sin(nowSec * 2 + idx) * 3);

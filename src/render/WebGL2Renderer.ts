@@ -629,11 +629,11 @@ export class WebGL2Renderer {
     this.splashElapsed += safeDt * motionScale;
     this.titleMidFlash = Math.max(0, this.titleMidFlash - Math.max(safeDt, frame.dt) * 0.9);
 
-    // Step screen vortex pulse (vortex.fs) & brief glitch decay
+    // Step background vortex swirl pulse (vortex.fs energy applied to Pass 1 so cards stay aligned with DOM buttons!)
     let vortexStrength = 0;
     let vortexAmt = 0;
     if (!frame.settings.reducedMotion && this.vortexElapsed < this.vortexDuration) {
-      this.vortexElapsed += safeDt;
+      this.vortexElapsed += Math.max(safeDt, Math.min(0.25, frame.dt));
       const p = Math.min(1, this.vortexElapsed / this.vortexDuration);
       vortexStrength = Math.sin(p * Math.PI);
       vortexAmt = this.vortexPeakAmt * vortexStrength;
@@ -684,17 +684,18 @@ export class WebGL2Renderer {
       drawCalls++;
     } else if (this.bgProg) {
       activeShaderSet.add('background');
+      if (vortexStrength > 0.001) activeShaderSet.add('vortex');
       gl.disable(gl.BLEND);
       gl.useProgram(this.bgProg);
       gl.bindVertexArray(this.emptyVao);
       gl.uniform2f(u.bg.res, pw, ph);
       gl.uniform1f(u.bg.time, frame.timeSec * motionScale);
-      gl.uniform1f(u.bg.spinTime, this.spinTime);
+      gl.uniform1f(u.bg.spinTime, this.spinTime + vortexAmt * 0.85);
       gl.uniform4fv(u.bg.c1, this.bgCurrent.c1);
       gl.uniform4fv(u.bg.c2, this.bgCurrent.c2);
       gl.uniform4fv(u.bg.c3, this.bgCurrent.c3);
-      gl.uniform1f(u.bg.contrast, this.bgCurrent.contrast);
-      gl.uniform1f(u.bg.spinAmount, this.bgCurrent.spinAmount);
+      gl.uniform1f(u.bg.contrast, this.bgCurrent.contrast + vortexStrength * 0.55);
+      gl.uniform1f(u.bg.spinAmount, this.bgCurrent.spinAmount + vortexStrength * 0.45);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       drawCalls++;
     }
@@ -1336,8 +1337,9 @@ export class WebGL2Renderer {
       gl.uniform2f(u.crt.res, pw, ph);
       gl.uniform1f(u.crt.time, frame.timeSec);
       gl.uniform1f(u.crt.crtAmount, useCrt ? frame.settings.crtAmount / 100 : 0);
-      gl.uniform1f(u.crt.vortexStrength, vortexStrength);
-      gl.uniform1f(u.crt.vortexAmt, vortexAmt);
+      // Keep full-screen Pass 4 un-twisted so WebGL2 cards stay 100% locked onto DOM buttons
+      gl.uniform1f(u.crt.vortexStrength, 0.0);
+      gl.uniform1f(u.crt.vortexAmt, 0.0);
       gl.uniform1f(u.crt.glitchIntensity, this.glitchIntensity);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       drawCalls++;

@@ -1264,7 +1264,7 @@ export class UiOverlay {
     cards: readonly VisualCard[]
   ): string {
     // Frame sits cleanly below jokerTray/consumableTray X/Y counters (zero overlap!)
-    const boardTop = Math.max(geom.jokerTray.y + geom.jokerTray.h + 22, geom.shopOfferTray.y - 4);
+    const boardTop = Math.max(geom.jokerTray.y + geom.jokerTray.h + 20, geom.shopOfferTray.y - 10);
     const boardH = geom.viewportH - boardTop + 8;
     const controlsW = Math.max(132, geom.shopOfferTray.x - geom.table.x - 14);
     const canAfford = (cost: number) => state.dollars - state.bankruptAt >= cost;
@@ -1277,7 +1277,7 @@ export class UiOverlay {
         continue;
       }
       const cx = Math.round(vc.moveable.tx);
-      const topTagY = Math.round(vc.moveable.ty - vc.moveable.th * 0.5 - 22);
+      const topTagY = Math.round(vc.moveable.ty - vc.moveable.th * 0.5 - 18);
       const btnY = Math.round(vc.moveable.ty + vc.moveable.th * 0.5 + 8);
       const cost = vc.cost ?? 0;
       const affordable = canAfford(cost);
@@ -1578,8 +1578,9 @@ export class UiOverlay {
         }
         const isXMult = /^X\d/i.test(p.text);
         const extraClass = isXMult ? 'kc-popup-xmult' : '';
+        const clampedTop = Math.max(20, Math.round(p.y));
         return `
-          <div class="kc-popup-pill ${extraClass}" style="left:${Math.round(p.x)}px;top:${Math.round(p.y)}px;background:${p.bgColor};color:${p.textColor};opacity:${alpha.toFixed(2)};transform:translate(-50%,-50%) scale(${popScale.toFixed(3)}) rotate(${(p.rotation * 57.3).toFixed(1)}deg);">
+          <div class="kc-popup-pill ${extraClass}" style="left:${Math.round(p.x)}px;top:${clampedTop}px;background:${p.bgColor};color:${p.textColor};opacity:${alpha.toFixed(2)};transform:translate(-50%,-50%) scale(${popScale.toFixed(3)}) rotate(${(p.rotation * 57.3).toFixed(1)}deg);">
             ${renderDynaWord(p.text, 'kc-pop-char')}
           </div>
         `;
@@ -3700,14 +3701,14 @@ export class UiOverlay {
         background: #fe5f55;
         color: #ffffff;
         padding: 0px 5px 1px;
-        margin: 0;
+        margin: 0 3px;
         border-radius: 5px;
         border: 1px solid #9e261f;
         box-shadow: 0 2px 0 #9e261f;
         text-shadow: 0 1px 0 rgba(0, 0, 0, 0.45);
         line-height: 1.2;
       }
-      .kc-hl-money { color: #c77c00; }
+      .kc-hl-money { color: #a86200; }
       .kc-hl-prob { color: #218c5c; }
       .kc-hl-tarot { color: #7d4fa3; }
       .kc-hl-spectral { color: #3b55c4; }

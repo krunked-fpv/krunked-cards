@@ -4054,7 +4054,7 @@ reg(3, 9, (cell) => {
   // Tragic downturned crimson frown
   layer.drawQuadBezier(29, 54, 35, 49, 41, 54, C_RED, 1.7, 1.7);
   layer.drawQuadBezier(31, 53, 35, 51, 39, 53, C_WHITE, 0.7, 0.7);
-  cell.blitLayer(layer, 0, 0, C_INK);
+  cell.blitLayer(layer, 0, -5, C_INK);
 });
 
 // (4,9) Triboulet soulPos — Royal blue & gold court jester bust (TRANSPARENT BG!)
